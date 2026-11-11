@@ -72,6 +72,13 @@ skills/
 
 ## Changelog
 
+- **1.2.0** — Repeated elements are no longer always exported per instance. The agent decides reuse
+  from UI purpose, game-UI priors and evidence in `reuse_candidates.json` (pixel similarity,
+  smart-object id, name pattern, `ui_role_prior`); reused instances share one image (`reuse_of`)
+  but keep their own bounds. Instances that do not match the design are split; conflicts with
+  strong evidence go to the user as `reuse_decisions` with comparison images. Avatar pictures
+  are runtime placeholders kept separate from their frames. `validate` reports `reuse_mismatch`.
+
 - **1.1.0** — Group layer effects can be either baked into the slice (`effect_mode: "baked"`,
   default) or drawn by the engine (`effect_mode: "engine"` + `engine_effects` parameters read
   by psd-tools); the agent picks per part and the review preview shows the choice. `validate`

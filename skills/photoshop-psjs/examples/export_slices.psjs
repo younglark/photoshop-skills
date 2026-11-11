@@ -377,8 +377,16 @@ try {
           if (entry.kind === "dynamic_text" || desc.textKey) {
             item.text = parseText(desc) || entry.text || null;
           }
-          if (entry.kind === "dynamic_text") {
+          if (entry.reuse_of) item.reuse_of = entry.reuse_of;
+          // Reused instance (export_png === false): record bounds only; build-layout
+          // places the shared image (exported once by its source instance) here.
+          if (entry.kind === "dynamic_text" || entry.export_png === false) {
+            if (entry.export_png === false) item.bounds_only = true;
             item.ok = true;
+            if (revealed && revealed.length) {
+              // This path skips the shared restore below, so restore visibility here.
+              try { restoreHiddenChain(src, revealed); } catch (errR) { item.restore_error = String(errR); }
+            }
             item.ms = nowMs() - t1;
             log.items.push(item);
             await flush();
@@ -463,7 +471,9 @@ try {
             };
             item.visible_bounds_from_logical_plus_png = true;
           }
-          const png = await slicesDir.createFile(entry.name + ".png", { overwrite: true });
+          const pngName = (entry.image_name || entry.name) + ".png"; // shared image name when reused
+          item.image = pngName;
+          const png = await slicesDir.createFile(pngName, { overwrite: true });
           await tmp.saveAs.png(png, { compression: 6 }, true);
           await executionContext.hostControl.unregisterAutoCloseDocument(tmp.id);
           await closeTemp(tmp);

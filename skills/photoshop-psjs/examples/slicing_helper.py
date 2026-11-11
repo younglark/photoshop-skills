@@ -361,6 +361,13 @@ def collect_layer(layer, path, depth, index_in_parent, warnings):
                 node["effect_params"] = params
     except Exception:
         pass
+    try:
+        so = getattr(layer, "smart_object", None) if "smart" in kind_l else None
+        if so is not None:
+            node["smart_object_id"] = str(getattr(so, "unique_id", "") or "") or None
+            node["smart_object_file"] = str(getattr(so, "filename", "") or "") or None
+    except Exception:
+        pass
     if node["is_text"]:
         try:
             text = getattr(layer, "text", None)
@@ -1266,6 +1273,8 @@ def annotate_preview(base: Image.Image, entries, art_origin, out_path: Path, tit
             draw.line([(l, top_g), (r_draw, top_g)], fill=guide, width=1)
             draw.line([(l, bot_g), (r_draw, bot_g)], fill=guide, width=1)
         label = f"{entry['name']}  [{entry['kind']}]"
+        if entry.get("reuse_of") and entry.get("reuse_of") != entry.get("name"):
+            label += f" → {entry['reuse_of']}"
         if entry.get("effect_mode"):
             fx = ",".join((e.get("type") or "?") for e in (entry.get("engine_effects") or []) if isinstance(e, dict))
             label += f" fx:{entry['effect_mode']}" + (f"({fx})" if fx else "")
@@ -1611,6 +1620,8 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
             "text": base.get("text"),
             "effects": list(base.get("effects") or []),
             "effect_params": list(base.get("effect_params") or []),
+            "smart_object_id": base.get("smart_object_id"),
+            "smart_object_file": base.get("smart_object_file"),
             "visible": bool(base.get("visible")),
             "clipping": bool(base.get("clipping")),
             "opacity": base.get("opacity"),
@@ -1696,6 +1707,12 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
         ),
         encoding="utf-8",
     )
+    try:
+        reuse = compute_reuse_candidates(crop_records, dest, dest / "reuse_compare")
+    except Exception as exc:
+        warnings.append(f"reuse candidates failed: {exc}")
+        reuse = {"count": 0, "groups": [], "error": str(exc)}
+    (dest / "reuse_candidates.json").write_text(json.dumps(reuse, ensure_ascii=False, indent=2), encoding="utf-8")
     (dest / "crops_index.json").write_text(
         json.dumps({"count": len(crop_records), "crops": crop_records}, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -1729,7 +1746,9 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
         "crops_sheet": str(sheet_path),
         "nine_slice_candidates": str(dest / "nine_slice_candidates.json"),
         "group_effects": str(dest / "group_effects.json"),
+        "reuse_candidates": str(dest / "reuse_candidates.json"),
         "stats": {
+            "reuse_groups": reuse.get("count", 0),
             "crop_count": len(crop_records),
             "hidden_crops": hidden_n,
             "text_crops": text_n,
@@ -1747,10 +1766,312 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
             "(suggested_select_ids / group_effects.json). A missing crop for a group id is not "
             "a reason to fall back to the child. Visible bounds must include baked effects.",
             "psd-tools thumbnails may omit those baked effects; Photoshop export of the group bakes them.",
+            "reuse_candidates.json lists repeated elements with pixel similarity and logical evidence. "
+            "The agent decides reuse (reuse_of); groups with evidence but pixel differences need a "
+            "reuse_decisions entry for the user (see reuse_compare/).",
         ],
     }
     (dest / "materials.json").write_text(json.dumps(materials, ensure_ascii=False, indent=2), encoding="utf-8")
     return materials
+
+
+# ---------------------------------------------------------------------------
+# Repeated elements: reuse evidence (helper provides evidence; the agent decides)
+# ---------------------------------------------------------------------------
+
+REUSE_MAD_TOL = 2.0  # mean abs diff (0-255) on premultiplied RGBA below which crops count as identical
+
+
+def name_pattern(text):
+    """Name/path with digit runs replaced by '#', lowercased (e.g. 'row 3/bg' -> 'row #/bg')."""
+    return re.sub(r"\d+", "#", (text or "").strip().lower())
+
+
+# Generic game-UI priors (keywords on layer name/path). Defaults only: pixel checks
+# against the design can override them, and conflicts go to the user.
+UI_ROLE_PRIORS = [
+    # (role, prior, keywords)
+    ("avatar_frame", "likely_reuse", ("avatar frame", "avatar_frame", "avatarframe", "head frame", "headframe", "头像框", "头像边框")),
+    ("avatar", "dynamic_placeholder", ("avatar", "portrait", "headicon", "head_icon", "头像")),
+    ("list_row_bg", "likely_reuse", ("row", "cell", "list item", "listitem", "rank item", "rankitem", "slot bg", "条目", "列表", "行底", "排行项")),
+    ("rank_badge", "small_fixed_set", ("medal", "badge", "rank icon", "rankicon", "trophy", "crown", "奖牌", "徽章", "名次", "奖杯", "皇冠")),
+    ("currency_icon", "likely_reuse", ("coin", "gold", "gem", "diamond", "currency", "金币", "钻石", "宝石", "货币")),
+    ("item_slot", "likely_reuse", ("slot", "item frame", "itemframe", "grid", "格子", "道具框", "物品框")),
+    ("button", "likely_reuse", ("btn", "button", "按钮")),
+    ("progress_bar", "likely_reuse", ("progress", "bar fill", "bar_bg", "track", "进度")),
+    ("icon", "likely_reuse", ("icon", "图标")),
+]
+
+
+def ui_role_prior(name, path=""):
+    """Best-effort UI role prior from name/path keywords. Returns dict or None."""
+    hay = f"{name or ''} {path or ''}".lower()
+    own = (name or "").lower()
+    for role, prior, keys in UI_ROLE_PRIORS:
+        hit = next((k for k in keys if k in own), None) or next((k for k in keys if k in hay), None)
+        if hit:
+            return {"type": "ui_role_prior", "role": role, "prior": prior, "matched": hit}
+    return None
+
+
+AVATAR_KEYS = ("avatar", "portrait", "headicon", "head_icon", "头像")
+FRAME_KEYS = ("frame", "border", "ring", "框")
+
+
+def _center_opaque(path):
+    """True when the middle of a crop is mostly opaque (a frame alone has a see-through centre)."""
+    try:
+        a = np.asarray(Image.open(path).convert("RGBA"))[..., 3]
+    except Exception:
+        return None
+    h, w = a.shape
+    if h < 4 or w < 4:
+        return None
+    mid = a[h // 3: h - h // 3, w // 3: w - w // 3]
+    return bool(mid.size and mid.mean() > 128)
+
+
+def avatar_merge_suspects(records, base_dir=None):
+    """Leaves that may hold an avatar picture merged with its frame (flag for a split decision).
+
+    Suspect when the name mentions an avatar and either it is a smart object (often a
+    placed avatar+frame) or it also mentions a frame and its crop centre is opaque.
+    """
+    out = []
+    for rec in records or []:
+        if rec.get("is_group") or rec.get("is_text"):
+            continue
+        name = (rec.get("name") or "").lower()
+        if not any(k in name for k in AVATAR_KEYS):
+            continue
+        has_frame_word = any(k in name for k in FRAME_KEYS)
+        smart = bool(rec.get("smart_object_id"))
+        center = _center_opaque(Path(base_dir) / rec["crop"]) if base_dir and rec.get("crop") else None
+        if smart or (has_frame_word and center):
+            out.append({
+                "layer_id": rec.get("layer_id"),
+                "name": rec.get("name"),
+                "path": rec.get("path"),
+                "crop": rec.get("crop"),
+                "evidence": {
+                    "type": "ui_role_prior",
+                    "role": "avatar",
+                    "name_mentions_frame": has_frame_word,
+                    "smart_object": smart,
+                    "crop_center_opaque": center,
+                },
+                "problem": "Avatar picture may be merged with its frame. The avatar is runtime content and the frame is "
+                           "a reusable resource; check the crop and add a split decision instead of exporting them combined.",
+            })
+    return out
+
+
+def premultiplied(im):
+    arr = np.asarray(im.convert("RGBA"), dtype=np.float32)
+    a = arr[..., 3:4] / 255.0
+    return np.concatenate([arr[..., :3] * a, arr[..., 3:4]], axis=-1)
+
+
+def pad_to(arr, w, h):
+    out = np.zeros((h, w, arr.shape[2]), dtype=arr.dtype)
+    out[: arr.shape[0], : arr.shape[1]] = arr
+    return out
+
+
+def crop_mad(a, b):
+    """Mean abs diff of two premultiplied RGBA arrays (padded to the larger size), plus pct of px > 16."""
+    h, w = max(a.shape[0], b.shape[0]), max(a.shape[1], b.shape[1])
+    pa, pb = pad_to(a, w, h), pad_to(b, w, h)
+    d = np.abs(pa - pb)
+    return float(d.mean()), float((d.max(axis=-1) > 16).mean() * 100)
+
+
+def _diff_heat(a, b):
+    h, w = max(a.shape[0], b.shape[0]), max(a.shape[1], b.shape[1])
+    d = np.abs(pad_to(a, w, h) - pad_to(b, w, h)).max(axis=-1)
+    v = np.clip(d * 3, 0, 255).astype(np.uint8)
+    heat = np.zeros((h, w, 3), dtype=np.uint8)
+    heat[..., 0] = v
+    heat[..., 1] = (v * 0.3).astype(np.uint8)
+    return Image.fromarray(heat, "RGB")
+
+
+def write_compare_sheet(rows, out_path, titles=("design", "reused", "diff x3")):
+    """rows: [(label, design_img, reused_img)] -> one row per instance: design | reused | diff."""
+    if not rows:
+        return None
+    font = load_font(12)
+    cell_w = max(max(r[1].width, r[2].width) for r in rows) + 12
+    cell_h = max(max(r[1].height, r[2].height) for r in rows) + 22
+    cell_w, cell_h = max(cell_w, 90), max(cell_h, 40)
+    sheet = Image.new("RGB", (cell_w * 3, 22 + cell_h * len(rows)), (40, 40, 40))
+    d = ImageDraw.Draw(sheet)
+    for i, t in enumerate(titles):
+        d.text((i * cell_w + 6, 4), t, fill=(255, 255, 255), font=font)
+    checker = (70, 70, 70)
+    for r, (label, design, reused) in enumerate(rows):
+        y = 22 + r * cell_h
+        da, ra = premultiplied(design), premultiplied(reused)
+        for c, im in enumerate((design.convert("RGBA"), reused.convert("RGBA"), _diff_heat(da, ra).convert("RGBA"))):
+            bg = Image.new("RGBA", im.size, checker + (255,))
+            sheet.paste(Image.alpha_composite(bg, im).convert("RGB"), (c * cell_w + 6, y + 18))
+        d.text((6, y + 2), str(label)[:60], fill=(255, 220, 120), font=font)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(out_path)
+    return out_path
+
+
+def compute_reuse_candidates(records, base_dir, compare_dir, tol=REUSE_MAD_TOL):
+    """Group repeated crops and attach evidence. Does not decide reuse.
+
+    A group forms from logical evidence (same smart-object source id, or same
+    name pattern + kind with near-equal size) or from pixel identity (same size and
+    premultiplied MAD <= tol). Each group gets pixel clusters, metrics, evidence and a
+    hint: ``reuse`` (identical pixels), ``split`` (no logical evidence, pixels differ) or
+    ``needs_decision`` (evidence says reuse, pixels differ; a compare image is written).
+    """
+    base_dir = Path(base_dir)
+    items = []
+    for rec in records or []:
+        if rec.get("is_group") or rec.get("is_text") or not rec.get("crop"):
+            continue
+        path = base_dir / rec["crop"]
+        if not path.exists():
+            continue
+        try:
+            im = Image.open(path).convert("RGBA")
+        except Exception:
+            continue
+        items.append({"rec": rec, "im": im, "arr": premultiplied(im)})
+
+    def size_close(a, b, slack=2):
+        return abs(a.width - b.width) <= slack and abs(a.height - b.height) <= slack
+
+    # Union-find over evidence links.
+    parent = list(range(len(items)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(len(items)):
+        ri = items[i]["rec"]
+        for j in range(i + 1, len(items)):
+            rj = items[j]["rec"]
+            a, b = items[i]["im"], items[j]["im"]
+            so = ri.get("smart_object_id") and ri.get("smart_object_id") == rj.get("smart_object_id")
+            same_pattern = (
+                name_pattern(ri.get("name")) == name_pattern(rj.get("name"))
+                and (ri.get("kind") == rj.get("kind"))
+                and size_close(a, b)
+            )
+            identical = a.size == b.size and crop_mad(items[i]["arr"], items[j]["arr"])[0] <= tol
+            if so or same_pattern or identical:
+                union(i, j)
+
+    buckets = {}
+    for i in range(len(items)):
+        buckets.setdefault(find(i), []).append(i)
+
+    groups = []
+    for members in buckets.values():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda k: items[k]["rec"]["layer_id"])
+        recs = [items[k]["rec"] for k in members]
+        # Pixel clusters (greedy against each cluster's first member).
+        clusters = []
+        for k in members:
+            for cl in clusters:
+                ref = items[cl[0]]
+                if ref["im"].size == items[k]["im"].size and crop_mad(ref["arr"], items[k]["arr"])[0] <= tol:
+                    cl.append(k)
+                    break
+            else:
+                clusters.append([k])
+        rep_k = max(clusters, key=len)[0]
+        per_instance = []
+        for k in members:
+            mad, pct = crop_mad(items[rep_k]["arr"], items[k]["arr"])
+            per_instance.append({
+                "layer_id": items[k]["rec"]["layer_id"],
+                "name": items[k]["rec"].get("name"),
+                "size": list(items[k]["im"].size),
+                "mad_vs_representative": round(mad, 3),
+                "pct_px_diff_gt16": round(pct, 3),
+            })
+        so_ids = {r.get("smart_object_id") for r in recs if r.get("smart_object_id")}
+        patterns = {name_pattern(r.get("name")) for r in recs}
+        path_patterns = {name_pattern(r.get("path")) for r in recs}
+        nines = {json.dumps(r.get("nine_slice"), sort_keys=True) for r in recs}
+        sizes = {tuple(items[k]["im"].size) for k in members}
+        priors = [ui_role_prior(r.get("name"), r.get("path")) for r in recs]
+        roles = {p["role"] for p in priors if p}
+        role_prior = next((p for p in priors if p), None) if len(roles) == 1 and all(priors) else None
+        evidence = {
+            "ui_role_prior": role_prior,
+            "same_smart_object": next(iter(so_ids)) if len(so_ids) == 1 and all(r.get("smart_object_id") for r in recs) else None,
+            "smart_object_ids": sorted(so_ids),
+            "same_name_pattern": next(iter(patterns)) if len(patterns) == 1 else None,
+            "same_path_pattern": next(iter(path_patterns)) if len(path_patterns) == 1 else None,
+            "same_size": len(sizes) == 1,
+            "same_nine_slice": len(nines) == 1,
+            "same_kind": len({r.get("kind") for r in recs}) == 1,
+        }
+        prior_reuse = bool(role_prior and role_prior["prior"] in {"likely_reuse", "small_fixed_set"})
+        logical = bool(evidence["same_smart_object"] or evidence["same_name_pattern"] or evidence["same_path_pattern"] or prior_reuse)
+        identical = len(clusters) == 1
+        hint = "reuse" if identical else ("needs_decision" if logical else "split")
+        if role_prior and role_prior["prior"] == "dynamic_placeholder":
+            # Runtime content (e.g. avatar pictures): differences are expected; export as placeholder.
+            hint = "dynamic_placeholder"
+        gid = f"reuse_{len(groups) + 1:03d}"
+        group = {
+            "id": gid,
+            "layer_ids": [r["layer_id"] for r in recs],
+            "names": [r.get("name") for r in recs],
+            "representative_layer_id": items[rep_k]["rec"]["layer_id"],
+            "pixel_clusters": [[items[k]["rec"]["layer_id"] for k in cl] for cl in clusters],
+            "max_mad": round(max(p["mad_vs_representative"] for p in per_instance), 3),
+            "instances": per_instance,
+            "evidence": evidence,
+            "hint": hint,
+            "compare_image": None,
+        }
+        if not identical:
+            rows = [
+                (f"{items[k]['rec']['layer_id']} {items[k]['rec'].get('name') or ''}", items[k]["im"], items[rep_k]["im"])
+                for k in members
+            ]
+            out = write_compare_sheet(rows, Path(compare_dir) / f"{gid}.png")
+            if out is not None:
+                try:
+                    group["compare_image"] = str(Path(out).relative_to(base_dir))
+                except ValueError:
+                    group["compare_image"] = str(out)
+        groups.append(group)
+    return {
+        "count": len(groups),
+        "tolerance_mad": tol,
+        "groups": groups,
+        "avatar_merge_suspects": avatar_merge_suspects(records, base_dir),
+        "notes": [
+            "evidence.ui_role_prior is a keyword-based game-UI prior (default only; pixels can override, conflicts go to the user).",
+            "hint=dynamic_placeholder: runtime content such as avatar pictures; export one placeholder part, separate from its frame.",
+            "Evidence only; the agent decides. hint=reuse: pixel-identical repeats, export once (reuse_of).",
+            "hint=needs_decision: logical evidence for reuse but pixels differ; add a reuse_decisions entry with compare_image.",
+            "hint=split: similar by size/pixels only; export separately unless the design logic says otherwise.",
+            "Crops are psd-tools composites of the layer alone; Photoshop-baked effects may differ.",
+        ],
+    }
 
 
 def cmd_prepare(args):
@@ -1921,6 +2242,8 @@ def flatten_components(manifest):
                 "effect_mode": part.get("effect_mode"),
                 "engine_effects": list(part.get("engine_effects") or []),
                 "effect_reason": part.get("effect_reason"),
+                "reuse_of": part.get("reuse_of"),
+                "reuse_accepted": bool(part.get("reuse_accepted")),
                 "component_id": comp.get("id"),
                 "component_type": comp.get("type"),
                 "part_role": part.get("role"),
@@ -1934,8 +2257,34 @@ def flatten_components(manifest):
                 entry["notes"] = list(entry["notes"]) + ["reveal hidden layer for export, then restore"]
             entries.append(entry)
     entries = sort_by_paint_order(entries, layer_tree_from_manifest(manifest))
+    assign_reuse(entries)
     manifest["entries"] = entries
     return entries
+
+
+def assign_reuse(entries):
+    """Shared images: entries with the same ``reuse_of`` use one PNG named after it.
+
+    The source instance (the entry whose name equals reuse_of, else the first default
+    one, else the first) exports ``<reuse_of>.png``; the others get ``export_png: false``
+    and are placed by build-layout at their own bounds. Entries without reuse_of export
+    ``<name>.png`` as before.
+    """
+    groups = {}
+    for e in entries:
+        e["image_name"] = e["name"]
+        e["export_png"] = e.get("kind") != "dynamic_text"
+        shared = e.get("reuse_of")
+        if shared and e.get("kind") != "dynamic_text":
+            groups.setdefault(shared, []).append(e)
+    for shared, members in groups.items():
+        source = next((m for m in members if m["name"] == shared), None)
+        source = source or next((m for m in members if m.get("default")), None) or members[0]
+        for m in members:
+            m["image_name"] = shared
+            m["reuse_source"] = m["name"] if m is source else source["name"]
+            m["export_png"] = m is source
+    return groups
 
 
 def effect_groups_from_tree(tree):
@@ -2052,8 +2401,12 @@ def cmd_flatten(args):
     out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     groups = load_effect_groups(manifest, path, getattr(args, "group_effects", None))
     effect_issues = find_silent_effect_loss(entries, groups)
+    decisions = manifest.get("reuse_decisions") or []
+    pending = [d.get("id") or d.get("instances") for d in decisions if not d.get("decision") or d.get("decision") == "pending"]
     summary = {
         "manifest": str(out),
+        "shared_images": dict(Counter(e["image_name"] for e in entries if e.get("reuse_of"))),
+        "pending_reuse_decisions": pending,
         "entry_count": len(entries),
         "by_kind": dict(Counter(e["kind"] for e in entries)),
         "hidden_entries": sum(1 for e in entries if e.get("hidden")),
@@ -2266,7 +2619,7 @@ def enrich_components(components, nodes_by_name):
             out["logical_bounds"] = node.get("logical_bounds")
             out["nine_slice"] = node.get("nine_slice")
             out["kind"] = node.get("kind") or out.get("kind")
-            for key in ("effect_mode", "engine_effects", "effect_reason", "effect_bounds", "effect_bounds_estimated"):
+            for key in ("effect_mode", "engine_effects", "effect_reason", "effect_bounds", "effect_bounds_estimated", "reuse_of", "reuse_source"):
                 if node.get(key) is not None:
                     out[key] = node[key]
             if node.get("text"):
@@ -2294,6 +2647,35 @@ def enrich_components(components, nodes_by_name):
         return out
 
     return [enrich(c) for c in components]
+
+
+def place_reused_instances(nodes):
+    """Place bounds-only instances of a shared image: source visible box shifted by the logical-origin delta."""
+    by_name = {n["name"]: n for n in nodes}
+    for node in nodes:
+        bounds_only = node.pop("_bounds_only", False)
+        if not bounds_only:
+            continue
+        src = by_name.get(node.get("reuse_source"))
+        if not src or not src.get("visible_bounds"):
+            continue
+        sv, sl, il = src["visible_bounds"], src.get("logical_bounds"), node.get("logical_bounds")
+        if sl and il:
+            dx, dy = il["left"] - sl["left"], il["top"] - sl["top"]
+        elif node.get("visible_bounds"):
+            dx, dy = node["visible_bounds"]["left"] - sv["left"], node["visible_bounds"]["top"] - sv["top"]
+        else:
+            continue
+        node["visible_bounds"] = _shift(sv, -dx, -dy)
+        if sl:
+            node["logical_bounds"] = _shift(sl, -dx, -dy)
+            node["anchor"] = _center(node["logical_bounds"])
+        node["kind"] = src.get("kind", node.get("kind"))
+        node["nine_slice"] = src.get("nine_slice")
+        node["image"] = src.get("image")
+        if src.get("effect_bounds"):
+            node["effect_bounds"] = _shift(src["effect_bounds"], -dx, -dy)
+    return nodes
 
 
 def cmd_build_layout(args):
@@ -2340,7 +2722,7 @@ def cmd_build_layout(args):
                 vis = dict(logi)
         vis_ab = _shift(vis, ox, oy) if vis else None
         logi_ab = _shift(logi, ox, oy) if logi else None
-        png_name = None if entry["kind"] == "dynamic_text" else f"{name}.png"
+        png_name = None if entry["kind"] == "dynamic_text" else f"{entry.get('image_name') or name}.png"
         png_path = slices_dir / png_name if png_name else None
         nine = refine_nine(entry, png_path) if png_path else None
         kind = entry["kind"]
@@ -2378,6 +2760,11 @@ def cmd_build_layout(args):
             "default": entry.get("default", True),
             "hidden": entry.get("hidden", False),
         }
+        if entry.get("reuse_of"):
+            node["reuse_of"] = entry["reuse_of"]
+            node["reuse_source"] = entry.get("reuse_source")
+            node["reuse_accepted"] = bool(entry.get("reuse_accepted"))
+            node["_bounds_only"] = entry.get("export_png") is False
         if entry.get("effect_mode"):
             node["effect_mode"] = entry["effect_mode"]
             node["effect_reason"] = entry.get("effect_reason")
@@ -2393,6 +2780,7 @@ def cmd_build_layout(args):
             node["effect_bounds_estimated"] = True
         nodes.append(node)
 
+    place_reused_instances(nodes)
     nodes = sort_by_paint_order(nodes, layer_tree_from_manifest(manifest))
     nodes_by_name = {n["name"]: n for n in nodes}
     components = enrich_components(manifest.get("components") or [], nodes_by_name)
@@ -2415,6 +2803,7 @@ def cmd_build_layout(args):
         "tree": manifest.get("tree") or [],
         "effect_groups": effect_groups,
         "effect_issues": effect_issues,
+        "reuse_decisions": manifest.get("reuse_decisions") or [],
         "notes": [
             "Coordinates are artboard-relative pixels (1x).",
             "Hierarchy is component semantics (screen > tab_group > tab > state > part).",
@@ -2423,6 +2812,7 @@ def cmd_build_layout(args):
             "effect_mode 'engine': the PNG has no effect pixels (visible == logical); the engine draws "
             "engine_effects. effect_bounds is an estimate of their extent, not Photoshop's exact box.",
             "anchor is the center of logical_bounds; pivot is normalized (0.5, 0.5).",
+            "Nodes with reuse_of share one image (image = <reuse_of>.png); each instance keeps its own bounds.",
             "Engine importers are out of scope for this schema.",
         ],
     }
@@ -3134,6 +3524,52 @@ def write_state_previews(layout, slices_dir, canvas_size, out_dir, fonts_dir=Non
     return written
 
 
+def reuse_region_checks(layout, ref, rec, mask, out_dir, tol_mae=4.0, tol_pct=1.0):
+    """Per-instance diff for nodes that share an image. Returns (mismatches, accepted, checked)."""
+    ch, cw = ref.shape[0], ref.shape[1]
+    mismatches, accepted, checked = [], [], []
+    for node in layout.get("nodes") or []:
+        if not node.get("reuse_of") or node.get("kind") == "dynamic_text":
+            continue
+        b = node.get("visible_bounds") or node.get("logical_bounds")
+        if not b:
+            continue
+        l, t, r, bt = [int(round(v)) for v in (b["left"], b["top"], b["right"], b["bottom"])]
+        l, t, r, bt = max(0, l), max(0, t), min(cw, r), min(ch, bt)
+        if r <= l or bt <= t:
+            continue
+        keep = ~mask[t:bt, l:r] if mask is not None else np.ones((bt - t, r - l), dtype=bool)
+        if not keep.any():
+            continue
+        aa = ref[t:bt, l:r, :3].astype(np.int16)[keep]
+        bb = rec[t:bt, l:r, :3].astype(np.int16)[keep]
+        d = np.abs(aa - bb)
+        row = {
+            "name": node["name"],
+            "reuse_of": node["reuse_of"],
+            "bounds": [l, t, r, bt],
+            "mae": round(float(d.mean()), 3),
+            "pct_px_diff_gt16": round(float((d.max(axis=-1) > 16).mean() * 100), 3),
+        }
+        checked.append(row)
+        if row["mae"] <= tol_mae and row["pct_px_diff_gt16"] <= tol_pct:
+            continue
+        img = write_compare_sheet(
+            [(node["name"], Image.fromarray(ref[t:bt, l:r]), Image.fromarray(rec[t:bt, l:r]))],
+            Path(out_dir) / "reuse" / f"{node['name']}.png",
+            titles=("design (PS)", "shared image", "diff x3"),
+        )
+        row["compare_image"] = str(img) if img else None
+        if node.get("reuse_accepted"):
+            accepted.append(row)
+        else:
+            mismatches.append(dict(row, type="reuse_mismatch", hint=(
+                "Reused image differs from the design here. First suspect the reuse analysis and export this "
+                "instance separately; if logical evidence still says reuse, add a reuse_decisions entry for the user."
+            )))
+    return mismatches, accepted, checked
+
+
 def layout_nodes_as_preview_entries(nodes):
     """Layout nodes -> annotate_preview entries, boxed by visible_bounds (artboard coords)."""
     entries = []
@@ -3148,6 +3584,7 @@ def layout_nodes_as_preview_entries(nodes):
             "nine_slice": node.get("nine_slice"),
             "effect_mode": node.get("effect_mode"),
             "engine_effects": node.get("engine_effects"),
+            "reuse_of": node.get("reuse_of"),
         })
     return entries
 
@@ -3264,6 +3701,11 @@ def cmd_validate(args):
     )
 
     state_previews = write_state_previews(layout, slices_dir, (w, h), out_dir, fonts_dir=fonts_dir)
+    reuse_bad, reuse_ok, reuse_checked = reuse_region_checks(
+        default_layout, ref, rec_m, masked_all, out_dir,
+        tol_mae=getattr(args, "reuse_tol_mae", 4.0) or 4.0, tol_pct=getattr(args, "reuse_tol_pct", 1.0) or 1.0,
+    )
+    issues.extend(reuse_bad)
     exported_preview = write_exported_preview(default_layout, rec_text, full.crop((0, 0, cw, ch)), out_dir)
 
     rendered = sum(1 for p in placed_text if p.get("rendered"))
@@ -3289,6 +3731,9 @@ def cmd_validate(args):
         ],
         "engine_effects_unemulated": unemulated,
         "exported_preview": exported_preview,
+        "reuse_checked": reuse_checked,
+        "reuse_mismatch_accepted": reuse_ok,
+        "reuse_decisions": layout.get("reuse_decisions") or [],
         "state_previews": [
             {k: v for k, v in item.items() if k != "activation"} | {"activation": item["activation"]}
             for item in state_previews
@@ -3372,6 +3817,8 @@ def build_parser():
     s.add_argument("--out-dir", required=True)
     s.add_argument("--fonts-dir", default=None, help="Directory of TTF/OTF files used to approximate dynamic_text")
     s.add_argument("--group-effects", default=None, help="Optional group_effects.json for the silent effect-loss check")
+    s.add_argument("--reuse-tol-mae", type=float, default=4.0, help="Per-instance MAE above which a reused image is a reuse_mismatch")
+    s.add_argument("--reuse-tol-pct", type=float, default=1.0, help="Per-instance %% of pixels with diff > 16 above which it is a reuse_mismatch")
     s.set_defaults(func=cmd_validate)
     return p
 

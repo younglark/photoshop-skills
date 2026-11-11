@@ -11,8 +11,9 @@
 3. **分清共用零件和随状态变化的零件。** 图标、始终存在的底等跨状态不变的，放进该组件的 `shared`，文件名不加状态后缀。槽/底的明暗、选中高亮、只在某一态出现的标签等，放进 `states.<state>.parts`。
 4. **区分状态变体和旧稿。** 主体/内容不变、只改明度、描边、发光、配色或缩放的，是状态变体，可以导出。同一槽位但换了内容或徽记的，当旧稿忽略。内容或母题对不上、吃不准时才写 `uncertain_hidden`，并附上两侧裁切图。
 5. **只给会随状态变化的零件记 missing。** 以同组里状态最完整的那一项为模板（例如某选中项有 base + highlight + label），每个缺少其中一件的兄弟项都要列出，**包括 highlight**。不要因为共用图标没有另一态就标 missing。单个特殊样式的列表行（例如 self 高亮行）只是这一行的一个实例：不要给其它行推断缺失的 self，也不要给这一行推断缺失的 normal，除非设计里每行都有成套变体。
-6. **写好审核清单后停下。** 跑 `flatten` + `preview`，`status` 保持 `pending_review`，等用户改 JSON 确认后再导出。
-7. **确认后一口气跑完，不要停在导出。** 导出 → `build-layout` → `validate` 是一个整体；`export_log.json` 写出不算完成，只有 `validate/validate_report.json` 写出并读过 `issues`（含 `group_effect_lost`）、遮罩 PSNR / ΔE 后才算完成。`validate` 的最后一步用**实际导出的 PNG** 拼出默认态并画上标注，写出 `validate/preview_exported_annotated.png` 与 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注）；把这两张图作为最终成果交给用户。第 6 步导出前的审核预览不变。每条长命令都设超时并把输出写进日志；某步超时或报错时，读日志、修正后重跑这一步，不要静默结束。
+6. **判断重复元素是否复用（见下文「重复元素：复用还是分开」）。** 先按 UI 用途和常识（游戏 UI 先验）加上 `reuse_candidates.json` 的证据，从逻辑上判断是否该共用一张图；该复用就用 `reuse_of` 指向同一张共享图。再对照效果图：复用后与设计对不上，先怀疑分析错了，只把对不上的实例拆出去单独导出；逻辑证据很强却对不上，写进 `reuse_decisions` 交用户决定。头像图与头像框必须分开；PSD 里合在一起的，写进 `reuse_decisions` 请用户决定，不要合着导出。
+7. **写好审核清单后停下。** 跑 `flatten` + `preview`，`status` 保持 `pending_review`，等用户改 JSON 确认后再导出。
+8. **确认后一口气跑完，不要停在导出。** 导出 → `build-layout` → `validate` 是一个整体；`export_log.json` 写出不算完成，只有 `validate/validate_report.json` 写出并读过 `issues`（含 `group_effect_lost`）、遮罩 PSNR / ΔE 后才算完成。`validate` 的最后一步用**实际导出的 PNG** 拼出默认态并画上标注，写出 `validate/preview_exported_annotated.png` 与 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注）；把这两张图作为最终成果交给用户。第 7 步导出前的审核预览不变。若 `issues` 里有 `reuse_mismatch`，按第 6 步处理（拆出单独导出，或交用户决定）后重跑。每条长命令都设超时并把输出写进日志；某步超时或报错时，读日志、修正后重跑这一步，不要静默结束。
 
 选中槽上的隐藏层：若它落在**当前选中项**的槽里，并且是同一主体、只是加了发光或高亮样式，应作为该态的 `highlight`。若默认态就是这一项被选中，即使该高亮层在 PSD 里仍是隐藏的，也要纳入默认选中态，否则拼图会缺一层。只有内容或徽记对不上时，才用 `uncertain_hidden`。
 
@@ -39,6 +40,23 @@
 **唯一禁止的结果：** 只选子层合并、既没烘焙也没记录 `engine_effects`，组效果悄悄丢失。`flatten` 的 `effect_issues`、`build-layout` 的 `effect_issues` 和 `validate` 的 `issues` 都会把这种部件标成 `group_effect_lost`。
 
 「带效果导出组但临时关掉组效果」需要 batchPlay 切换效果可见性，描述符**未核实**，模板没有实现；`engine` 一律用合并子层。
+
+### 重复元素：复用还是分开
+
+规则不是定死的，按三步走：
+
+1. **先从逻辑上判断。** 结合 UI 用途、游戏开发常识和结构证据（同一智能对象/链接源、同尺寸、同九宫格、重复组件里的同一角色、同名模式），判断这些实例是否本该共用一张资源（例如由代码实例化的列表行底、多处同一图标）。该复用就只导出**一张**：每个实例的 part 写 `reuse_of: <共享名>`，布局 JSON 里每个实例仍有自己的节点、位置和边界，只是 `image` 指向同一张图。共享名去掉实例序号（如 `<module>_bg_row`，不是 `<module>_bg_row1`）。
+2. **再对照效果图。** 复用后拼图在某实例区域与设计不一致（颜色、尺寸、效果、内容等逐实例不同，超出容差），先怀疑分析错了：只把不一致的实例改成单独导出（去掉 `reuse_of`），一致的仍可共用。`prepare` 的 `reuse_candidates.json` 和 `validate` 的 `reuse_mismatch` 都给出逐实例差异。
+3. **有逻辑证据却对不上时，不要默默决定。** 写进清单顶层 `reuse_decisions`，附对比图（每个实例：设计裁切 | 共享图 | 差异）、问题描述和证据，交用户决定。决定前默认单独导出，并标明待决定。用户确认按复用处理的实例写 `reuse_accepted: true`，校验时差异改记在 `reuse_mismatch_accepted`，不再算问题。
+
+**游戏 UI 常见先验**（默认判断，像素对照可以推翻，冲突交用户）：
+
+- 列表 / 排行 / 背包的行底：很可能是一张复用的模板，另有少量特殊变体（自己那一行、高亮行等）。
+- 头像框：很可能复用。**头像图本身是运行时动态内容**，要和框分开：单独一个 part，`role: avatar`、`placeholder: true`，导出 PSD 里的示意图作占位，绝不和框烘焙在一起。PSD 里头像和框在同一层或合并的智能对象里时，在 `reuse_decisions` 里标为需要拆分/决定（`type: split_avatar`），不要合着导出。
+- 道具/图标格、同款按钮、按名次的奖牌/徽章（少量固定集合）、货币图标、进度条的底和填充：典型的可复用资源。
+- 玩家名、分数、数字：`dynamic_text`。
+
+`reuse_candidates.json` 里每组带 `evidence.ui_role_prior`（`type: ui_role_prior`，按图层名/路径关键词猜的角色和先验：`likely_reuse`、`small_fixed_set`、`dynamic_placeholder`），以及 `avatar_merge_suspects`（疑似头像与框合并的层）。这些只是证据，由 agent 判断。
 
 助手子命令：
 
@@ -115,6 +133,7 @@ PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))
 | `crops_index.json` | 已写出的裁切图，以及带图层效果的组（即使暂无缩略图）：id、可见性、路径、效果及 `effect_params`、`select_ids` / `suggested_select_ids`、九宫格候选。叶子若挂在带效果的父组下，会标注 `parent_group_id`、`parent_effects` 和 `parent_effect_params`。查 id 用这份索引，不要猜文件名。 |
 | `crops_sheet.jpg` | 所有裁切图的拼图，隐藏项标 `HID`，带效果的组标 `FX`，便于快速扫。 |
 | `group_effects.json` | 带图层效果的组：效果列表、`effect_params`（psd-tools 读出的参数；读不懂的效果保留原类名并标 `unknown`）、子层 id（`child_leaf_ids` / `child_ids`）、`ancestor_ids`、`baked` 用的 `select_ids`（组 id）、`engine` 用的 `engine_select_ids`（可见子层）、可选的组裁切路径。选导出目标和 `effect_mode` 时先看这份。 |
+| `reuse_candidates.json` | 重复元素的证据：每组的 `layer_ids`、`pixel_clusters`（像素一致的子集，预乘 RGBA 平均差 ≤ `tolerance_mad`）、逐实例差异、`evidence`（`ui_role_prior`、同智能对象 id、同名/同路径模式、同尺寸、同九宫格）和 `hint`（`reuse` / `split` / `needs_decision` / `dynamic_placeholder`）；逻辑相似但像素不同的组附 `reuse_compare/<组id>.png`（设计 \| 共享图 \| 差异）。另有 `avatar_merge_suspects`。只是证据，不替 agent 决定。 |
 | `nine_slice_candidates.json` | 像素启发式给出的九宫格候选（最长的均匀相邻行/列；两边边距都小于 `min_run` 则拒绝）。agent 决定采不采纳。 |
 | `materials.json` | 上述路径和数量统计。 |
 
@@ -154,7 +173,7 @@ PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))
    单个特殊样式的列表行（例如只有一行画了 self 高亮）只是**这一行的一个实例**，不是「每一行都该有 self / 这一行还缺 normal」。不要给其它行推断缺失的 self，也不要给这一行推断缺失的 normal，除非设计里每行都画出了成套状态变体。
 5. **导出目标要看效果在哪一层。** 图层效果（如投影、外发光、描边）经常加在代表该元素的**父组**上，内层叶子（智能对象、形状）自身没有效果。选 `layer_id` / `select_ids` 时，检查最近的父组（或代表该元素的组）：组有效果而叶子没有，按第 1 节前的「组效果：烘焙还是引擎绘制」选 `effect_mode`。`baked` 选组 id，可见框用组的含效果框；`engine` 选子层，并写 `engine_effects`。组 id 没有裁切图时同样如此。例如某个图标组 `<item>` 上有 DropShadow、内层叶子没有：`baked` 写该组 id；`engine` 写子层 id + `"effect_mode": "engine"` + 抄自 `effect_params` 的 `engine_effects`。不能只写子层而什么都不记。
 6. 底图、高亮、图标、文字始终是独立 `parts`。类型仍是 `image` | `nine_slice` | `dynamic_text` | `art_text`。可变文案（分数、名字、倒计时、1–2 位名次）用 `dynamic_text`（只出属性，不出图）；带效果的固定标签（页签名、导航名、标题）用 `art_text`（出图）。
-7. 列表重复行各导一份，不去重。全部 1x。
+7. 重复元素按「重复元素：复用还是分开」处理：逻辑上该复用的导出一张、各实例用 `reuse_of` 引用；与设计对不上的拆开；有证据却对不上的交用户决定。头像图与头像框分开。全部 1x。
 
 ---
 
@@ -192,6 +211,27 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 }
 ```
 
+清单顶层还可有 `reuse_decisions`（交用户决定的复用/拆分问题）：
+
+```json
+"reuse_decisions": [
+  {
+    "id": "rd_row_bg",
+    "type": "reuse",
+    "instances": ["<module>_bg_row1", "<module>_bg_row2", "<module>_bg_row3"],
+    "reuse_of": "<module>_bg_row",
+    "evidence": [{ "type": "ui_role_prior", "role": "list_row_bg", "prior": "likely_reuse" }, { "type": "same_name_pattern", "value": "row #" }],
+    "problem": "第 3 行底色与前两行不同，复用会与效果图不一致",
+    "compare_image": "reuse_compare/reuse_001.png",
+    "options": ["reuse", "separate", "reuse_with_variant"],
+    "default": "separate",
+    "decision": null
+  }
+]
+```
+
+`type` 为 `reuse` 或 `split_avatar`（头像与框合在一起，需拆分）。`decision` 为空时 `flatten` 会在 `pending_reuse_decisions` 里列出；未决定的按 `default` 导出。
+
 组件节点常用字段：
 
 | 字段 | 含义 |
@@ -209,7 +249,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 | `children` | 子组件 |
 | `source_path` / `layer_id` | 仅供对照的源图层引用 |
 
-部件（`part`）常用字段：`name`（规范文件名）、`role`（`base`、`highlight`、`icon`、`text` 等）、`kind`、`layer_id`、`select_ids`、`hidden`、`nine_slice`、`text`、`logical_bounds`、`source_name`、`source_path`。父组带效果时再加：`effect_mode`（`"baked"` | `"engine"`）、`effect_reason`（一句话理由，审核时可见）、`engine_effects`（仅 `engine`，从 `effect_params` 抄）。
+部件（`part`）常用字段：`name`（规范文件名）、`role`（`base`、`highlight`、`icon`、`text` 等）、`kind`、`layer_id`、`select_ids`、`hidden`、`nine_slice`、`text`、`logical_bounds`、`source_name`、`source_path`。重复元素复用时加 `reuse_of`（共享图名，不带实例序号）；用户确认接受差异时加 `reuse_accepted: true`。运行时内容的占位图（如头像）加 `placeholder: true`。父组带效果时再加：`effect_mode`（`"baked"` | `"engine"`）、`effect_reason`（一句话理由，审核时可见）、`engine_effects`（仅 `engine`，从 `effect_params` 抄）。
 
 ```json
 {
@@ -468,7 +508,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 确认前不要导出。
 
 1. 用 `flatten` 把组件树展成 `entries`，再用 `preview` 画标注预览（框出每个切图、标规范名和九宫格线；来自隐藏态的条目会计入标题；有 `effect_mode` 的标 `fx:baked` / `fx:engine(效果类型)`，`engine` 再用细品红框画出估计的效果范围）。`flatten` 输出里的 `effect_issues` 必须为空。
-2. 把 `preview_annotated.png` 和 `manifest.json` 交给用户。用户改 JSON：改名、改类型、改九宫格、拆/合并部件、确认或删除 `missing`、把不该导出的隐藏层拿掉、切换 `effect_mode`。
+2. 把 `preview_annotated.png` 和 `manifest.json` 交给用户。用户改 JSON：改名、改类型、改九宫格、拆/合并部件、确认或删除 `missing`、把不该导出的隐藏层拿掉、切换 `effect_mode`、对 `reuse_decisions` 填 `decision`（看对比图）。
 3. `status` 在用户确认前保持 `pending_review`，确认后改为 `confirmed`。导出脚本拒绝其它状态（测试授权下允许 `pending_review`）。
 4. 用户确认后才进入导出。
 
@@ -476,7 +516,9 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 ## 7. 导出
 
-[examples/export_slices.psjs](../examples/export_slices.psjs) 只硬编码一个 `CONFIG_URL`，从作业 JSON 读路径（见 [export_config.example.json](../examples/export_config.example.json)）。按 `layer_id`（及 `select_ids` 里的剪贴层）导出 1x PNG，图层效果烘焙进图；重复实例各导一份。`dynamic_text` 不出图，只写文本属性；`art_text` 出图。
+[examples/export_slices.psjs](../examples/export_slices.psjs) 只硬编码一个 `CONFIG_URL`，从作业 JSON 读路径（见 [export_config.example.json](../examples/export_config.example.json)）。按 `layer_id`（及 `select_ids` 里的剪贴层）导出 1x PNG，图层效果烘焙进图；带 `reuse_of` 的实例只导出一张共享图（见下）。`dynamic_text` 不出图，只写文本属性；`art_text` 出图。
+
+带 `reuse_of` 的条目由 `flatten` 分配：源实例（名称等于共享名的那条，否则第一条默认态实例）导出 `<共享名>.png`（`image_name`），其余实例 `export_png: false`，脚本只记录它们的边界，不再出图。
 
 `select_ids` 有多个 id 时，脚本把它们一起选中（`addToSelection`）、「从图层新建」、`mergeVisible` 后 trim 导出。`engine` 部件就靠这条路径：选的是子层，新文档里没有父组，所以组上的效果、组不透明度和混合模式都不会带进 PNG，子层自己的效果仍在。PNG 原点照样用 trim 内缩量计算；`layer_id` 留组 id 时，日志里的 `logical_bounds` 是组的 `boundsNoEffects`。
 
@@ -505,6 +547,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 - `components`：与 manifest 相同的语义树，但每个 part 已补上导出后的 `image`、`visible_bounds`、`logical_bounds`、`nine_slice`、文本属性。
 - `nodes`：扁平列表，便于引擎遍历和校验放置。每条含 `name`、`kind`、`component_id`、`part_role`、`state`、`default`、`hidden`、`visible_bounds`（含烘焙效果，画板坐标）、`logical_bounds`（不含效果）、`anchor`（逻辑框中心）、`pivot`（0.5, 0.5）、`nine_slice`、`image`、`text`。有 `effect_mode` 时附 `effect_mode`、`effect_reason`；`engine` 还附 `engine_effects` 和 `effect_bounds`（逻辑框按各效果的距离/角度/大小外扩的**估计**范围，`effect_bounds_estimated: true`，不是 PS 的精确框），此时 `logical_bounds` = `visible_bounds` = 图片框。`components` 里对应的 part 也带这些字段。
+- 复用：带 `reuse_of` 的节点 `image` 都是 `<共享名>.png`，九宫格取源实例；非源实例的 `visible_bounds` = 源实例可见框按两者逻辑框原点的差平移。顶层附 `reuse_decisions`。
 - `effect_groups` / `effect_issues`：参与检查的带效果组，以及组效果被悄悄丢掉的部件（应为空）。
 - 坐标是画板像素（1x）。各引擎导入器自己写，不在本 skill 里。
 
@@ -516,8 +559,9 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 1. **默认状态**：只拼 `default: true` 的部件（即 PSD 里当前显示的那一态，加上始终可见的 chrome），用 src-over（`Image.alpha_composite`）叠回画板，与 Photoshop 整图比像素差 / CIEDE2000 ΔE。同时报告 Pillow 渲染动态文字后的数字、以及遮罩动态文字区域后的数字，并列出误差最大的 10 条。再检查漏切、重名、空图。
 2. **引擎效果**：`effect_mode: engine` 的部件，投影 / 外发光按 Pillow 近似画在部件下面（alpha → 按角度/距离偏移 → 扩展后高斯模糊 → 颜色/不透明度，普通混合），报告列在 `engine_effects_emulated`。描边、内阴影、叠加等无法模拟的，按估计的 `effect_bounds` 把外圈（内部效果则整框）从遮罩指标里去掉，列在 `engine_effects_unemulated`。`issues` 里的 `group_effect_lost` 表示选了带效果组的子层却既没烘焙也没写 `engine_effects`，必须修。
-3. **交替状态**：对每个交互组件的非默认状态（含仅存在于 `missing` 中的状态），按「共用部件 + 该状态部件」拼图，互斥组的兄弟项切到对应态，写出 `validate/states/<component_id>_<state>.png`。只对真正缺失的、按设计随状态变化的零件画红框并标 `missing`。这些预览**不**和默认态整图比 PSNR（对不上是正常的）。
-4. **导出后标注预览（最终交付）**：用实际导出的 PNG 按布局 JSON 拼默认态（同上，含引擎效果近似），再按审核预览的样式画标注：每个切图按 `visible_bounds` 画框、规范名、九宫格线、类型和 `fx:baked` / `fx:engine`。写出 `validate/preview_exported_annotated.png` 和 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注），路径记在报告的 `exported_preview`。把它们交给用户。
+3. **复用实例**：每个带 `reuse_of` 的默认态节点，在其可见框内（去掉动态文字与无法模拟的效果区域）比 PS 整图与拼图。MAE > `--reuse-tol-mae`（默认 4）或差值 >16 的像素占比 > `--reuse-tol-pct`（默认 1%）时记为 `reuse_mismatch`（含实例名、区域、指标和 `validate/reuse/<名>.png` 对比图）；`reuse_accepted` 的改记 `reuse_mismatch_accepted`。逐实例数据在 `reuse_checked`。
+4. **交替状态**：对每个交互组件的非默认状态（含仅存在于 `missing` 中的状态），按「共用部件 + 该状态部件」拼图，互斥组的兄弟项切到对应态，写出 `validate/states/<component_id>_<state>.png`。只对真正缺失的、按设计随状态变化的零件画红框并标 `missing`。这些预览**不**和默认态整图比 PSNR（对不上是正常的）。
+5. **导出后标注预览（最终交付）**：用实际导出的 PNG 按布局 JSON 拼默认态（同上，含引擎效果近似），再按审核预览的样式画标注：每个切图按 `visible_bounds` 画框、规范名、九宫格线、类型和 `fx:baked` / `fx:engine`，复用实例的标签后缀为 `→ <共享名>`。写出 `validate/preview_exported_annotated.png` 和 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注），路径记在报告的 `exported_preview`。把它们交给用户。
 
 `Image.paste(..., mask=)` 不是正确的 Porter-Duff over。Pillow 无法复现 PS 的混合模式、文字 hinting 和描边，遮罩后若残差集中在重叠层或文字本身，属于预期。
 
