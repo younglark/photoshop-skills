@@ -1,6 +1,12 @@
 ---
-name: Photoshop UXP scripts (.psjs)
+name: photoshop-psjs
 description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psjs): write, launch, poll, and verify document create/edit/export from an agent. Covers executeAsModal, batchPlay, file tokens, doc-id safety, and psjs vs UXP plugins vs ExtendScript/JSX. Chinese triggers: psjs驱动Photoshop, UXP脚本, batchPlay, executeAsModal, 用脚本改PSD, 从命令行跑Photoshop脚本, 图层样式脚本, 导出切片, 切图工作流, 九宫格, 切图清单, 布局JSON. Do NOT use for UXP plugin/panel or MCP-bridge development, ExtendScript/JSX-only work, or read-only PSD inspection that psd-tools/ag-psd can do without launching Photoshop."
+license: MIT-0
+compatibility: "Requires Adobe Photoshop 2023 (v23.5+) or later with UXP scripting, on Windows or macOS. The optional slicing helper needs Python 3 with psd-tools, Pillow and numpy."
+metadata:
+  author: younglark
+  version: "1.0.0"
+  homepage: https://github.com/younglark/photoshop-skills
 ---
 
 # 用 UXP 脚本 (.psjs) 驱动 Photoshop
