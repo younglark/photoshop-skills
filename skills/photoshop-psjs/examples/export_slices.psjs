@@ -386,6 +386,8 @@ try {
           }
 
           // Select base + any visible clipped layers, then new document from the target.
+          // effect_mode "engine": select_ids are the children of an effect group; the new
+          // document has no parent group, so the group's effects are intentionally not baked.
           const selectDescs = selectIds.map((id, idx) => {
             const d = {
               _obj: "select",

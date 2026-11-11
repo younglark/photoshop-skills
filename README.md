@@ -70,6 +70,16 @@ skills/
 - The skill instructions are mostly written in Simplified Chinese, with English trigger
   keywords; modern models read both.
 
+## Changelog
+
+- **1.1.0** — Group layer effects can be either baked into the slice (`effect_mode: "baked"`,
+  default) or drawn by the engine (`effect_mode: "engine"` + `engine_effects` parameters read
+  by psd-tools); the agent picks per part and the review preview shows the choice. `validate`
+  approximates engine drop shadows / outer glows, masks effects it cannot emulate, flags parts
+  that silently drop a group effect, and writes a final annotated preview rendered from the
+  exported PNGs (`validate/preview_exported_annotated.png`, plus a side-by-side with the PS render).
+- **1.0.0** — Standalone repository; first marketplace release.
+
 ## License
 
 [MIT-0](LICENSE) (MIT No Attribution), matching ClawHub's required license.

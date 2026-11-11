@@ -137,6 +137,174 @@ def find_token(text: str, pairs):
 
 
 # ---------------------------------------------------------------------------
+# Layer effect parameters (for engine-drawn effects)
+# ---------------------------------------------------------------------------
+
+# Effects a game engine commonly redraws (shadow / glow / outline / tint).
+ENGINE_FRIENDLY_EFFECTS = {"DropShadow", "OuterGlow", "Stroke", "ColorOverlay", "InnerShadow"}
+# Effects that only change pixels inside the shape (no extent outside logical bounds).
+INNER_EFFECTS = {"InnerShadow", "InnerGlow", "ColorOverlay", "GradientOverlay", "PatternOverlay", "Satin", "BevelEmboss"}
+# Effects validate can approximate with Pillow when the engine draws them.
+EMULATED_EFFECTS = {"DropShadow", "OuterGlow"}
+
+_COLOR_KEYS_255 = (("Rd  ", "Grn ", "Bl  "),)
+_COLOR_KEYS_FLOAT = (("redFloat", "greenFloat", "blueFloat"),)
+
+
+def _desc_get(desc, key):
+    """Read *key* from a psd-tools Descriptor or a plain dict (str / bytes keys)."""
+    if desc is None:
+        return None
+    candidates = [key]
+    if isinstance(key, str):
+        candidates.append(key.encode("latin-1"))
+    elif isinstance(key, bytes):
+        candidates.append(key.decode("latin-1"))
+    for k in candidates:
+        try:
+            if k in desc:
+                return desc[k]
+        except Exception:
+            continue
+    try:  # psd-tools Key enum lookup
+        from psd_tools.terminology import Key  # type: ignore
+        for member in Key:
+            if member.value in candidates:
+                try:
+                    if member in desc:
+                        return desc[member]
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
+def _num(v):
+    if v is None:
+        return None
+    for attr in ("value",):
+        if hasattr(v, attr) and not isinstance(v, (int, float)):
+            try:
+                v = getattr(v, attr)
+            except Exception:
+                pass
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def color_to_hex(desc):
+    """RGB color descriptor -> '#rrggbb'. Returns None for other color models."""
+    if desc is None:
+        return None
+    if isinstance(desc, str) and desc.startswith("#"):
+        return desc.lower()
+    for keys in _COLOR_KEYS_255:
+        vals = [_num(_desc_get(desc, k)) for k in keys]
+        if all(v is not None for v in vals):
+            return "#" + "".join(f"{int(round(max(0.0, min(255.0, v)))):02x}" for v in vals)
+    for keys in _COLOR_KEYS_FLOAT:
+        vals = [_num(_desc_get(desc, k)) for k in keys]
+        if all(v is not None for v in vals):
+            return "#" + "".join(f"{int(round(max(0.0, min(1.0, v)) * 255)):02x}" for v in vals)
+    return None
+
+
+def _safe_attr(obj, name):
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return None
+
+
+def effect_params(effect):
+    """Best-effort parameters of one psd-tools effect, never raising.
+
+    Keys follow the engine_effects schema: type, enabled, blend_mode, color
+    ('#rrggbb'), opacity (0-1), angle (deg), distance (px), size (px), spread or
+    choke (Photoshop percent 0-100), position (stroke). Unknown effect classes
+    keep their raw class name in ``type`` and set ``unknown: true``.
+    """
+    out = {"type": type(effect).__name__}
+    try:
+        enabled = _safe_attr(effect, "enabled")
+        out["enabled"] = True if enabled is None else bool(enabled)
+        bm = _safe_attr(effect, "blend_mode")
+        if bm is not None:
+            out["blend_mode"] = (enum_val(bm) or "").lower() or None
+        color = _safe_attr(effect, "color")
+        if color is not None:
+            hx = color_to_hex(color)
+            if hx:
+                out["color"] = hx
+            else:
+                out["color_raw"] = str(getattr(color, "classID", type(color).__name__))
+        op = _num(_safe_attr(effect, "opacity"))
+        if op is not None:
+            out["opacity"] = round(op / 100.0 if op > 1.0 else op, 4)
+        for key in ("angle", "distance", "size", "noise"):
+            val = _num(_safe_attr(effect, key))
+            if val is not None:
+                out[key] = round(val, 3)
+        if _safe_attr(effect, "use_global_light") is not None:
+            out["use_global_light"] = bool(_safe_attr(effect, "use_global_light"))
+        choke = _num(_safe_attr(effect, "choke"))
+        if choke is not None:
+            out["choke" if out["type"] in INNER_EFFECTS else "spread"] = round(choke, 3)
+        if out["type"] == "Stroke":
+            pos = _safe_attr(effect, "position")
+            out["position"] = (enum_val(pos) or "outside").lower() if pos is not None else "outside"
+            ft = _safe_attr(effect, "fill_type")
+            if ft is not None:
+                out["fill_type"] = (enum_val(ft) or "").lower() or None
+        if out["type"] in {"OuterGlow", "InnerGlow"}:
+            gt = _safe_attr(effect, "glow_type")
+            if gt is not None:
+                out["technique"] = (enum_val(gt) or "").lower() or None
+        if out["type"] not in ENGINE_FRIENDLY_EFFECTS | INNER_EFFECTS | {"OuterGlow"}:
+            out["unknown"] = True
+    except Exception as exc:  # never break prepare on an odd effect
+        out["error"] = str(exc)
+    return out
+
+
+def _effect_outset(eff):
+    """(left, top, right, bottom) pixels an outer effect may extend past the shape. Estimate only."""
+    t = eff.get("type") or ""
+    if eff.get("enabled") is False or t in INNER_EFFECTS:
+        return (0.0, 0.0, 0.0, 0.0)
+    size = float(eff.get("size") or 0)
+    if t == "Stroke":
+        pos = str(eff.get("position") or "outside").lower()
+        grow = 0.0 if pos.startswith("in") else (size / 2.0 if pos.startswith("c") else size)
+        return (grow, grow, grow, grow)
+    if t == "DropShadow":
+        import math
+        d = float(eff.get("distance") or 0)
+        a = math.radians(float(eff.get("angle") if eff.get("angle") is not None else 120))
+        dx, dy = -d * math.cos(a), d * math.sin(a)
+        return (max(0.0, size - dx), max(0.0, size - dy), max(0.0, size + dx), max(0.0, size + dy))
+    if t == "OuterGlow":
+        return (size, size, size, size)
+    return (0.0, 0.0, 0.0, 0.0)
+
+
+def estimate_effect_bounds(logical, effects):
+    """Logical bounds expanded by each engine effect's outset. Estimate, not Photoshop's exact box."""
+    if not logical:
+        return None
+    l, t, r, b = logical["left"], logical["top"], logical["right"], logical["bottom"]
+    for eff in effects or []:
+        if not isinstance(eff, dict):
+            continue
+        ol, ot, orr, ob = _effect_outset(eff)
+        l, t, r, b = min(l, logical["left"] - ol), min(t, logical["top"] - ot), max(r, logical["right"] + orr), max(b, logical["bottom"] + ob)
+    return {"left": round(l, 2), "top": round(t, 2), "right": round(r, 2), "bottom": round(b, 2)}
+
+
+# ---------------------------------------------------------------------------
 # Layer tree (visible-aware)
 # ---------------------------------------------------------------------------
 
@@ -183,10 +351,14 @@ def collect_layer(layer, path, depth, index_in_parent, warnings):
     try:
         fx = layer.effects
         if fx:
+            params = []
             for effect in fx:
                 enabled = getattr(effect, "enabled", True)
                 if enabled:
                     node["effects"].append(effect.__class__.__name__)
+                    params.append(effect_params(effect))
+            if params:
+                node["effect_params"] = params
     except Exception:
         pass
     if node["is_text"]:
@@ -1077,6 +1249,11 @@ def annotate_preview(base: Image.Image, entries, art_origin, out_path: Path, tit
         r_draw, b_draw = max(l, r - 1), max(t, b - 1)
         color = KIND_COLORS.get(entry["kind"], (255, 255, 255))
         draw.rectangle([l, t, r_draw, b_draw], outline=color + (255,), width=2)
+        if entry.get("effect_mode") == "engine" and entry.get("engine_effects"):
+            eb = estimate_effect_bounds({"left": l, "top": t, "right": r, "bottom": b}, entry["engine_effects"])
+            ebox = normalize_box(eb["left"], eb["top"], eb["right"], eb["bottom"], width=overlay.width, height=overlay.height)
+            if ebox is not None and tuple(ebox) != (l, t, r, b):
+                draw.rectangle([ebox[0], ebox[1], max(ebox[0], ebox[2] - 1), max(ebox[1], ebox[3] - 1)], outline=(255, 60, 200, 200), width=1)
         nine = entry.get("nine_slice")
         if nine and entry["kind"] == "nine_slice":
             guide = (255, 220, 80, 220)
@@ -1089,6 +1266,9 @@ def annotate_preview(base: Image.Image, entries, art_origin, out_path: Path, tit
             draw.line([(l, top_g), (r_draw, top_g)], fill=guide, width=1)
             draw.line([(l, bot_g), (r_draw, bot_g)], fill=guide, width=1)
         label = f"{entry['name']}  [{entry['kind']}]"
+        if entry.get("effect_mode"):
+            fx = ",".join((e.get("type") or "?") for e in (entry.get("engine_effects") or []) if isinstance(e, dict))
+            label += f" fx:{entry['effect_mode']}" + (f"({fx})" if fx else "")
         # Place the label above the box if there is room, else inside.
         ty = t - 16 if t >= 18 else t + 2
         tx = max(2, l)
@@ -1257,7 +1437,7 @@ def leaf_to_effect_group_map(root, artboard_bbox=None):
     return mapping
 
 
-def effect_group_record(group, crop_rel=None, size=None):
+def effect_group_record(group, crop_rel=None, size=None, ancestors=None):
     lid = group["layer_id"]
     return {
         "layer_id": lid,
@@ -1267,18 +1447,28 @@ def effect_group_record(group, crop_rel=None, size=None):
         "is_group": True,
         "is_text": False,
         "effects": node_effect_names(group),
+        "effect_params": list(group.get("effect_params") or []),
         "visible": bool(group.get("visible")),
         "bbox": group.get("bbox"),
         "child_leaf_ids": collect_descendant_leaf_ids(group),
+        "child_ids": [i for i in descendant_ids(group) if i != lid],
+        "ancestor_ids": [a["layer_id"] for a in (ancestors or []) if a.get("layer_id") is not None],
         "select_ids": [lid],
         "suggested_select_ids": [lid],
+        "engine_select_ids": [
+            c["layer_id"] for c in all_children(group)
+            if c.get("layer_id") is not None and c.get("visible", True)
+        ],
         "crop": crop_rel,
         "size": size,
         "notes": (
             "Layer effects such as DropShadow live on this group, not on the inner leaf. "
-            "Export the group: set layer_id and select_ids to this group id. "
-            "A missing crop for this id is not a reason to fall back to a child. "
-            "Visible bounds must include the baked effects; do not clip to the child's logical bounds."
+            "Pick an effect_mode per part. baked (default): layer_id and select_ids = this group id; "
+            "visible bounds include the baked effect, logical bounds exclude it. "
+            "engine: select the children (engine_select_ids), set effect_mode 'engine' and copy "
+            "effect_params into engine_effects so the engine draws them. "
+            "Never select only the children without one of these: the group effect would be lost silently. "
+            "A missing crop for this id is not a reason to fall back to a child."
         ),
     }
 
@@ -1420,6 +1610,7 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
             "is_text": bool(base.get("is_text")),
             "text": base.get("text"),
             "effects": list(base.get("effects") or []),
+            "effect_params": list(base.get("effect_params") or []),
             "visible": bool(base.get("visible")),
             "clipping": bool(base.get("clipping")),
             "opacity": base.get("opacity"),
@@ -1452,13 +1643,15 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
             continue
         rec["parent_group_id"] = group["layer_id"]
         rec["parent_effects"] = node_effect_names(group)
+        rec["parent_effect_params"] = list(group.get("effect_params") or [])
         rec["suggested_select_ids"] = [group["layer_id"]]
         notes = rec.get("notes") or []
         if isinstance(notes, str):
             notes = [notes]
         notes.append(
-            "Nearest parent group has layer effects; export that group id "
-            "(see suggested_select_ids), not only this leaf."
+            "Nearest parent group has layer effects. baked: export that group id "
+            "(suggested_select_ids). engine: export the children with effect_mode 'engine' and "
+            "engine_effects copied from parent_effect_params. Never only this leaf without either."
         )
         rec["notes"] = notes
 
@@ -1484,7 +1677,7 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
                 image.save(out_png, "PNG")
                 crop_rel = f"crops/{public_crop_name(lid)}"
                 size = list(image.size)
-        rec = effect_group_record(group, crop_rel=crop_rel, size=size)
+        rec = effect_group_record(group, crop_rel=crop_rel, size=size, ancestors=_anc)
         rec["nine_slice"] = None
         crop_records.append(rec)
         existing_ids.add(lid)
@@ -1725,6 +1918,9 @@ def flatten_components(manifest):
                 "opacity": part.get("opacity"),
                 "blend_mode": part.get("blend_mode"),
                 "notes": list(part.get("notes") or []),
+                "effect_mode": part.get("effect_mode"),
+                "engine_effects": list(part.get("engine_effects") or []),
+                "effect_reason": part.get("effect_reason"),
                 "component_id": comp.get("id"),
                 "component_type": comp.get("type"),
                 "part_role": part.get("role"),
@@ -1742,6 +1938,109 @@ def flatten_components(manifest):
     return entries
 
 
+def effect_groups_from_tree(tree):
+    """Compact effect-group records (id, effects, params, descendants, ancestors) from a layer tree."""
+    roots = tree if isinstance(tree, list) else ([tree] if isinstance(tree, dict) else [])
+    out = []
+    for root in roots:
+        if not root:
+            continue
+        for group, anc in iter_effect_groups(root):
+            out.append({
+                "layer_id": group["layer_id"],
+                "effects": node_effect_names(group),
+                "effect_params": list(group.get("effect_params") or []),
+                "child_ids": [i for i in descendant_ids(group) if i != group["layer_id"]],
+                "ancestor_ids": [a["layer_id"] for a in anc if a.get("layer_id") is not None],
+            })
+    return out
+
+
+def load_effect_groups(manifest=None, manifest_path=None, group_effects_path=None):
+    """group_effects.json (explicit or next to the manifest) or the manifest layer tree."""
+    candidates = []
+    if group_effects_path:
+        candidates.append(Path(group_effects_path))
+    if manifest_path:
+        candidates.append(Path(manifest_path).parent / "group_effects.json")
+    for path in candidates:
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                warn(f"cannot read {path}: {exc}")
+                continue
+            groups = data.get("groups") if isinstance(data, dict) else data
+            out = []
+            for g in groups or []:
+                if g.get("layer_id") is None:
+                    continue
+                out.append({
+                    "layer_id": g["layer_id"],
+                    "effects": list(g.get("effects") or []),
+                    "effect_params": list(g.get("effect_params") or []),
+                    "child_ids": list(g.get("child_ids") or g.get("child_leaf_ids") or []),
+                    "ancestor_ids": list(g.get("ancestor_ids") or []),
+                })
+            return out
+    if manifest is not None:
+        tree = layer_tree_from_manifest(manifest)
+        if tree:
+            return effect_groups_from_tree(tree)
+    return []
+
+
+def _int_ids(values):
+    out = set()
+    for v in values or []:
+        try:
+            out.add(int(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def find_silent_effect_loss(items, effect_groups):
+    """Parts that select children of an effect group but neither bake the group nor record engine_effects.
+
+    *items* are manifest entries or layout nodes. A part is fine when it selects the
+    effect group itself (or one of its ancestors), or when it has effect_mode 'engine'
+    with a non-empty engine_effects list. dynamic_text is skipped (attributes only).
+    """
+    problems = []
+    for item in items or []:
+        if item.get("kind") == "dynamic_text":
+            continue
+        ids = _int_ids(item.get("select_ids") or ([item.get("layer_id")] if item.get("layer_id") is not None else []))
+        if not ids:
+            continue
+        mode = item.get("effect_mode")
+        engine_ok = mode == "engine" and bool(item.get("engine_effects"))
+        for g in effect_groups or []:
+            gid = g.get("layer_id")
+            covering = {gid} | _int_ids(g.get("ancestor_ids"))
+            if ids & covering:
+                continue
+            if not ids & _int_ids(g.get("child_ids")):
+                continue
+            if engine_ok:
+                continue
+            problems.append({
+                "type": "group_effect_lost",
+                "name": item.get("name"),
+                "effect_group_id": gid,
+                "group_effects": list(g.get("effects") or []),
+                "select_ids": sorted(ids),
+                "effect_mode": mode,
+                "hint": (
+                    "select_ids are children of a group that carries layer effects. Either bake: "
+                    "select the group id (effect_mode 'baked'), or set effect_mode 'engine' and copy the "
+                    "group's effect_params into engine_effects."
+                ),
+            })
+    return problems
+
+
 def cmd_flatten(args):
     path = Path(args.manifest)
     manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -1751,7 +2050,19 @@ def cmd_flatten(args):
     out = Path(args.out) if args.out else path
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"manifest": str(out), "entry_count": len(entries), "by_kind": dict(Counter(e["kind"] for e in entries)), "hidden_entries": sum(1 for e in entries if e.get("hidden"))}, ensure_ascii=False, indent=2))
+    groups = load_effect_groups(manifest, path, getattr(args, "group_effects", None))
+    effect_issues = find_silent_effect_loss(entries, groups)
+    summary = {
+        "manifest": str(out),
+        "entry_count": len(entries),
+        "by_kind": dict(Counter(e["kind"] for e in entries)),
+        "hidden_entries": sum(1 for e in entries if e.get("hidden")),
+        "by_effect_mode": dict(Counter(e.get("effect_mode") or "-" for e in entries)),
+        "effect_issues": effect_issues,
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    for problem in effect_issues:
+        warn(f"group effect would be lost: {problem['name']} (group {problem['effect_group_id']})")
     return 0
 
 
@@ -1955,6 +2266,9 @@ def enrich_components(components, nodes_by_name):
             out["logical_bounds"] = node.get("logical_bounds")
             out["nine_slice"] = node.get("nine_slice")
             out["kind"] = node.get("kind") or out.get("kind")
+            for key in ("effect_mode", "engine_effects", "effect_reason", "effect_bounds", "effect_bounds_estimated"):
+                if node.get(key) is not None:
+                    out[key] = node[key]
             if node.get("text"):
                 out["text"] = node["text"]
         return out
@@ -2064,11 +2378,28 @@ def cmd_build_layout(args):
             "default": entry.get("default", True),
             "hidden": entry.get("hidden", False),
         }
+        if entry.get("effect_mode"):
+            node["effect_mode"] = entry["effect_mode"]
+            node["effect_reason"] = entry.get("effect_reason")
+        if entry.get("engine_effects"):
+            node["engine_effects"] = list(entry["engine_effects"])
+        if entry.get("effect_mode") == "engine":
+            # The PNG has no effect pixels: its box is the logical box.
+            base = vis_ab or logi_ab
+            if base:
+                node["logical_bounds"] = dict(base)
+                node["anchor"] = _center(base)
+            node["effect_bounds"] = estimate_effect_bounds(base, node.get("engine_effects"))
+            node["effect_bounds_estimated"] = True
         nodes.append(node)
 
     nodes = sort_by_paint_order(nodes, layer_tree_from_manifest(manifest))
     nodes_by_name = {n["name"]: n for n in nodes}
     components = enrich_components(manifest.get("components") or [], nodes_by_name)
+    effect_groups = load_effect_groups(manifest, args.manifest, getattr(args, "group_effects", None))
+    effect_issues = find_silent_effect_loss(nodes, effect_groups)
+    for problem in effect_issues:
+        warn(f"group effect lost: {problem['name']} (group {problem['effect_group_id']})")
     layout = {
         "schema": SCHEMA_LAYOUT,
         "source": manifest["source"],
@@ -2082,11 +2413,15 @@ def cmd_build_layout(args):
         "components": components,
         "missing": manifest.get("missing") or [],
         "tree": manifest.get("tree") or [],
+        "effect_groups": effect_groups,
+        "effect_issues": effect_issues,
         "notes": [
             "Coordinates are artboard-relative pixels (1x).",
             "Hierarchy is component semantics (screen > tab_group > tab > state > part).",
             "source_name / source_path / layer_id are PSD references only.",
-            "visible_bounds include layer effects; logical_bounds do not.",
+            "visible_bounds include baked layer effects; logical_bounds do not.",
+            "effect_mode 'engine': the PNG has no effect pixels (visible == logical); the engine draws "
+            "engine_effects. effect_bounds is an estimate of their extent, not Photoshop's exact box.",
             "anchor is the center of logical_bounds; pivot is normalized (0.5, 0.5).",
             "Engine importers are out of scope for this schema.",
         ],
@@ -2306,7 +2641,113 @@ def draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin):
     }
 
 
-def recomposite(layout, slices_dir, canvas_size, render_text=False, fonts_dir=None):
+def _fx_opacity(eff):
+    op = eff.get("opacity")
+    if op is None:
+        return 0.75
+    op = float(op)
+    return max(0.0, min(1.0, op / 100.0 if op > 1.0 else op))
+
+
+def emulate_outer_effect(im, eff):
+    """Approximate a DropShadow / OuterGlow from a part's alpha. Returns (layer, dx, dy) or None.
+
+    Pillow approximation only: spread dilates the alpha by spread% of size, the
+    rest of size becomes a Gaussian blur (sigma ~ size/3), the effect is drawn with
+    normal blending (Photoshop's multiply/screen are not emulated).
+    """
+    import math
+    from PIL import ImageFilter
+
+    t = eff.get("type")
+    if t not in EMULATED_EFFECTS or eff.get("enabled") is False:
+        return None
+    size = max(0.0, float(eff.get("size") or 0))
+    spread = max(0.0, min(100.0, float(eff.get("spread") or 0))) / 100.0
+    dist = float(eff.get("distance") or 0) if t == "DropShadow" else 0.0
+    ang = math.radians(float(eff.get("angle") if eff.get("angle") is not None else 120))
+    dx, dy = int(round(-dist * math.cos(ang))), int(round(dist * math.sin(ang)))
+    pad = int(math.ceil(size + abs(dx) + abs(dy))) + 2
+    alpha = im.getchannel("A")
+    big = Image.new("L", (im.width + 2 * pad, im.height + 2 * pad), 0)
+    big.paste(alpha, (pad, pad))
+    grow = int(round(size * spread))
+    if grow > 0:
+        big = big.filter(ImageFilter.MaxFilter(min(2 * grow + 1, 51)))
+    sigma = size * (1.0 - spread) / 3.0
+    if sigma > 0.25:
+        big = big.filter(ImageFilter.GaussianBlur(sigma))
+    rgb = hex_to_rgba(eff.get("color") or ("#000000" if t == "DropShadow" else "#ffffff"))[:3]
+    a = (np.asarray(big, dtype=np.float32) * _fx_opacity(eff)).clip(0, 255).astype(np.uint8)
+    layer = Image.new("RGBA", big.size, rgb + (0,))
+    layer.putalpha(Image.fromarray(a, "L"))
+    return layer, dx - pad, dy - pad
+
+
+def render_engine_effects(canvas, node, im, x, y):
+    """Draw emulated engine effects under a part. Returns (canvas, emulated, unemulated)."""
+    emulated, unemulated = [], []
+    if node.get("effect_mode") != "engine":
+        return canvas, emulated, unemulated
+    for eff in node.get("engine_effects") or []:
+        if not isinstance(eff, dict) or eff.get("enabled") is False:
+            continue
+        res = None
+        try:
+            res = emulate_outer_effect(im, eff)
+        except Exception as exc:
+            warn(f"effect emulation failed for {node.get('name')}: {exc}")
+        if res is None:
+            unemulated.append(eff.get("type") or "?")
+            continue
+        layer, ox, oy = res
+        canvas = alpha_over(canvas, layer, (x + ox, y + oy))
+        emulated.append(eff.get("type"))
+    return canvas, emulated, unemulated
+
+
+def unemulated_effect_mask(layout, cw, ch):
+    """Mask of engine-effect areas validate cannot emulate (ring for outer, box for inner effects)."""
+    mask = np.zeros((ch, cw), dtype=bool)
+    listed = []
+    for node in layout.get("nodes") or []:
+        if node.get("effect_mode") != "engine":
+            continue
+        effs = [e for e in (node.get("engine_effects") or []) if isinstance(e, dict) and e.get("enabled") is not False]
+        todo = [e for e in effs if e.get("type") not in EMULATED_EFFECTS]
+        if not todo:
+            continue
+        logi = node.get("logical_bounds") or node.get("visible_bounds")
+        if not logi:
+            continue
+        outer = estimate_effect_bounds(logi, todo) or logi
+        inner = any(e.get("type") in INNER_EFFECTS for e in todo) or any(
+            e.get("type") == "Stroke" and not str(e.get("position") or "outside").lower().startswith("out") for e in todo
+        )
+
+        def clip(b):
+            l, t, r, bt = [int(round(v)) for v in (b["left"], b["top"], b["right"], b["bottom"])]
+            return max(0, l), max(0, t), min(cw, r), min(ch, bt)
+
+        l, t, r, bt = clip(outer)
+        if r > l and bt > t:
+            ring = np.zeros_like(mask)
+            ring[t:bt, l:r] = True
+            if not inner:
+                il, it, ir, ib = clip(logi)
+                if ir > il and ib > it:
+                    ring[it:ib, il:ir] = False
+            mask |= ring
+        listed.append({
+            "name": node.get("name"),
+            "effects": [e.get("type") for e in todo],
+            "masked_bounds": outer,
+            "area": "box" if inner else "ring",
+        })
+    return mask, listed
+
+
+def recomposite(layout, slices_dir, canvas_size, render_text=False, fonts_dir=None, emulate_effects=True):
     w, h = canvas_size
     canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     placed = []
@@ -2333,8 +2774,13 @@ def recomposite(layout, slices_dir, canvas_size, render_text=False, fonts_dir=No
             placed.append({"name": node["name"], "missing_bounds": True})
             continue
         x, y = int(round(vb["left"])), int(round(vb["top"]))
+        info = {"name": node["name"], "xy": [x, y], "size": list(im.size)}
+        if emulate_effects and node.get("effect_mode") == "engine":
+            canvas, emulated, unemulated = render_engine_effects(canvas, node, im, x, y)
+            info["effects_emulated"] = emulated
+            info["effects_unemulated"] = unemulated
         canvas = alpha_over(canvas, im, (x, y))
-        placed.append({"name": node["name"], "xy": [x, y], "size": list(im.size)})
+        placed.append(info)
     return canvas, placed
 
 
@@ -2688,6 +3134,58 @@ def write_state_previews(layout, slices_dir, canvas_size, out_dir, fonts_dir=Non
     return written
 
 
+def layout_nodes_as_preview_entries(nodes):
+    """Layout nodes -> annotate_preview entries, boxed by visible_bounds (artboard coords)."""
+    entries = []
+    for node in nodes or []:
+        b = node.get("visible_bounds") or node.get("logical_bounds")
+        if not b:
+            continue
+        entries.append({
+            "name": node.get("name"),
+            "kind": node.get("kind") or "image",
+            "logical_bounds": [b["left"], b["top"], b["right"], b["bottom"]],
+            "nine_slice": node.get("nine_slice"),
+            "effect_mode": node.get("effect_mode"),
+            "engine_effects": node.get("engine_effects"),
+        })
+    return entries
+
+
+def write_exported_preview(layout, rec, ref, out_dir, title=None):
+    """Final deliverable: annotated preview drawn on the recomposite of the exported PNGs.
+
+    Writes preview_exported_annotated.png and, when *ref* is given, a side-by-side with
+    the Photoshop full render (preview_exported_vs_ps.png). Returns the written paths.
+    """
+    out_dir = Path(out_dir)
+    nodes = (layout.get("nodes") or [])
+    entries = layout_nodes_as_preview_entries(nodes)
+    bg = Image.new("RGBA", rec.size, (24, 24, 24, 255))
+    base = Image.alpha_composite(bg, rec.convert("RGBA"))
+    art = (layout.get("source") or {}).get("artboard") or {}
+    title = title or f"{art.get('name') or 'artboard'}  exported {len(entries)} slices"
+    annotated = out_dir / "preview_exported_annotated.png"
+    annotate_preview(base, entries, (0, 0), annotated, title)
+    paths = {"annotated": str(annotated)}
+    if ref is not None:
+        left = ref.convert("RGBA")
+        left = Image.alpha_composite(Image.new("RGBA", left.size, (24, 24, 24, 255)), left).convert("RGB")
+        right = Image.open(annotated).convert("RGB")
+        top = 36  # legend height of annotate_preview
+        lw, lh = left.size
+        gap = 20
+        side = Image.new("RGB", (lw + gap + right.width, max(lh + top, right.height)), (30, 30, 30))
+        side.paste(left, (0, top))
+        side.paste(right, (lw + gap, 0))
+        d = ImageDraw.Draw(side)
+        d.text((8, 8), "Photoshop full render", fill=(255, 255, 255), font=load_font(16))
+        sbs = out_dir / "preview_exported_vs_ps.png"
+        side.save(sbs)
+        paths["side_by_side"] = str(sbs)
+    return paths
+
+
 def cmd_validate(args):
     layout = json.loads(Path(args.layout).read_text(encoding="utf-8"))
     slices_dir = Path(args.slices_dir)
@@ -2723,6 +3221,12 @@ def cmd_validate(args):
         issues.append({"type": "missing_slices", "names": missing})
     if empty:
         issues.append({"type": "empty_images", "names": empty})
+    effect_groups = layout.get("effect_groups")
+    if getattr(args, "group_effects", None) or not effect_groups:
+        effect_groups = load_effect_groups(None, None, getattr(args, "group_effects", None)) or effect_groups or []
+    if not effect_groups and (layout.get("layer_tree") or layout.get("tree")):
+        effect_groups = effect_groups_from_tree(layout.get("layer_tree") or layout.get("tree"))
+    issues.extend(find_silent_effect_loss(layout["nodes"], effect_groups))
 
     fonts_dir = getattr(args, "fonts_dir", None)
     default_layout = layout_with_nodes(layout, default_nodes(layout))
@@ -2736,10 +3240,12 @@ def cmd_validate(args):
     rec_m = np.asarray(rec_masked.convert("RGBA").crop((0, 0, cw, ch)))
     rec_t = np.asarray(rec_text.convert("RGBA").crop((0, 0, cw, ch)))
     text_mask = text_region_mask(default_layout, cw, ch)
+    fx_mask, unemulated = unemulated_effect_mask(default_layout, cw, ch)
+    masked_all = text_mask | fx_mask
 
     m_text_all = metrics(ref, rec_t, None)
     m_text_masked_regions = metrics(ref, rec_t, text_mask)
-    m_masked = metrics(ref, rec_m, text_mask)
+    m_masked = metrics(ref, rec_m, masked_all)
     m_no_text_all = metrics(ref, rec_m, None)
     worst10, _all = per_element_diffs(default_layout, ref, rec_t, cw, ch)
     worst10_masked, _ = per_element_diffs(default_layout, ref, rec_m, cw, ch)
@@ -2758,6 +3264,7 @@ def cmd_validate(args):
     )
 
     state_previews = write_state_previews(layout, slices_dir, (w, h), out_dir, fonts_dir=fonts_dir)
+    exported_preview = write_exported_preview(default_layout, rec_text, full.crop((0, 0, cw, ch)), out_dir)
 
     rendered = sum(1 for p in placed_text if p.get("rendered"))
     report = {
@@ -2776,6 +3283,12 @@ def cmd_validate(args):
         "diff_no_text_unmasked": m_no_text_all,
         "worst_10_elements_text_rendered": worst10,
         "worst_10_elements_text_masked": worst10_masked[:10],
+        "effect_modes": dict(Counter(n.get("effect_mode") or "-" for n in default_layout["nodes"])),
+        "engine_effects_emulated": [
+            {"name": p["name"], "effects": p["effects_emulated"]} for p in placed_masked if p.get("effects_emulated")
+        ],
+        "engine_effects_unemulated": unemulated,
+        "exported_preview": exported_preview,
         "state_previews": [
             {k: v for k, v in item.items() if k != "activation"} | {"activation": item["activation"]}
             for item in state_previews
@@ -2783,7 +3296,10 @@ def cmd_validate(args):
         "notes": [
             "Default-state recomposite only (parts currently shown in the PSD) is compared to the PS render.",
             "diff_text_rendered: slices + Pillow approximation of dynamic_text vs the PS render.",
-            "diff_text_masked: slices only; dynamic_text boxes excluded from the metrics.",
+            "diff_text_masked: slices only; dynamic_text boxes and unemulated engine-effect areas excluded from the metrics.",
+            "effect_mode 'engine': DropShadow / OuterGlow are approximated with Pillow (normal blend, Gaussian blur); "
+            "other engine effects are listed in engine_effects_unemulated and masked.",
+            "preview_exported_annotated.png is drawn on the recomposite of the exported PNGs; show it to the user as the final check.",
             "Pillow cannot emulate Photoshop blend modes, layer effects on type, or hinting; residual error there is expected.",
             "visible_bounds use post-trim insets (before.left - after.left) so the PNG origin matches the tight opaque box.",
             "Alternate states are written to validate/states/<component>_<state>.png for visual check, not measured against the default render.",
@@ -2815,6 +3331,7 @@ def build_parser():
     s = sub.add_parser("flatten", help="Flatten an agent component manifest into export entries")
     s.add_argument("--manifest", required=True)
     s.add_argument("--out", default=None, help="Defaults to overwriting --manifest")
+    s.add_argument("--group-effects", default=None, help="group_effects.json (default: next to --manifest)")
     s.set_defaults(func=cmd_flatten)
 
     s = sub.add_parser("infer", help="Optional keyword draft only; writes draft_manifest.json for the agent to review")
@@ -2845,6 +3362,7 @@ def build_parser():
     s.add_argument("--export-log", required=True)
     s.add_argument("--slices-dir", required=True)
     s.add_argument("--out", required=True)
+    s.add_argument("--group-effects", default=None, help="group_effects.json (default: next to --manifest)")
     s.set_defaults(func=cmd_build_layout)
 
     s = sub.add_parser("validate", help="Recomposite and compare against a full Photoshop render")
@@ -2853,6 +3371,7 @@ def build_parser():
     s.add_argument("--full-render", required=True)
     s.add_argument("--out-dir", required=True)
     s.add_argument("--fonts-dir", default=None, help="Directory of TTF/OTF files used to approximate dynamic_text")
+    s.add_argument("--group-effects", default=None, help="Optional group_effects.json for the silent effect-loss check")
     s.set_defaults(func=cmd_validate)
     return p
 

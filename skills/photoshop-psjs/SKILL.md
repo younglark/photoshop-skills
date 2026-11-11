@@ -5,7 +5,7 @@ license: MIT-0
 compatibility: "Requires Adobe Photoshop 2023 (v23.5+) or later with UXP scripting, on Windows or macOS. The optional slicing helper needs Python 3 with psd-tools, Pillow and numpy."
 metadata:
   author: younglark
-  version: "1.0.0"
+  version: "1.1.0"
   homepage: https://github.com/younglark/photoshop-skills
 ---
 
@@ -220,7 +220,7 @@ await out.write(JSON.stringify(log, null, 2));
 
 ## 9. Agent 切图工作流
 
-把界面切成游戏引擎可导入的 1x PNG，并产出一份按组件语义组织、引擎无关的中间布局 JSON。细节、schema、命名、识别方法和实测见 [references/slicing.md](references/slicing.md)。**先按该文文首的决策树走：** 打开材料（含组上的图层效果）→ 识别组件 → 分清共用与随状态变化的零件 → 区分变体与旧稿 → 只给会变的零件记 missing → 停在审核门闩。脚本与 Python 助手： [examples/export_slices.psjs](examples/export_slices.psjs)、[examples/slicing_helper.py](examples/slicing_helper.py)、[examples/naming_rules.example.json](examples/naming_rules.example.json)、[examples/export_config.example.json](examples/export_config.example.json)。
+把界面切成游戏引擎可导入的 1x PNG，并产出一份按组件语义组织、引擎无关的中间布局 JSON。细节、schema、命名、识别方法和实测见 [references/slicing.md](references/slicing.md)。**先按该文文首的决策树走：** 打开材料（含组上的图层效果，并为每个受影响的部件选效果方式）→ 识别组件 → 分清共用与随状态变化的零件 → 区分变体与旧稿 → 只给会变的零件记 missing → 停在审核门闩。脚本与 Python 助手： [examples/export_slices.psjs](examples/export_slices.psjs)、[examples/slicing_helper.py](examples/slicing_helper.py)、[examples/naming_rules.example.json](examples/naming_rules.example.json)、[examples/export_config.example.json](examples/export_config.example.json)。
 
 **Python 环境：** 用项目 venv 运行助手，不要把包装进系统 Python。需要 `psd-tools[composite]`、Pillow、numpy。打开大文档用已核实的 `PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))`（不要猜参数，也不要设置 `ParseLimits.max_objects` 类属性）。详见 slicing.md「Python 环境」。
 
@@ -228,13 +228,13 @@ await out.write(JSON.stringify(log, null, 2));
 
 **流程（确认前不导出）：**
 
-1. **准备材料（离线）**：`prepare`。`--artboard <画板名或id>` 可选；省略则处理所有可见顶层画板，没有画板时处理整份画布。树里包含隐藏层（`visible` 标记）。`crops/` 主要是可导出叶子；带图层效果的组会写入 `group_effects.json` 和 `crops_index.json`（能合成时还有组裁切图）。用索引查 id，不要猜文件名。组 id 没有裁切图时，不要改用内层叶子——先看该组有没有效果。无效果的分组、空层或在画板外的，回到 `tree.json` 判断；没有裁切图不等于缺失状态。
-2. **Agent 编写 manifest**：识别页签组、底栏、按钮、列表行等交互组件，把底/高亮/图标/文字按状态拆成独立部件，不要把状态烘焙在一起。先看设计里哪些零件跨状态共用、哪些会变：共用的放进 `shared`（文件名不加状态后缀），会变的放进各 `states`。隐藏层只有在主体/内容不变、差别只是状态样式（明度、描边、发光、配色等）时才算交替状态；同一槽位但换了内容或徽记的，当作旧稿忽略，不要用它去顶替共用的真资源，也不要把共用零件写成 missing。落在当前选中项槽里、同一主体且只是发光/高亮样式的隐藏层，应作为该态的 `highlight`（默认选中态也要纳入）；叠在可见选中底之上的发光/气泡层即使形状不同，也是叠加的高亮，不是替换，不要挂进 `uncertain_hidden`；只有内容或母题对不上时才写 `uncertain_hidden`（带上两侧裁切图）。missing 以同组里最完整的那一项为模板（例如选中项有 base + highlight + label），每个缺少其中一件的兄弟项都要列出，包括 highlight。单个特殊样式的列表行只是该行的一个实例，不要给其它行推断缺失状态，也不要给这一行推断缺失的 normal，除非设计里每行都有成套变体。选导出目标时，检查该元素最近的父组（或代表该元素的组）上有没有图层效果（如投影）：效果在组上、内层叶子没有时，`layer_id` / `select_ids` 用组 id，不要因为 `crops/` 里没有该组缩略图就退回叶子；可见框必须包含烘焙后的效果，不要裁到叶子的逻辑框。禁止捏造。命名为 `模块_类型_用途_状态`（小写；共用零件省略状态段），不要直接用 PSD 图层名。类型：`image` | `nine_slice` | `dynamic_text` | `art_text`。
-3. **审核门闩**：`flatten` + `preview` 产出标注预览和 JSON。用户改 JSON 确认；`status` 在确认前保持 `pending_review`。`preview` 会跳过倒置或空的包围盒并给出警告，不要因此中断。
-4. **导出（`.psjs`）**：脚本只硬编码一个 `CONFIG_URL`，从作业 JSON 读路径。按 `layer_id` 导出 1x PNG，效果烘焙进图；重复实例各导一份。`dynamic_text` 不出图，只导出文本属性；`art_text` 出图。隐藏状态层会临时显示再恢复，文档不保存。
-5. **布局 JSON**：按组件语义组织（如 `screen > tab_group > tab > state > part`），源图层 id/路径仅供对照。记录可见尺寸（含效果）、逻辑尺寸（不含效果）、锚点、九宫格、文本属性和图片。各引擎导入器自己写。
-6. **校验**：只把**默认状态**按 src-over 拼回去，和 PS 整图比像素差 / CIEDE2000 ΔE（含 Pillow 动态文字版与遮罩版，并列误差最大的 10 条）。再为每个交替状态写出预览图供目视检查。同时检查漏切、重名、空图。
-7. **跑完再收尾**：确认后，导出、`build-layout`、`validate` 要连续跑完；写出 `export_log.json` 不算完成，读过 `validate/validate_report.json`（`issues`、遮罩 PSNR / ΔE）才算完成。长命令设超时并写日志，失败就读日志修正重跑，不要静默停下。
+1. **准备材料（离线）**：`prepare`。`--artboard <画板名或id>` 可选；省略则处理所有可见顶层画板，没有画板时处理整份画布。树里包含隐藏层（`visible` 标记）。`crops/` 主要是可导出叶子；带图层效果的组会写入 `group_effects.json` 和 `crops_index.json`（能合成时还有组裁切图），并附 psd-tools 读出的效果参数 `effect_params`（类型、混合模式、颜色、不透明度、角度、距离、大小、扩展/阻塞、描边位置）。用索引查 id，不要猜文件名。组 id 没有裁切图时，不要直接改用内层叶子——先看该组有没有效果。无效果的分组、空层或在画板外的，回到 `tree.json` 判断；没有裁切图不等于缺失状态。
+2. **Agent 编写 manifest**：识别页签组、底栏、按钮、列表行等交互组件，把底/高亮/图标/文字按状态拆成独立部件，不要把状态烘焙在一起。先看设计里哪些零件跨状态共用、哪些会变：共用的放进 `shared`（文件名不加状态后缀），会变的放进各 `states`。隐藏层只有在主体/内容不变、差别只是状态样式（明度、描边、发光、配色等）时才算交替状态；同一槽位但换了内容或徽记的，当作旧稿忽略，不要用它去顶替共用的真资源，也不要把共用零件写成 missing。落在当前选中项槽里、同一主体且只是发光/高亮样式的隐藏层，应作为该态的 `highlight`（默认选中态也要纳入）；叠在可见选中底之上的发光/气泡层即使形状不同，也是叠加的高亮，不是替换，不要挂进 `uncertain_hidden`；只有内容或母题对不上时才写 `uncertain_hidden`（带上两侧裁切图）。missing 以同组里最完整的那一项为模板（例如选中项有 base + highlight + label），每个缺少其中一件的兄弟项都要列出，包括 highlight。单个特殊样式的列表行只是该行的一个实例，不要给其它行推断缺失状态，也不要给这一行推断缺失的 normal，除非设计里每行都有成套变体。选导出目标时，检查该元素最近的父组（或代表该元素的组）上有没有图层效果（如投影）。效果在组上、内层叶子没有时，给该部件选一种 `effect_mode`（见 slicing.md「组效果：烘焙还是引擎绘制」）：**`baked`**（默认）——`layer_id` / `select_ids` 用组 id，效果烘焙进图，可见框含效果、逻辑框不含；**`engine`**——`select_ids` 用子层，把组的 `effect_params` 抄进 `engine_effects`，由引擎绘制，图里没有效果像素。每个这样的部件写一句 `effect_reason`。项目规则或用户指定了方式就照做。**唯一禁止的是只选子层又不记录效果**（效果悄悄丢失）。禁止捏造。命名为 `模块_类型_用途_状态`（小写；共用零件省略状态段），不要直接用 PSD 图层名。类型：`image` | `nine_slice` | `dynamic_text` | `art_text`。
+3. **审核门闩**：`flatten` + `preview` 产出标注预览和 JSON（标签带 `fx:baked` / `fx:engine`，引擎效果画出估计范围，便于用户在审核时改方式；`flatten` 会在 `effect_issues` 里列出会丢效果的部件）。用户改 JSON 确认；`status` 在确认前保持 `pending_review`。`preview` 会跳过倒置或空的包围盒并给出警告，不要因此中断。
+4. **导出（`.psjs`）**：脚本只硬编码一个 `CONFIG_URL`，从作业 JSON 读路径。按 `layer_id` / `select_ids` 导出 1x PNG：`baked` 选组，效果烘焙进图；`engine` 选子层合并，图里不含组效果；重复实例各导一份。`dynamic_text` 不出图，只导出文本属性；`art_text` 出图。隐藏状态层会临时显示再恢复，文档不保存。
+5. **布局 JSON**：按组件语义组织（如 `screen > tab_group > tab > state > part`），源图层 id/路径仅供对照。记录可见尺寸（含烘焙效果）、逻辑尺寸（不含效果）、锚点、九宫格、文本属性和图片；`engine` 部件另带 `effect_mode`、`engine_effects`、`effect_reason` 和估计的 `effect_bounds`。各引擎导入器自己写。
+6. **校验**：只把**默认状态**按 src-over 拼回去，和 PS 整图比像素差 / CIEDE2000 ΔE（含 Pillow 动态文字版与遮罩版，并列误差最大的 10 条）。`engine` 部件的投影/外发光用 Pillow 近似画上；其它引擎效果（描边等）的估计范围从遮罩指标里去掉，并列入 `engine_effects_unemulated`。再为每个交替状态写出预览图供目视检查。同时检查漏切、重名、空图，以及组效果被悄悄丢掉的部件（`group_effect_lost`）。
+7. **跑完再收尾**：确认后，导出、`build-layout`、`validate` 要连续跑完；写出 `export_log.json` 不算完成，读过 `validate/validate_report.json`（`issues`、遮罩 PSNR / ΔE）才算完成。`validate` 最后会用**实际导出的 PNG** 拼出默认态，再画上与审核预览同样的标注（按 `visible_bounds` 的框、规范名、九宫格线、类型与效果方式），写出 `validate/preview_exported_annotated.png` 和与 PS 整图并排的 `validate/preview_exported_vs_ps.png`。**这两张图是交给用户的最终成果**，连同报告要点一起给。导出前的审核预览流程不变。长命令设超时并写日志，失败就读日志修正重跑，不要静默停下。
 
 沿用第 2–5 节的规则：每条描述符 `_options.dialogOptions = "silent"`，轮询结果 JSON，文档 id 守卫，不加额外 CLI 参数，顶层 `await`，`executeAsModal`，需要时 `suspendHistory`。
 
