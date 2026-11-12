@@ -5,7 +5,7 @@ license: MIT-0
 compatibility: "Requires Adobe Photoshop 2023 (v23.5+) or later with UXP scripting, on Windows or macOS. The optional slicing helper needs Python 3 with psd-tools, Pillow and numpy; its validate step also requires uharfbuzz + freetype-py (or uharfbuzz + skia-python), plus scipy for strokes and effect spread, when the layout has dynamic_text or static_text."
 metadata:
   author: younglark
-  version: "1.4.14"
+  version: "1.4.15"
   homepage: https://github.com/younglark/photoshop-skills
 ---
 
@@ -236,11 +236,11 @@ await out.write(JSON.stringify(log, null, 2));
 2. **Agent 编写 manifest**：按 slicing.md 文首决策树第 2–6 步，以及「组效果」「重复元素」「头像与框合在一起」「拆开后拼回去对不上」「frame 类元素」和第 3–5 节编写清单。
    **完成标准：** 可见设计有条目覆盖；每个要问用户的问题都已写成 `reuse_decisions` 条目（只写在 notes / `uncertain_hidden` / checklist 里不算）。
 3. **审核门闩**：`flatten` + `preview`，然后等用户确认再 `confirm`（见 slicing.md 第 6 节）。
-   **完成标准：** 已跑 `flatten` + `preview`，`status` 仍为 `pending_review`，并把待问项交给用户。用户确认后：`confirm` 已锁定，`manifest.confirmed.json` 存在；已展示 `not_user_decided` / `blocking_not_user_decided`。一句「清单确认」（`confirm --note`）只锁清单，不是回答。
-4. **导出（`.psjs`）**：用自带 `export_slices.psjs` **按字节**复制到作业目录，只改 `CONFIG_URL`（复制方式见 slicing.md 第 7 节）。作业 JSON 的 `exporter_url` 指向这份副本。
-   **完成标准：** `export_log.json` 已写出，日志里的 exporter sha 与自带脚本一致。
+   **完成标准：** 已跑 `flatten` + `preview`，`status` 仍为 `pending_review`，并把待问项交给用户。用户确认后：`confirm` 已锁定，`manifest.confirmed.json` 存在；已展示 `not_user_decided` / `blocking_not_user_decided`。一句「清单确认」（`confirm --note`）只锁清单，不是回答。用户的回答用 `confirm --decision` 记下后，从第 4 步重跑。
+4. **导出（`.psjs`）**：用自带 `export_slices.psjs` **按字节**复制到作业目录，只改 `CONFIG_URL`（复制方式见 slicing.md 第 7 节；不要用 PowerShell 5 或 Python 的文本模式转存）。作业 JSON 的 `exporter_url` 指向这份副本。
+   **完成标准：** `export_log.json` 已写出，日志里的 exporter sha 与自带脚本一致，导出晚于最后一次 `confirm --decision`。`skipped_pending_decision` 里的切图等用户回答后再导。
 5. **布局 JSON**：`build-layout`（schema 见 slicing.md 第 8 节）。
-   **完成标准：** `layout.json` 已写出。
+   **完成标准：** `layout.json` 已写出，`kind` 和九宫边距与确认的清单一致（`build-layout` 只补清单里空着的边距）。
 6. **校验**：`validate`（见 slicing.md 第 9 节）。与第 7 步一起完成，不要停在导出。
 7. **跑完再收尾**：导出、`build-layout`、`validate` 要连续跑完。长命令设超时并写日志，失败就读日志修正重跑，不要静默停下。
-   **完成标准（第 6–7 步）：** 写出 `export_log.json` 不算完成，**读过** `validate/validate_report.json`（`ok`、`issues`、遮罩 PSNR / ΔE）才算；两张最终图 `validate/preview_exported_annotated.png` 和 `validate/preview_exported_vs_ps.png` 已交给用户。
+   **完成标准（第 6–7 步）：** 写出 `export_log.json` 不算完成，**读过** `validate/validate_report.json`（`ok`、`issues`、遮罩 PSNR / ΔE）才算；`issues` 里有 `exported_before_decision` 就从第 4 步重跑；两张最终图 `validate/preview_exported_annotated.png` 和 `validate/preview_exported_vs_ps.png` 已交给用户。

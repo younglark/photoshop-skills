@@ -1,6 +1,19 @@
 # photoshop-psjs changelog
 
-维护者向的版本记录。现行切图规则只在 [references/slicing.md](references/slicing.md)；历史实测（原第 10 节 10.1–10.17）在 [references/slicing-history.md](references/slicing-history.md)。入口是 [SKILL.md](SKILL.md)。
+维护者向的版本记录。现行切图规则只在 [references/slicing.md](references/slicing.md)；历史实测（原第 10 节 10.1–10.17，之后的接着编号）在 [references/slicing-history.md](references/slicing-history.md)。入口是 [SKILL.md](SKILL.md)。
+
+## 1.4.15
+
+一次新画板盲测（弹窗）暴露的交付问题，都改成机械检查（`validate` 的 `issues`，`ok:false`）：
+
+- **用户回答之前不出图，回答之后要重导。** `export_slices.psjs`：条目用到打开时隐藏、且被未答阻塞性决定覆盖的层时，不显示、不出 PNG，只记边界（条目和日志顶层的 `skipped_pending_decision`）；每张 PNG 记 `exported_at`。`validate` 新增 `exported_before_decision`：PNG 早于覆盖它的决定拿到当前回答的时间（`png_older_than_decision`）、导出时被跳过而现在答成状态（`skipped_while_pending`）、整图早于用户记录的排除（`full_render_older_than_decision`）。只记边界的复用实例不再被 `hidden_layer_exported_without_decision` 误判（布局节点新增 `bounds_only: true`）。
+- **九宫数据以确认的清单为准。** `build-layout` 不再把 `image` 升成 `nine_slice`，也不再用检测值覆盖已确认的边距；只补清单里空着的边距并记 `nine_slice_source`（`manifest` / `auto_detected` / `manifest+auto_detected`）和 `nine_slice_auto_filled`，其它检测结果只写在 `nine_slice_detected`。`validate` 新增 `nine_slice_changed_after_confirm`（对照 `manifest.confirmed.json`，`kind_changed` / `margins_changed`）和 `nine_slice_margins_missing`。
+- **段落文字预览放对位置。** 段落框的左上角取 `click_point`，`box_bounds_pt` 只取宽高；框与图层实测框不相交时改按实测框放（`box_origin`）。仍是 HarfBuzz + FreeType，没有 Pillow 回退。
+- **按字节复制导出器的说明补上 Python 文本模式**（Windows 上 `write_text` / `open("w")` 把 LF 改成 CRLF）。
+- **标注字体支持中文。** `preview` / `validate` 按 `--label-font`、`PSJS_LABEL_FONT`、系统中日韩字体的顺序找标签字体；找不到照样画，报告 `label_font.warning` 提示。
+- **状态写全。** 组件可声明 `cumulative: true`（可选 `members`、`cumulative_state`、`off_state`），`build-layout` 展开 `expanded_states.level_<N>`，`validate` 按整档出状态预览；任何状态可写完整的 `activation`。新增 `state_activation_incomplete`：声明了累积的组里，显式组合让高位亮、低位没亮。
+
+导出器真的改了（不只是版本号），作业目录要重新按字节复制 1.4.15 的 `examples/export_slices.psjs`。
 
 ## 1.4.14
 

@@ -29,6 +29,7 @@ attach them to interactive states. Unrelated hidden layers stay unused.
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import math
@@ -55,7 +56,7 @@ except ImportError:
     ParseLimits = None
 
 SCHEMA_MANIFEST = "psjs-slice-manifest/v2"
-SKILL_VERSION = "1.4.14"
+SKILL_VERSION = "1.4.15"
 SCHEMA_LAYOUT = "psjs-layout/v2"
 SCHEMA_MANIFEST_V1 = "psjs-slice-manifest/v1"
 SCHEMA_LAYOUT_V1 = "psjs-layout/v1"
@@ -1447,13 +1448,117 @@ def find_artboard_in(nodes, raw):
     return None
 
 
+# 1.4.15: annotation labels (artboard and slice names) may be CJK. The label font is searched in this order:
+# --label-font / PSJS_LABEL_FONT, then common CJK-capable system fonts. Without one, labels are still drawn with a
+# Latin font (CJK shows as boxes) and the report carries a warning; labels are annotation only, never validation.
+LABEL_FONT_ENV = "PSJS_LABEL_FONT"
+CJK_LABEL_FONTS = (
+    # Windows
+    "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyh.ttf", "C:/Windows/Fonts/msyhbd.ttc",
+    "C:/Windows/Fonts/Deng.ttf", "C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/simsun.ttc",
+    "C:/Windows/Fonts/YuGothM.ttc", "C:/Windows/Fonts/malgun.ttf",
+    # macOS
+    "/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc", "/System/Library/Fonts/STHeiti Light.ttc",
+    "/Library/Fonts/Arial Unicode.ttf", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    # Linux
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+    "/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Regular.otf",
+    "/usr/share/fonts/opentype/adobe-source-han-sans/SourceHanSans-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc", "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
+)
+CJK_LABEL_GLOBS = ("NotoSansCJK*", "NotoSansSC*", "NotoSerifCJK*", "SourceHanSans*", "msyh*", "PingFang*",
+                   "wqy-*", "simhei*", "Deng*")
+LATIN_LABEL_FONTS = (
+    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/calibri.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
+LABEL_FONT = {"path": None, "cjk": False, "configured": None, "warning": None, "resolved": False}
+NO_CJK_LABEL_FONT_HINT = (
+    "no CJK-capable label font found: annotation labels with Chinese / Japanese / Korean text are drawn as boxes. "
+    "Labels are annotation only (validation is unaffected). Install Noto Sans CJK / Source Han Sans / WenQuanYi, "
+    "or pass --label-font <path> (or set PSJS_LABEL_FONT)."
+)
+
+
+def _font_has_cjk(path):
+    try:
+        f = ImageFont.truetype(str(path), size=16)
+        mask = f.getmask("中")
+        return mask.size[0] > 0 and mask.getbbox() is not None
+    except Exception:
+        return False
+
+
+def _font_dirs():
+    out = []
+    windir = __import__("os").environ.get("WINDIR")
+    local = __import__("os").environ.get("LOCALAPPDATA")
+    for d in ((Path(windir) / "Fonts") if windir else None,
+              (Path(local) / "Microsoft/Windows/Fonts") if local else None,
+              Path("/System/Library/Fonts"), Path("/Library/Fonts"), Path.home() / "Library/Fonts",
+              Path("/usr/share/fonts"), Path("/usr/local/share/fonts"), Path.home() / ".fonts",
+              Path.home() / ".local/share/fonts"):
+        if d is not None and d.is_dir():
+            out.append(d)
+    return out
+
+
+def resolve_label_font(configured=None, force=False):
+    """Find a CJK-capable label font once; returns LABEL_FONT {path, cjk, configured, warning}."""
+    import os
+    if LABEL_FONT["resolved"] and not force and configured in (None, LABEL_FONT["configured"]):
+        return LABEL_FONT
+    configured = configured or os.environ.get(LABEL_FONT_ENV) or None
+    LABEL_FONT.update(path=None, cjk=False, configured=configured, warning=None, resolved=True)
+    cands = []
+    if configured:
+        if Path(configured).is_file():
+            cands.append(Path(configured))
+        else:
+            LABEL_FONT["warning"] = f"label font {configured!r} not found; searching system fonts"
+    cands.extend(Path(p) for p in CJK_LABEL_FONTS)
+    for p in cands:
+        if p.is_file() and _font_has_cjk(p):
+            LABEL_FONT.update(path=str(p), cjk=True)
+            return LABEL_FONT
+    for d in _font_dirs():
+        for pat in CJK_LABEL_GLOBS:
+            for p in sorted(d.rglob(pat))[:20]:
+                if p.suffix.lower() in (".ttf", ".ttc", ".otf") and _font_has_cjk(p):
+                    LABEL_FONT.update(path=str(p), cjk=True)
+                    return LABEL_FONT
+    for p in LATIN_LABEL_FONTS:
+        if Path(p).is_file():
+            LABEL_FONT["path"] = p
+            break
+    LABEL_FONT["warning"] = NO_CJK_LABEL_FONT_HINT
+    warn(NO_CJK_LABEL_FONT_HINT)
+    return LABEL_FONT
+
+
+def label_font_report(labels=()):
+    """Report block for annotated previews: font path, CJK capability, and a warning when CJK labels need it."""
+    info = resolve_label_font()
+    needs = any(re.search(r"[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]", str(t or "")) for t in labels)
+    out = {"path": info["path"], "cjk": info["cjk"], "labels_need_cjk": needs}
+    if info.get("warning"):
+        out["warning"] = info["warning"]
+    return out
+
+
 def load_font(size):
-    for path in (
-        "C:/Windows/Fonts/arial.ttf",
-        "C:/Windows/Fonts/calibri.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ):
+    info = resolve_label_font()
+    if info["path"]:
+        try:
+            return ImageFont.truetype(info["path"], size=size)
+        except Exception:
+            pass
+    for path in LATIN_LABEL_FONTS:
         if Path(path).exists():
             try:
                 return ImageFont.truetype(path, size=size)
@@ -3001,6 +3106,17 @@ def uncertain_hidden_issues(components, decisions, lock_info=None, extra=None):
     return issues
 
 
+def node_exports_own_png(n):
+    """The node's PNG was rendered from its own layers: it has an image, is not attribute-only text, not a
+    bounds-only reuse instance (drawn with the reuse source's PNG) and was not skipped by the exporter."""
+    if not isinstance(n, dict) or not n.get("image") or is_attr_text(n.get("kind")) or n.get("export_skipped"):
+        return False
+    if n.get("_bounds_only") or n.get("bounds_only"):
+        return False
+    src = n.get("reuse_source")
+    return not (n.get("reuse_of") and src and src != n.get("name"))
+
+
 def hidden_layer_export_issues(layout):
     """hidden_layer_exported_without_decision: a PNG entry whose layer_id / select_ids include a layer hidden at
     open (own or through an ancestor, from layers_at_open) without a blocking decision covering it that the user
@@ -3042,7 +3158,7 @@ def hidden_layer_export_issues(layout):
 
     bad = []
     for n in nodes:
-        if not n.get("image") or n.get("_bounds_only") or is_attr_text(n.get("kind")):
+        if not node_exports_own_png(n):
             continue
         hidden = [i for i in ids_of(n) if vis.get(i) is False]
         if not hidden:
@@ -3063,6 +3179,176 @@ def hidden_layer_export_issues(layout):
         return []
     return [{"type": "hidden_layer_exported_without_decision", "count": len(bad), "entries": bad[:50],
              "message": HIDDEN_EXPORT_HINT}]
+
+
+# 1.4.15: a PNG made before the user answered the question it depends on is not authorised by a later answer.
+# The exporter skips slices whose layer (hidden at open) is covered by an unanswered blocking decision
+# (skipped_pending_decision); validate compares each PNG's export time with the time its covering decision got
+# its current answer (decision_log) and reports exported_before_decision.
+EXPORTED_BEFORE_DECISION_HINT = (
+    "these PNGs were exported before the user answered the decision that covers their layers (or were skipped "
+    "while it was pending). A later answer does not authorise an earlier export: after `confirm --decision`, run "
+    "the export again with the shipped exporter, then build-layout and validate."
+)
+
+
+def parse_time(v):
+    """datetime (timezone-aware) from an ISO time (Z, +HH:MM or +HHMM); naive times are local. None if unparsable."""
+    if not v or not isinstance(v, str):
+        return None
+    t = v.strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    m = re.match(r"^(.*[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)([+-])(\d{2})(\d{2})$", t)
+    if m:
+        t = f"{m.group(1)}{m.group(2)}{m.group(3)}:{m.group(4)}"
+    try:
+        dt = datetime.datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt
+
+
+def decision_answered_at(d, decision_log):
+    """When the decision got its current answer: decided_at of the first record of the last run of identical
+    answers in decision_log (a relock that repeats the same answer does not move it). None if not recorded."""
+    did, val = str(d.get("id")), _norm_decision(d.get("decision"))
+    recs = [r for r in decision_log or [] if isinstance(r, dict) and str(r.get("id")) == did]
+    if not recs or _norm_decision(recs[-1].get("decision")) != val:
+        return None
+    first = recs[-1]
+    for r in reversed(recs):
+        if _norm_decision(r.get("decision")) != val:
+            break
+        first = r
+    return first.get("decided_at")
+
+
+def exported_before_decision_issues(layout):
+    """exported_before_decision: a PNG node whose layer_id / select_ids are covered by an answered blocking decision,
+    exported before that answer was recorded (node exported_at, else the export log's started), or skipped while
+    pending and the answer is now "export as state". Also the full render when a recorded exclusion is newer than
+    the export. Nodes and logs without times are not judged."""
+    decisions = [d for d in (layout or {}).get("reuse_decisions") or [] if isinstance(d, dict) and d.get("layer_ids")]
+    if not decisions:
+        return []
+    log = ((layout.get("manifest_lock") or {}).get("decision_log")) or []
+    exp = layout.get("export") or {}
+    started = parse_time(exp.get("started"))
+    answered = []
+    for d in decisions:
+        if not decision_is_blocking(d) or decision_answer_state(d, log) is not None:
+            continue
+        at = decision_answered_at(d, log)
+        answered.append((d, {_lid(i) for i in d.get("layer_ids") or []}, at, parse_time(at)))
+    if not answered:
+        return []
+    bad = []
+    for n in layout.get("nodes") or []:
+        if not isinstance(n, dict) or (not node_exports_own_png(n) and not n.get("export_skipped")):
+            continue
+        ids = {_lid(i) for i in (n.get("select_ids") or ([n.get("layer_id")] if n.get("layer_id") is not None else []))
+               if i is not None}
+        for d, lids, at_s, at in answered:
+            if not ids & lids:
+                continue
+            rec = {"name": n.get("name"), "layer_ids": sorted(ids & lids, key=str), "decision_id": d.get("id"),
+                   "decision": d.get("decision"), "decided_at": at_s}
+            if n.get("export_skipped"):
+                if _norm_decision(d.get("decision")) in STATE_EXPORT_DECISIONS:
+                    bad.append(dict(rec, reason="skipped_while_pending"))
+                continue
+            t_s = n.get("exported_at") or exp.get("started")
+            t = parse_time(n.get("exported_at")) or started
+            if t is not None and at is not None and t < at:
+                bad.append(dict(rec, exported_at=t_s, reason="png_older_than_decision"))
+    if started is not None:
+        for d, lids, at_s, at in answered:
+            if at is not None and started < at and _norm_decision(d.get("decision")) in EXCLUDE_DECISIONS:
+                bad.append({"name": "full_render", "layer_ids": sorted(lids, key=str), "decision_id": d.get("id"),
+                            "decision": d.get("decision"), "decided_at": at_s, "exported_at": exp.get("started"),
+                            "reason": "full_render_older_than_decision"})
+    if not bad:
+        return []
+    return [{"type": "exported_before_decision", "count": len(bad), "entries": bad[:50],
+             "message": EXPORTED_BEFORE_DECISION_HINT}]
+
+
+# 1.4.15: build-layout takes kind and nine-slice margins from the confirmed manifest. validate compares the layout
+# with manifest.confirmed.json (next to the manifest named in manifest_lock).
+NINE_CHANGED_HINT = (
+    "the layout's kind / nine-slice margins differ from what the user confirmed in the manifest. The confirmed "
+    "manifest decides both; rebuild the layout with this skill's build-layout (it never promotes image to "
+    "nine_slice and keeps approved margins). To change them, write manifest.proposal.json and ask the user."
+)
+NINE_MISSING_HINT = (
+    "kind nine_slice without margins: the confirmed manifest left them empty and none could be detected on the PNG. "
+    "Propose margins in manifest.proposal.json and ask the user."
+)
+
+
+def confirmed_manifest_entries(layout):
+    """{entry name: entry} from manifest.confirmed.json next to the layout's manifest_lock.manifest, or None."""
+    mp = ((layout or {}).get("manifest_lock") or {}).get("manifest")
+    if not mp:
+        return None
+    copy, _sha = manifest_lock_paths(mp)
+    if not copy.is_file():
+        return None
+    try:
+        m = json.loads(copy.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return {e.get("name"): e for e in m.get("entries") or [] if isinstance(e, dict)}
+
+
+def nine_slice_issues(layout, confirmed=None):
+    """nine_slice_changed_after_confirm (kind or approved margins differ from the confirmed manifest; margins the
+    manifest left empty may be filled by detection when the node records nine_slice_source auto_detected) and
+    nine_slice_margins_missing (kind nine_slice with no margins)."""
+    if confirmed is None:
+        confirmed = confirmed_manifest_entries(layout)
+    changed, missing = [], []
+    for n in (layout or {}).get("nodes") or []:
+        if not isinstance(n, dict) or is_text_kind(n.get("kind")) or n.get("bounds_only"):
+            continue
+        if n.get("kind") == "nine_slice" and not n.get("nine_slice"):
+            missing.append(n.get("name"))
+        e = (confirmed or {}).get(n.get("name"))
+        if not e:
+            continue
+        want_kind = e.get("kind") or "image"
+        if is_text_kind(want_kind):
+            continue
+        if n.get("kind") != want_kind:
+            changed.append({"name": n.get("name"), "reason": "kind_changed", "confirmed_kind": want_kind,
+                            "layout_kind": n.get("kind"), "confirmed_nine_slice": e.get("nine_slice"),
+                            "layout_nine_slice": n.get("nine_slice")})
+            continue
+        if want_kind != "nine_slice":
+            continue
+        want = e.get("nine_slice") if isinstance(e.get("nine_slice"), dict) else {}
+        got = n.get("nine_slice") if isinstance(n.get("nine_slice"), dict) else {}
+        auto = "auto_detected" in str(n.get("nine_slice_source") or "")
+        diff = []
+        for k in NINE_KEYS:
+            if isinstance(want.get(k), (int, float)):
+                if got.get(k) != want[k]:
+                    diff.append(k)
+            elif got.get(k) is not None and not auto:
+                diff.append(k)
+        if diff:
+            changed.append({"name": n.get("name"), "reason": "margins_changed", "keys": diff,
+                            "confirmed_nine_slice": e.get("nine_slice"), "layout_nine_slice": n.get("nine_slice")})
+    issues = []
+    if changed:
+        issues.append({"type": "nine_slice_changed_after_confirm", "count": len(changed), "entries": changed[:50],
+                       "message": NINE_CHANGED_HINT})
+    if missing:
+        issues.append({"type": "nine_slice_margins_missing", "names": missing, "message": NINE_MISSING_HINT})
+    return issues
 
 
 MANIFEST_CHANGED_HINT = (
@@ -5146,8 +5432,12 @@ def cmd_preview(args):
     title = f"{src.get('name')}  {len(manifest['entries'])} slices"
     if hidden_n:
         title += f"  ({hidden_n} hidden-state)"
+    resolve_label_font(getattr(args, "label_font", None), force=True)
     annotate_preview(base, manifest["entries"], origin, out, title)
+    lf = label_font_report([title] + [e.get("name") for e in manifest["entries"]])
     print(f"wrote {out}")
+    if lf.get("warning"):
+        print(json.dumps({"label_font": lf}, ensure_ascii=False))
     return 0
 
 
@@ -5293,6 +5583,7 @@ def place_reused_instances(nodes):
         bounds_only = node.pop("_bounds_only", False)
         if not bounds_only:
             continue
+        node["bounds_only"] = True  # draws the reuse source's PNG; made from no layer of its own
         src = by_name.get(node.get("reuse_source"))
         if not src or not src.get("visible_bounds"):
             continue
@@ -5315,6 +5606,44 @@ def place_reused_instances(nodes):
     return nodes
 
 
+NINE_KEYS = ("left", "top", "right", "bottom")
+
+
+def _nine_complete(nine):
+    return isinstance(nine, dict) and all(isinstance(nine.get(k), (int, float)) for k in NINE_KEYS)
+
+
+def layout_nine_slice(entry, png_path):
+    """kind and nine-slice margins of a layout node, taken from the confirmed manifest entry.
+
+    Returns (kind, nine_slice, nine_slice_source, detected, auto_filled_keys). The manifest decides: an ``image``
+    stays an image (never promoted), approved margins are kept as they are. Detection on the exported PNG only fills
+    margins the manifest left empty (kind ``nine_slice`` with null margins or null keys) and says so
+    (``nine_slice_source`` ``auto_detected`` / ``manifest+auto_detected``). *detected* is returned as a suggestion."""
+    kind = entry.get("kind") or "image"
+    if is_text_kind(kind):
+        return kind, None, None, None, []
+    detected = None
+    if png_path is not None and Path(png_path).exists():
+        try:
+            detected = detect_nine_slice(Image.open(png_path))
+        except Exception:
+            detected = None
+    approved = entry.get("nine_slice")
+    if kind != "nine_slice":
+        return kind, None, None, detected, []
+    if _nine_complete(approved):
+        return kind, {k: approved[k] for k in NINE_KEYS}, "manifest", detected, []
+    if not detected:
+        return kind, (dict(approved) if isinstance(approved, dict) and approved else None), \
+            ("manifest" if isinstance(approved, dict) and approved else None), None, []
+    base = approved if isinstance(approved, dict) else {}
+    filled = [k for k in NINE_KEYS if not isinstance(base.get(k), (int, float))]
+    nine = {k: (base[k] if k not in filled else detected[k]) for k in NINE_KEYS}
+    source = "auto_detected" if len(filled) == len(NINE_KEYS) else "manifest+auto_detected"
+    return kind, nine, source, detected, filled
+
+
 def cmd_build_layout(args):
     lock = manifest_lock_state(args.manifest)
     if lock["changed"]:
@@ -5333,18 +5662,6 @@ def cmd_build_layout(args):
     export_items = {}
     for item in export.get("items") or []:
         export_items[item.get("name")] = item
-
-    def refine_nine(entry, png_path):
-        if is_text_kind(entry.get("kind")):
-            return None
-        if not png_path.exists():
-            return entry.get("nine_slice")
-        try:
-            image = Image.open(png_path)
-        except Exception:
-            return entry.get("nine_slice")
-        detected = detect_nine_slice(image)
-        return detected if detected is not None else entry.get("nine_slice")
 
     nodes = []
     for entry in manifest["entries"]:
@@ -5370,17 +5687,7 @@ def cmd_build_layout(args):
         logi_ab = _shift(logi, ox, oy) if logi else None
         png_name = None if is_attr_text(entry["kind"]) else f"{entry.get('image_name') or name}.png"
         png_path = slices_dir / png_name if png_name else None
-        kind = entry["kind"]
-        nine = None if is_text_kind(kind) else (refine_nine(entry, png_path) if png_path else None)
-        if not is_text_kind(kind):
-            if nine and kind == "image":
-                kind = "nine_slice"
-            if not nine and kind == "nine_slice":
-                # Keep the reviewed kind if insets were confirmed, else downgrade.
-                if entry.get("nine_slice"):
-                    nine = entry["nine_slice"]
-                else:
-                    kind = "image"
+        kind, nine, nine_source, nine_detected, nine_filled = layout_nine_slice(entry, png_path)
         text = item.get("text") or entry.get("text")
         if is_attr_text(kind) and isinstance(text, dict):
             text = text_render.complete_text_attrs(text)
@@ -5410,6 +5717,23 @@ def cmd_build_layout(args):
             "default": entry.get("default", True),
             "hidden": entry.get("hidden", False),
         }
+        if nine_source:
+            node["nine_slice_source"] = nine_source
+        if nine_filled:
+            node["nine_slice_auto_filled"] = nine_filled
+            warn(f"{name}: nine_slice margins {nine_filled} were empty in the confirmed manifest; filled from the "
+                 f"exported PNG (nine_slice_source {nine_source})")
+        if nine_detected and nine_detected != nine:
+            # A suggestion only: the confirmed manifest decides kind and margins.
+            node["nine_slice_detected"] = nine_detected
+        if kind == "nine_slice" and not nine:
+            warn(f"{name}: kind nine_slice without margins in the confirmed manifest and none detected; "
+                 "validate will report nine_slice_margins_missing")
+        if item.get("exported_at"):
+            node["exported_at"] = item["exported_at"]
+        if item.get("skipped_pending_decision"):
+            node["export_skipped"] = "pending_decision"
+            node["skipped_pending_decision"] = item["skipped_pending_decision"]
         if bounds_conflict:
             man_ab = _shift(_rect_to_dict(entry.get("logical_bounds")), ox, oy)
             node["layer_bounds_mismatch"] = {
@@ -5463,6 +5787,7 @@ def cmd_build_layout(args):
     nodes = sort_by_paint_order(nodes, layer_tree_from_manifest(manifest))
     nodes_by_name = {n["name"]: n for n in nodes}
     components = enrich_components(manifest.get("components") or [], nodes_by_name)
+    expand_cumulative_states(components)
     effect_groups = load_effect_groups(manifest, args.manifest, getattr(args, "group_effects", None))
     effect_issues = find_silent_effect_loss(nodes, effect_groups)
     for problem in effect_issues:
@@ -5486,6 +5811,7 @@ def cmd_build_layout(args):
             "full_render_hidden": full_item.get("hidden_at_render") if isinstance(full_item, dict) else None,
             "excluded_by_user_decision": export.get("excluded_by_user_decision"),
             "pending_user_decisions": export.get("pending_user_decisions"),
+            "skipped_pending_decision": export.get("skipped_pending_decision"),
         },
         "nodes": nodes,
         "components": components,
@@ -5993,17 +6319,102 @@ def nodes_for_activation(layout, activation):
     return out
 
 
+# 1.4.15: a state is the complete set of part states visible at that moment. A group whose members are ordinal /
+# cumulative (rating stars, progress pips, level dots) declares it: ``cumulative: true`` (or ``ordinal: true``),
+# optional ``members`` (ordered child ids; default the children order), ``cumulative_state`` (the member state that
+# accumulates; default the one state every member declares) and ``off_state`` (default: a member default_state that
+# is not the cumulative state, else "off"). State N then switches members 1..N on and the rest off; build-layout
+# writes these as the group's ``expanded_states`` and validate previews them instead of single-member states. Any
+# state may also carry an explicit full ``activation`` ({component_id: state}).
+def cumulative_spec(comp):
+    """{group, members, on_state, off_state, default_level, levels: {name: activation}} or None."""
+    if not isinstance(comp, dict):
+        return None
+    flag = comp.get("cumulative", comp.get("ordinal"))
+    if not flag:
+        return None
+    children = {c.get("id"): c for c in comp.get("children") or [] if isinstance(c, dict)}
+    members = [m for m in (comp.get("members") or list(children)) if m in children]
+    if not members:
+        return None
+    on = comp.get("cumulative_state")
+    if not on and isinstance(flag, dict):
+        on = flag.get("state")
+    if not on:
+        common = None
+        for m in members:
+            names = set((children[m].get("states") or {}).keys()) if isinstance(children[m].get("states"), dict) else set()
+            common = names if common is None else common & names
+        if common and len(common) == 1:
+            on = next(iter(common))
+    if not on:
+        return None
+    off = comp.get("off_state") or (flag.get("off_state") if isinstance(flag, dict) else None)
+    if not off:
+        off = next((children[m].get("default_state") for m in members
+                    if children[m].get("default_state") not in (None, on)), None) or "off"
+    defaults = [children[m].get("default_state") == on for m in members]
+    k = sum(defaults)
+    default_level = k if all(defaults[:k]) and not any(defaults[k:]) else None
+    levels = {}
+    for n in range(len(members) + 1):
+        levels[f"level_{n}"] = {m: (on if i < n else off) for i, m in enumerate(members)}
+    return {"group": comp.get("id"), "members": members, "on_state": on, "off_state": off,
+            "default_level": default_level, "levels": levels,
+            "member_defaults": {m: children[m].get("default_state") for m in members}}
+
+
+def expand_cumulative_states(components):
+    """build-layout: write expanded_states (level_N -> full activation) on every cumulative group, in place."""
+    count = 0
+    for comp in iter_layout_components(components):
+        spec = cumulative_spec(comp)
+        if not spec:
+            if comp.get("cumulative") or comp.get("ordinal"):
+                warn(f"{comp.get('id')}: cumulative group without members or a cumulative_state; not expanded")
+            continue
+        comp["cumulative_expanded"] = {k: spec[k] for k in ("members", "on_state", "off_state", "default_level")}
+        comp["expanded_states"] = {
+            name: {"activation": act, "level": int(name.split("_")[-1]), "expanded_from": "cumulative"}
+            for name, act in spec["levels"].items()
+        }
+        count += 1
+    return count
+
+
+def _cumulative_specs(components):
+    specs = []
+    for comp in iter_layout_components(components or []):
+        spec = cumulative_spec(comp)
+        if spec:
+            specs.append(spec)
+    return specs
+
+
 def collect_alternate_activations(layout):
-    """Each interactive component's non-default state, with exclusive sibling switching."""
+    """Each interactive component's non-default state, with exclusive sibling switching. Members of a cumulative
+    group are previewed per group level (level_N) instead of one member at a time; a state with an explicit
+    ``activation`` uses it in full."""
     components = layout.get("components") or []
     parent_of = component_parent_map(components)
+    specs = _cumulative_specs(components)
+    member_of = {m: sp for sp in specs for m in sp["members"]}
     previews = []
     for comp in iter_layout_components(components):
+        cid = comp.get("id")
+        spec = next((sp for sp in specs if sp["group"] == cid), None)
+        if spec:
+            for level, act in spec["levels"].items():
+                if spec["default_level"] is not None and level == f"level_{spec['default_level']}":
+                    continue
+                previews.append({"id": f"{cid}_{level}", "component_id": cid, "component_type": comp.get("type"),
+                                 "state": level, "activation": dict(act), "cumulative": True,
+                                 "from_hidden": False})
         states = comp.get("states") or {}
         if not isinstance(states, dict) or not states:
             continue
         default = comp.get("default_state")
-        parent = parent_of.get(comp.get("id"))
+        parent = parent_of.get(cid)
         exclusive = bool(
             parent and (
                 parent.get("exclusive")
@@ -6015,28 +6426,78 @@ def collect_alternate_activations(layout):
             name = item if isinstance(item, str) else (item or {}).get("state")
             if name and name not in state_names:
                 state_names.append(name)
+        msp = member_of.get(cid)
         for state_name in state_names:
             if default is not None and state_name == default:
                 continue
-            activation = {comp.get("id"): state_name}
+            sobj = states.get(state_name) if isinstance(states.get(state_name), dict) else {}
+            if msp and state_name in (msp["on_state"], msp["off_state"]) and not sobj.get("activation"):
+                continue  # previewed as a whole group level
+            activation = {cid: state_name}
+            if isinstance(sobj.get("activation"), dict):
+                activation = dict(sobj["activation"], **{cid: state_name})
             if exclusive and state_name in {"selected", "on", "active", "pressed"}:
                 for sib in parent.get("children") or []:
-                    if sib.get("id") == comp.get("id"):
+                    if sib.get("id") == cid or sib.get("id") in activation:
                         continue
                     fallback = sibling_fallback_state(sib)
                     if fallback:
                         activation[sib.get("id")] = fallback
-            stem = f"{comp.get('id')}_{state_name}"
+            stem = f"{cid}_{state_name}"
             previews.append({
                 "id": stem,
-                "component_id": comp.get("id"),
+                "component_id": cid,
                 "component_type": comp.get("type"),
                 "state": state_name,
                 "activation": activation,
-                "from_hidden": bool((states.get(state_name) or {}).get("from_hidden")) if state_name in states else False,
+                "from_hidden": bool(sobj.get("from_hidden")) if state_name in states else False,
             })
     return previews
 
+
+STATE_ACTIVATION_HINT = (
+    "a state of a cumulative / ordinal group switches a member on while a lower member stays in its default or "
+    "off state (e.g. a 5-star state that lights slot 5 but not slot 4). A state is everything visible at that "
+    "moment: state N includes every lower member. Use the group's expanded level_N states, or list every member "
+    "in the state's activation."
+)
+
+
+def state_activation_issues(layout):
+    """state_activation_incomplete: in a group declared cumulative / ordinal, a declared state with an explicit
+    ``activation`` (on the group or any other component) leaves a lower member in its default / off state while a
+    higher one is on. Members' own single states are previewed as group levels instead. Groups without the
+    declaration are not judged (nothing is guessed from names)."""
+    components = (layout or {}).get("components") or []
+    specs = _cumulative_specs(components)
+    if not specs:
+        return []
+    bad = []
+    for comp in iter_layout_components(components):
+        states = comp.get("states") or {}
+        if not isinstance(states, dict):
+            continue
+        for sname, sobj in states.items():
+            if not isinstance(sobj, dict) or not isinstance(sobj.get("activation"), dict):
+                continue
+            act = dict(sobj["activation"], **{comp.get("id"): sname})
+            for sp in specs:
+                if not any(m in act for m in sp["members"]):
+                    continue
+                eff = [act.get(m, sp["member_defaults"].get(m)) for m in sp["members"]]
+                on = [e == sp["on_state"] for e in eff]
+                if True not in on:
+                    continue
+                top = max(i for i, v in enumerate(on) if v)
+                off = [sp["members"][i] for i in range(top) if not on[i]]
+                if off:
+                    bad.append({"group": sp["group"], "component_id": comp.get("id"), "state": sname,
+                                "on_state": sp["on_state"], "lower_members_off": off,
+                                "activation": {m: e for m, e in zip(sp["members"], eff)}})
+    if not bad:
+        return []
+    return [{"type": "state_activation_incomplete", "count": len(bad), "entries": bad[:50],
+             "message": STATE_ACTIVATION_HINT}]
 
 
 def _bounds_dict(b):
@@ -6531,6 +6992,7 @@ def resolve_layout_psd(layout, explicit=None):
 
 def cmd_validate(args):
     layout = json.loads(Path(args.layout).read_text(encoding="utf-8"))
+    resolve_label_font(getattr(args, "label_font", None), force=True)
     psd_for_text = resolve_layout_psd(layout, getattr(args, "psd", None))
     if psd_for_text:
         fill_layout_leading_types(layout, psd_for_text)
@@ -6562,6 +7024,8 @@ def cmd_validate(args):
             if not (node.get("text") or {}).get("content") and not (node.get("text") or {}).get("font"):
                 issues.append({"type": "missing_text_attrs", "name": node["name"]})
             continue
+        if node.get("export_skipped"):
+            continue  # skipped_pending_decision: pending_user_decision / exported_before_decision report it
         image_name = node.get("image")
         path = slices_dir / image_name if image_name else None
         if path is None or not path.exists():
@@ -6592,6 +7056,9 @@ def cmd_validate(args):
     issues.extend(uncertain_hidden_issues(layout.get("components") or [], layout.get("reuse_decisions") or [],
                                           layout.get("manifest_lock"), layout.get("uncertain_hidden")))
     issues.extend(hidden_layer_export_issues(layout))
+    issues.extend(exported_before_decision_issues(layout))
+    issues.extend(nine_slice_issues(layout))
+    issues.extend(state_activation_issues(layout))
     issues.extend(check_avatar_splits(layout["nodes"], layout.get("reuse_decisions") or [],
                                       layout.get("avatar_merge_suspects") or [], layout.get("tree") or None, thr))
     issues.extend(check_frame_bakes(layout["nodes"], layout.get("tree") or None))
@@ -6738,6 +7205,7 @@ def cmd_validate(args):
         ],
         "engine_effects_unemulated": unemulated,
         "exported_preview": exported_preview,
+        "label_font": label_font_report([art.get("name")] + [n.get("name") for n in layout["nodes"]]),
         "reuse_checked": reuse_checked,
         "reuse_mismatch_accepted": reuse_ok,
         "split_checked": split_checked,
@@ -6783,6 +7251,14 @@ def cmd_validate(args):
             "hidden_layer_exported_without_decision: a PNG entry uses a layer hidden at open (layers_at_open) as a "
             "state asset without the user's recorded export-as-state answer (a highlight over a base visible at "
             "open in the same component's default state is exempt; logs without layers_at_open are skipped).",
+            "exported_before_decision: a PNG (or the full render, for an exclusion) is older than the user's answer "
+            "to the decision covering its layers, or was skipped while that decision was pending; export again.",
+            "nine_slice_changed_after_confirm: layout kind / nine-slice margins differ from manifest.confirmed.json "
+            "(margins the manifest left empty may be filled by detection, nine_slice_source auto_detected).",
+            "state_activation_incomplete: in a group declared cumulative, an explicit activation lights a member "
+            "while a lower one stays off. Cumulative groups are previewed as whole levels (level_N).",
+            "label_font: font used for annotation labels; a warning means CJK labels may show as boxes (annotation "
+            "only, not a validation result).",
         ],
         "issues": issues,
         "placed": len(placed_text),
@@ -6873,6 +7349,7 @@ def build_parser():
     s.add_argument("--out", required=True)
     s.add_argument("--ref", default=None, help="Optional artboard PNG to draw on")
     s.add_argument("--ref-is-document", action="store_true", help="Ref is full-document sized, not artboard-cropped")
+    s.add_argument("--label-font", default=None, help="CJK-capable font file for labels (else PSJS_LABEL_FONT, then system CJK fonts)")
     s.set_defaults(func=cmd_preview)
 
     s = sub.add_parser("confirm", help="After the user confirms: set status confirmed and lock the manifest")
@@ -6928,6 +7405,7 @@ def build_parser():
                    help="Override thresholds.split_match_psnr (default 35 dB) for split parts vs the PS render")
     s.add_argument("--rules", default=None,
                    help="Project rules JSON; its \"thresholds\" object overrides the defaults (CLI flags win)")
+    s.add_argument("--label-font", default=None, help="CJK-capable font file for annotation labels (else PSJS_LABEL_FONT, then system CJK fonts)")
     s.add_argument("--shipped-exporter", default=None,
                    help="The skill's examples/export_slices.psjs (default: next to slicing_helper.py); the export "
                         "log's exporter sha256 must match it (exporter_modified)")

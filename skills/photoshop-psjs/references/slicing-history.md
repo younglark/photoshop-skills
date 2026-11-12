@@ -431,3 +431,23 @@ PSNR 按整张导出画布计算（括号内是合并图可见范围）。现状
 - 端到端（`flatten` → `confirm` → `build-layout` → `validate`）：无决定 → 两条新 issue，`ok:false`；有决定未答 → 只有 `pending_user_decision`；用户答 `state` → `issues` 为空；`flatten` 摘要列出无决定的 `uncertain_hidden`；导出器里有耗时字段且 `EXPORTER_RELEASE` 与助手版本一致。
 
 尚未在 Photoshop 上用 1.4.13 重跑盲测；快照耗时字段只加了记录，还没有实测数字。
+
+### 10.18 回答之前出图、九宫被覆盖、5 星只亮第 5 格（1.4.15）
+
+起因：1.4.13 在一个弹窗画板上的盲测（32 层，5 个隐藏层）。护栏本身有效：一句「清单确认」只锁清单，两个隐藏层问题写成了 `hidden_layer_state`，`validate` 报 `pending_user_decision`；用户回答后模型用 `confirm --decision` 记录，`ok:true`。但交付物有六处不对：
+1. 用户回答之前，导出器已经把一个隐藏的禁用态按钮底导成 PNG；回答之后模型认为「切片没变」，没有重导，这张图只是事后补了授权。
+2. `build-layout` 对每张 PNG 重新检测九宫：整屏背景快照从 `image` 被升成 `nine_slice`（688/1835/377/271），已确认的标题栏 59/100/58/100（只横向拉伸）变成 61/61/59/25，禁用按钮 94/0/93/0 变成 90/84/89/102，与正常态 0/0 对不上。上一轮商店画板也有 5 条 `image` 被升级。`validate` 不查这一点。
+3. 段落提示文字（`shape: box`）的 `box_bounds_pt` 是 (140, 1343)–(940, 1447)，而 `click_point` 换算后是 (140, 1223)，正是框的左上角（两行居中文字的墨迹 171–909 × 1223–1318）。旧实现把框的 left/top 再加到锚点上，整段画到画布外，整图 PSNR 只有 27.3 dB（遮罩文字后 69.6 dB）。按「框左上角 = click_point，只取宽高」放，两行文字与 Photoshop 渲染逐行重合。
+4. 模型用 `shutil.copy2` 复制导出器后，又用 Python `read_text` / `write_text` 改 `CONFIG_URL`，Windows 文本模式把全部 LF 改成 CRLF；哈希统一行尾，所以没有误报。
+5. 标注预览的标签字体没有中文，画板名显示成方框。
+6. 两个隐藏的亮星（第 4、5 格）被写成两个独立的格子状态；`validate` 的 5 星预览只点亮第 5 格（金金金空金）。
+
+回归用合成数据（`examples/test_slicing_helper_confirmed_layout.py`），覆盖的用例类型：
+- 时间解析（`Z`、`+0800`、`+00:00`）；PNG 早于 / 晚于回答；只有日志 `started`；没有时间不判；重新锁定重复同一回答不移动回答时间；导出时跳过、之后答成状态 / 答成旧稿；未答只报 `pending_user_decision`；只记边界的复用实例不判；整图早于用户记录的排除。
+- 导出器文本含跳过逻辑、`exported_at`、`skipped_pending_decision` 和 CRLF 说明，`node` 能解析整份脚本；端到端（`flatten` → `confirm` → `build-layout` → `validate`）：跳过时只有 `pending_user_decision`，回答后不重导报 `exported_before_decision`，重导后 `issues` 为空。
+- 九宫：`image` 不升级（检测结果只进 `nine_slice_detected`）；已确认边距原样保留；空边距和部分空边距由检测补并记来源；对照确认清单报 `kind_changed` / `margins_changed`；没有边距报 `nine_slice_margins_missing`；端到端里 1.4.14 式被覆盖的布局被拦下。
+- 段落框：带偏移的 `box_bounds_pt` 与零偏移结果相同；框与实测框不相交时改按实测框放；点文字不受影响。
+- 标签字体：指定 CJK 字体时使用且无警告；找不到时仍能画，报告带 `warning`；纯 ASCII 标签不需要 CJK。
+- 累积组：档位展开、默认档、自定成员顺序与亮 / 灭态名；预览按整档、不再单独预览某一格；未声明的组保持原样；显式 `activation` 漏掉低位报 `state_activation_incomplete`，写全不报。
+
+在这次盲测的产物上（离线）复跑：旧布局报 6 条 `nine_slice_changed_after_confirm` 和 1 条 `exported_before_decision`（禁用按钮底；第 4、5 格是复用实例，不报）；用 1.4.15 重建布局后九宫与清单一致；给星星组加上 `cumulative: true` 后，状态预览为 `level_0`…`level_5`（默认第 3 档除外），5 星档五格全亮。尚未在 Photoshop 上用 1.4.15 重跑盲测。

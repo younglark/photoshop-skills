@@ -20,7 +20,11 @@
 // - multi-layer entries (select_ids): select_bounds per layer and logical_bounds_union.
 // 1.4.13: layers_at_open_ms and full_render.hidden_at_render_ms record how long each layer snapshot took
 // (observability only; the snapshot itself is unchanged). Copy this file byte for byte (shutil.copy2,
-// Copy-Item, cmd /c copy), not with PowerShell 5 Get-Content / Set-Content, which rewrites non-ASCII text.
+// Copy-Item, cmd /c copy), not with PowerShell 5 Get-Content / Set-Content, which rewrites non-ASCII text,
+// nor with Python text mode on Windows (write_text / open("w") turn LF into CRLF).
+// 1.4.15: a slice whose layer was hidden at open and is covered by an unanswered blocking decision is not rendered
+// (item.skipped_pending_decision, log.skipped_pending_decision); every rendered PNG records exported_at, so
+// validate can tell a PNG made before the user's answer (exported_before_decision).
 
 const { app, core, action } = require("photoshop");
 const fs = require("uxp").storage.localFileSystem;
@@ -29,7 +33,7 @@ const fs = require("uxp").storage.localFileSystem;
 const CONFIG_URL = "file:/D:/work/ps-job/export_config.json";
 // -----------------------------------------------------------------------
 
-const EXPORTER_RELEASE = "1.4.14";
+const EXPORTER_RELEASE = "1.4.15";
 let ROOT_URL, SOURCE_URL, SOURCE_PATH_HINT, MANIFEST_NAME, LOG_NAME, SLICES_DIR_NAME, FULL_RENDER_NAME, EXPORTER_URL;
 
 async function loadConfig() {
@@ -161,7 +165,8 @@ const log = {
   layers_at_open_ms: null,
   layers_at_open_count: null,
   excluded_by_user_decision: [],
-  pending_user_decisions: []
+  pending_user_decisions: [],
+  skipped_pending_decision: []
 };
 
 const ours = new Set();
@@ -711,6 +716,19 @@ try {
       log.layers_at_open_ms = nowMs() - tSnap;
       log.layers_at_open_count = log.layers_at_open.length;
       await flush();
+      // 1.4.15: layers hidden at open that an unanswered blocking decision covers are not exported yet.
+      const hiddenAtOpen = new Set();
+      for (const l of log.layers_at_open) {
+        if (l.visible === false || l.effective_visible === false) hiddenAtOpen.add(l.id);
+      }
+      const pendingByLayer = new Map();
+      for (const p of decisionState.pending) {
+        for (const id of p.layer_ids || []) {
+          const key = Number(id);
+          if (!pendingByLayer.has(key)) pendingByLayer.set(key, []);
+          pendingByLayer.get(key).push(p.id);
+        }
+      }
 
       let suspension;
       try {
@@ -749,7 +767,16 @@ try {
           const selectIds = (entry.select_ids && entry.select_ids.length)
             ? entry.select_ids
             : [entry.layer_id];
-          if (entry.hidden || entry.from_hidden) {
+          const blockedIds = selectIds.filter((id) => hiddenAtOpen.has(id) && pendingByLayer.has(Number(id)));
+          const skipPending = blockedIds.length > 0 && !isAttrText(entry.kind) && entry.export_png !== false;
+          if (skipPending) {
+            const decisionIds = [];
+            for (const id of blockedIds) {
+              for (const did of pendingByLayer.get(Number(id))) if (decisionIds.indexOf(did) < 0) decisionIds.push(did);
+            }
+            item.skipped_pending_decision = { layer_ids: blockedIds, decision_ids: decisionIds };
+            log.skipped_pending_decision.push({ name: entry.name, layer_ids: blockedIds, decision_ids: decisionIds });
+          } else if (entry.hidden || entry.from_hidden) {
             revealed = revealHiddenChain(src, selectIds);
             item.revealed = revealed.map((r) => r.id);
           }
@@ -796,7 +823,7 @@ try {
           if (entry.reuse_of) item.reuse_of = entry.reuse_of;
           // Reused instance (export_png === false) or attribute-only text: record
           // bounds / text attrs only; build-layout places shared images, if any.
-          if (isAttrText(entry.kind) || entry.export_png === false) {
+          if (isAttrText(entry.kind) || entry.export_png === false || skipPending) {
             if (entry.export_png === false) item.bounds_only = true;
             item.ok = true;
             if (revealed && revealed.length) {
@@ -907,6 +934,7 @@ try {
           item.image = pngName;
           const png = await slicesDir.createFile(pngName, { overwrite: true });
           await tmp.saveAs.png(png, { compression: 6 }, true);
+          item.exported_at = new Date().toISOString();
           await executionContext.hostControl.unregisterAutoCloseDocument(tmp.id);
           await closeTemp(tmp);
           app.activeDocument = src;

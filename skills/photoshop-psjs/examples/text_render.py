@@ -606,6 +606,35 @@ def text_spec(text, *, doc_size=None, art_origin=(0, 0), bounds=None, options=No
         elif "right" in align0:
             ax = b.get("right", 0.0)
         ay = b.get("bottom", 0.0)
+    box_origin = None
+    bb = text.get("box_bounds_pt") if (text.get("shape") == "box") else None
+    if isinstance(bb, dict) and opts.get("box_wrap"):
+        # 1.4.15: the paragraph box starts at the text's click point (its top-left); box_bounds_pt only gives the
+        # box size. Its left/top can sit in another frame (a layer moved or copied between artboards), so they are
+        # not added to the anchor. If the box placed this way misses the layer's measured bounds, the box is placed
+        # from those bounds (top edge, and the left / centre / right edge by the first paragraph's alignment).
+        bw = (_f(bb.get("right"), 0.0) or 0.0) - (_f(bb.get("left"), 0.0) or 0.0)
+        bh = (_f(bb.get("bottom"), 0.0) or 0.0) - (_f(bb.get("top"), 0.0) or 0.0)
+        xx, xy, yx, yy = m
+        box_origin = "click_point" if anchor_from == "click_point" else "bounds"
+        b = bounds or {}
+        if bw > 0 and bh > 0 and all(k in b for k in ("left", "top", "right", "bottom")):
+            corners = [(ax + xx * u + yx * v, ay + xy * u + yy * v) for u, v in ((0, 0), (bw, 0), (0, bh), (bw, bh))]
+            cx0, cx1 = min(c[0] for c in corners), max(c[0] for c in corners)
+            cy0, cy1 = min(c[1] for c in corners), max(c[1] for c in corners)
+            overlap = cx0 < b["right"] and cx1 > b["left"] and cy0 < b["bottom"] and cy1 > b["top"]
+            if anchor_from != "click_point" or not overlap:
+                dev_w = abs(xx) * bw + abs(yx) * bh
+                align0 = paragraphs[0]["align"]
+                if "center" in align0:
+                    ax = (b["left"] + b["right"]) / 2.0 - dev_w / 2.0
+                elif "right" in align0:
+                    ax = b["right"] - dev_w
+                else:
+                    ax = b["left"]
+                ay = b["top"]
+                box_origin = "bounds"
+                anchor_from = "bounds_box"
     active, hidden = text_effects(text)
     kern, kern_reason = kern_enabled(text, runs)
     opacity = _unit_opacity(text.get("opacity"), 1.0)
@@ -627,6 +656,7 @@ def text_spec(text, *, doc_size=None, art_origin=(0, 0), bounds=None, options=No
         "warp": text.get("warp"),
         "shape": text.get("shape") or "point",
         "box_bounds_pt": text.get("box_bounds_pt"),
+        "box_origin": box_origin,
         "version": 2 if is_v2(text) else 1,
         "options": opts,
     }
@@ -885,9 +915,10 @@ def layout_glyphs(spec, shaper_for, fonts_dir=None, resolve_font=None):
 
     bb = spec.get("box_bounds_pt") if spec.get("shape") == "box" and opts.get("box_wrap") else None
     if bb:
-        bl, bt = _f(bb.get("left"), 0.0) or 0.0, _f(bb.get("top"), 0.0) or 0.0
-        bw = (_f(bb.get("right"), 0.0) or 0.0) - bl
-        bh = (_f(bb.get("bottom"), 0.0) or 0.0) - bt
+        # The box's top-left is the anchor (text_spec); only its size is read from box_bounds_pt (1.4.15).
+        bw = (_f(bb.get("right"), 0.0) or 0.0) - (_f(bb.get("left"), 0.0) or 0.0)
+        bh = (_f(bb.get("bottom"), 0.0) or 0.0) - (_f(bb.get("top"), 0.0) or 0.0)
+        bl, bt = 0.0, 0.0
     visual = []  # (hard line text, line start pos, a, b)
     pos = 0
     for line in lines:
@@ -1292,6 +1323,7 @@ def render_spec(spec, renderer, fonts_dir=None):
     if spec.get("warp") and str(spec["warp"]).lower() not in ("warpnone", "none"):
         info["approximations"].append(f"warp {spec['warp']} not rendered")
     if spec.get("shape") == "box":
+        info["box_origin"] = spec.get("box_origin")
         info["approximations"].append(
             "paragraph (box) text: greedy wrap to the box width; justification and hyphenation not rendered"
             if spec["options"].get("box_wrap") and spec.get("box_bounds_pt") else
