@@ -124,8 +124,9 @@ class TestHoleAndRisks(unittest.TestCase):
         rec = {"method": "smart_object_contents", "edge_effect_risks": list(risks.values()),
                "outer_effect_risks": h.outer_effect_risks(["DropShadow"], _ring())}
         fix = h.effect_fix_suggestion(rec)
-        self.assertEqual(fix["parts"][0]["split_fix"], "frame_from_merged")
-        burn = [p for p in fix["parts"] if p.get("blend_mode") == "linear_burn"][0]
+        self.assertEqual(fix["parts"][0]["split_fix"], "two_part_approx")
+        self.assertEqual(len(fix["parts"]), 1)
+        burn = [p for p in fix["optional_overlays"] if p.get("blend_mode") == "linear_burn"][0]
         self.assertIn("reverse-subtract", burn["engine"])
         self.assertEqual({x["id"] for x in fix["needs_user"]}, {7, 8})
         self.assertIn("frame_plain", fix["photoshop_exports"])
@@ -181,7 +182,7 @@ class TestComposeEffectFix(unittest.TestCase):
         self.assertEqual(int(fa[30:50, 30:50].max()), 0)
 
     def test_cmd_split_fix(self):
-        merged, content, ring, rim, _ = _design()
+        merged, content, ring, rim = _two_part_fixture()
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             for n, im in (("m", merged), ("c", content), ("f", ring), ("o", rim)):
@@ -190,10 +191,12 @@ class TestComposeEffectFix(unittest.TestCase):
             bb = rim.getbbox(); rim.crop(bb).save(td / "o_crop.png")
             args = SimpleNamespace(merged=str(td / "m.png"), content=str(td / "c.png"), frame=str(td / "f.png"),
                                    overlay=[f"{td / 'o_crop.png'}#{bb[0]},{bb[1]}"], overlay_blend=["linear_burn"],
-                                   canvas=f"{W},{W}", threshold=40.0, out_dir=str(td / "out"))
+                                   canvas=f"{W},{W}", threshold=40.0, out_dir=str(td / "out"),
+                                   emit_overlays=True, swap_content=None)
             self.assertEqual(h.cmd_split_fix(args), 0)
             rep = json.loads((td / "out" / "split_fix.json").read_text(encoding="utf-8"))
             self.assertTrue(rep["pass"])
+            self.assertEqual(rep["mode"], "emit_overlays")
             self.assertEqual(rep["parts"][1]["blend_mode"], "linear_burn")
             self.assertTrue((td / "out" / "compare.png").exists())
             args.overlay_blend = ["color_dodge"]
@@ -215,6 +218,7 @@ class TestCheckSplitEffects(unittest.TestCase):
         self.assertEqual([i["type"] for i in iss], ["outer_effect_into_hole"])
         self.assertEqual(iss[0]["owner_layer_id"], 10)
         self.assertEqual(h.check_split_effects([dict(e, split_fix="frame_from_merged")], self.TREE), [])
+        self.assertEqual(h.check_split_effects([dict(e, split_fix="two_part_approx")], self.TREE), [])
         self.assertEqual(h.check_split_effects([dict(e, split_evidence={"effects_checked": True})], self.TREE), [])
 
     def test_common_group_owner_and_blend_modes(self):
@@ -240,6 +244,82 @@ class TestCheckSplitEffects(unittest.TestCase):
             canvas, placed = h.recomposite(layout, td, (4, 4))
             self.assertEqual(tuple(np.asarray(canvas)[1, 1, :3]), (100, 100, 100))
             self.assertEqual(placed[1].get("blend_mode"), "multiply")
+
+
+
+def _two_part_fixture():
+    """A ring + a soft inner-edge linear-burn, closer to a real frame than the solid bar in _design()."""
+    content, ring = _content(), _ring()
+    rim = Image.fromarray(np.zeros((W, W, 4), np.uint8), "RGBA")
+    a = np.zeros((W, W, 4), np.uint8)
+    a[30:61, 20:23] = (170, 120, 90, 140)
+    a[30:61, 23] = (170, 120, 90, 70)
+    rim = Image.fromarray(a, "RGBA")
+    silhouette = Image.alpha_composite(content, ring)
+    merged = Image.alpha_composite(_shadow_of(silhouette), content)
+    merged = Image.alpha_composite(merged, ring)
+    merged = h.blend_arrays_img(merged, rim, "linear_burn")
+    return merged, content, ring, rim
+
+
+class TestTwoPartApprox(unittest.TestCase):
+    def test_ls_beats_normal_bake_on_swap(self):
+        merged, content, ring, rim = _two_part_fixture()
+        extras = [("solid_white", Image.new("RGBA", (W, W), (255, 255, 255, 255))),
+                  ("solid_black", Image.new("RGBA", (W, W), (0, 0, 0, 255))),
+                  ("solid_red", Image.new("RGBA", (W, W), (200, 40, 40, 255)))]
+        # force extras to share the content footprint
+        ca = np.asarray(content)[..., 3]
+        def masked(im):
+            a = np.asarray(im.convert("RGBA")).copy()
+            a[ca == 0] = 0
+            a[..., 3] = ca
+            return Image.fromarray(a, "RGBA")
+        extras = [(n, masked(im)) for n, im in extras]
+        res = h.compose_two_part_frame(merged, content, ring, [(rim, "linear_burn")], extras)
+        self.assertGreaterEqual(res["match"]["psnr"], 35)
+        self.assertGreaterEqual(res["swap_min_psnr"], 35)
+        self.assertTrue(res["pass"])
+        self.assertTrue(res["simulated_swap"])
+        # baking the burn as normal into the frame is worse on a dark/bright swap
+        zone = h.content_show_through_zone(content, ring)
+        frame_m = h.frame_pixels_from_merged(merged, content, ring)
+        baked = h.blend_arrays(frame_m, np.asarray(rim) * zone[..., None], "normal")
+        # placeholder may be ok-ish, but a black content should drift
+        black = masked(Image.new("RGBA", (W, W), (0, 0, 0, 255)))
+        sim_black = h.simulate_overlay_stack(black, frame_m, [(rim, "linear_burn")], zone)
+        rec_ls = h.blend_arrays(np.asarray(black, float), np.asarray(res["frame"], float), "normal")
+        rec_n = h.blend_arrays(np.asarray(black, float), baked, "normal")
+        db_ls = h.split_match(h._to_rgba_img(rec_ls), h._to_rgba_img(sim_black))["psnr"]
+        db_n = h.split_match(h._to_rgba_img(rec_n), h._to_rgba_img(sim_black))["psnr"]
+        self.assertGreater(db_ls, db_n)
+        self.assertGreaterEqual(db_ls, 35)
+
+    def test_cmd_split_fix_default_is_two_parts(self):
+        merged, content, ring, rim = _two_part_fixture()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            for n, im in (("m", merged), ("c", content), ("f", ring), ("o", rim)):
+                im.save(td / f"{n}.png")
+            alt = content.copy()
+            # a brighter stand-in for a swapped avatar
+            a = np.asarray(alt)
+            a = np.clip(a.astype(int) + 40, 0, 255).astype(np.uint8)
+            Image.fromarray(a, "RGBA").save(td / "swap.png")
+            args = SimpleNamespace(merged=str(td / "m.png"), content=str(td / "c.png"), frame=str(td / "f.png"),
+                                   overlay=[str(td / "o.png")], overlay_blend=["linear_burn"],
+                                   canvas=None, threshold=None, out_dir=str(td / "out"),
+                                   emit_overlays=False, swap_content=[str(td / "swap.png")])
+            self.assertEqual(h.cmd_split_fix(args), 0)
+            self.assertTrue((td / "out" / "frame.png").exists())
+            self.assertFalse((td / "out" / "overlay1_linear_burn.png").exists())
+            rep = json.loads((td / "out" / "split_fix.json").read_text(encoding="utf-8"))
+            self.assertEqual(rep["mode"], "two_part_approx")
+            self.assertEqual(len(rep["parts"]), 1)
+            self.assertEqual(rep["parts"][0]["blend_mode"], "normal")
+            self.assertTrue(rep["simulated_swap"])
+            self.assertGreaterEqual(rep["match"]["psnr"], 35)
+            self.assertGreaterEqual(rep["swap_min_psnr"], 35)
 
 
 if __name__ == "__main__":
