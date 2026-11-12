@@ -18,6 +18,9 @@
 // - only layers of a reuse_decisions entry the user answered "exclude" (recorded by `confirm --decision` in the
 //   lock's decision_log) are hidden, for slices and the full render. There is no other hide switch.
 // - multi-layer entries (select_ids): select_bounds per layer and logical_bounds_union.
+// 1.4.13: layers_at_open_ms and full_render.hidden_at_render_ms record how long each layer snapshot took
+// (observability only; the snapshot itself is unchanged). Copy this file byte for byte (shutil.copy2,
+// Copy-Item, cmd /c copy), not with PowerShell 5 Get-Content / Set-Content, which rewrites non-ASCII text.
 
 const { app, core, action } = require("photoshop");
 const fs = require("uxp").storage.localFileSystem;
@@ -26,7 +29,7 @@ const fs = require("uxp").storage.localFileSystem;
 const CONFIG_URL = "file:/D:/work/ps-job/export_config.json";
 // -----------------------------------------------------------------------
 
-const EXPORTER_RELEASE = "1.4.12";
+const EXPORTER_RELEASE = "1.4.13";
 let ROOT_URL, SOURCE_URL, SOURCE_PATH_HINT, MANIFEST_NAME, LOG_NAME, SLICES_DIR_NAME, FULL_RENDER_NAME, EXPORTER_URL;
 
 async function loadConfig() {
@@ -155,6 +158,8 @@ const log = {
   full_render: null,
   exporter: null,
   layers_at_open: null,
+  layers_at_open_ms: null,
+  layers_at_open_count: null,
   excluded_by_user_decision: [],
   pending_user_decisions: []
 };
@@ -701,7 +706,10 @@ try {
       }
       // Visibility as the document was opened, before any temporary change (validate: visible_layer_hidden,
       // visible_layer_unassigned).
+      const tSnap = nowMs();
       log.layers_at_open = snapshotLayers(src);
+      log.layers_at_open_ms = nowMs() - tSnap;
+      log.layers_at_open_count = log.layers_at_open.length;
       await flush();
 
       let suspension;
@@ -941,9 +949,11 @@ try {
         // Layers visible at open but hidden now (only user-recorded exclusions may be here).
         const openVis = {};
         for (const l of log.layers_at_open || []) openVis[l.id] = l.visible;
+        const tSnap2 = nowMs();
         fullItem.hidden_at_render = snapshotLayers(src)
           .filter((l) => openVis[l.id] === true && l.visible === false)
           .map((l) => ({ id: l.id, name: l.name }));
+        fullItem.hidden_at_render_ms = nowMs() - tSnap2;
         const hasArtboardId = artboard && artboard.id != null;
         if (hasArtboardId) {
           await bp([{

@@ -55,7 +55,7 @@ except ImportError:
     ParseLimits = None
 
 SCHEMA_MANIFEST = "psjs-slice-manifest/v2"
-SKILL_VERSION = "1.4.12"
+SKILL_VERSION = "1.4.13"
 SCHEMA_LAYOUT = "psjs-layout/v2"
 SCHEMA_MANIFEST_V1 = "psjs-slice-manifest/v1"
 SCHEMA_LAYOUT_V1 = "psjs-layout/v1"
@@ -2882,6 +2882,189 @@ def export_truth_issues(layout, shipped=None):
     return issues
 
 
+# 1.4.13: an uncertain_hidden note (on a component, a state or a part, or the manifest's top-level checklist list)
+# is only an index for people. The question to the user is the reuse_decisions entry (hidden_layer_state) whose
+# layer_ids cover it; without one, nobody was asked (uncertain_hidden_without_decision). Covered but unanswered
+# stays pending_user_decision only.
+UNCERTAIN_HIDDEN_HINT = (
+    "uncertain_hidden on the manifest is only an index for the reviewer; it asks the user nothing. For every "
+    "layer id listed there write a reuse_decisions entry of type hidden_layer_state (id, question, options, "
+    "layer_ids, crops), ask the user, and record the answer with `confirm --decision ID=VALUE`. If the layer is "
+    "clearly a state variant or clearly an old draft, drop it from uncertain_hidden instead (exporting a hidden "
+    "layer as a state still needs the user's recorded answer)."
+)
+HIDDEN_EXPORT_HINT = (
+    "these entries export a layer that was hidden when the document was opened as a state asset, and the user "
+    "did not choose to export it as a state. Adopting a hidden layer as a state (normal / unselected / locked / "
+    "alternate background, or reading the visible layer as 'selected' and a hidden one as 'normal') needs a "
+    "hidden_layer_state decision covering the layer, answered by the user with `confirm --decision ID=state`. "
+    "Until then keep the safe default: do not export the hidden layer and do not let it replace what the "
+    "document shows. Only a highlight over a base visible at open in the same component's default state is exempt."
+)
+STATE_EXPORT_DECISIONS = {"state", "states", "export", "export_as_state", "as_state", "alternate_state",
+                          "state_variant", "variant", "include", "included", "use", "use_as_state", "keep", "yes"}
+
+
+def _lid(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return v
+
+
+def _uncertain_ids(note):
+    """layer ids in an uncertain_hidden value: a dict, a list of dicts / ids, or a bare id."""
+    if note is None or note == "" or note is False:
+        return []
+    items = note if isinstance(note, (list, tuple)) else [note]
+    out = []
+    for it in items:
+        if isinstance(it, dict):
+            ids = list(it.get("layer_ids") or [])
+            if it.get("layer_id") is not None:
+                ids.append(it["layer_id"])
+        else:
+            ids = [it]
+        for i in ids:
+            if i is not None and not isinstance(i, (dict, list, bool)) and _lid(i) not in out:
+                out.append(_lid(i))
+    return out
+
+
+def _uncertain_question(note):
+    items = note if isinstance(note, (list, tuple)) else [note]
+    qs = [it.get("question") for it in items if isinstance(it, dict) and it.get("question")]
+    return qs[0] if len(qs) == 1 else (qs or None)
+
+
+def iter_uncertain_hidden(components, extra=None):
+    """Yield {component_id, state, part, layer_ids, question} for every uncertain_hidden note in the tree."""
+    seen = set()
+
+    def emit(note, comp_id, state=None, part=None):
+        ids = _uncertain_ids(note)
+        key = (comp_id, state, part, tuple(map(str, ids)))
+        if not ids or key in seen:
+            return None
+        seen.add(key)
+        return {"component_id": comp_id, "state": state, "part": part, "layer_ids": ids,
+                "question": _uncertain_question(note)}
+
+    def walk(comp):
+        if not isinstance(comp, dict):
+            return
+        cid = comp.get("id") or comp.get("name")
+        rec = emit(comp.get("uncertain_hidden"), cid)
+        if rec:
+            yield rec
+        for part in component_shared_parts(comp):
+            rec = emit(part.get("uncertain_hidden"), cid, part=part.get("name"))
+            if rec:
+                yield rec
+        states = comp.get("states") or {}
+        if isinstance(states, dict):
+            for sname, sobj in states.items():
+                if not isinstance(sobj, dict):
+                    continue
+                rec = emit(sobj.get("uncertain_hidden"), cid, state=sname)
+                if rec:
+                    yield rec
+                for part in sobj.get("parts") or []:
+                    if isinstance(part, dict):
+                        rec = emit(part.get("uncertain_hidden"), cid, state=sname, part=part.get("name"))
+                        if rec:
+                            yield rec
+        for child in comp.get("children") or []:
+            yield from walk(child)
+
+    for comp in components or []:
+        yield from walk(comp)
+    rec = emit(extra, None)
+    if rec:
+        yield rec
+
+
+def _decisions_covering(decisions, lid):
+    return [d for d in decisions or [] if isinstance(d, dict) and decision_is_blocking(d)
+            and lid in {_lid(i) for i in (d.get("layer_ids") or [])}]
+
+
+def uncertain_hidden_issues(components, decisions, lock_info=None, extra=None):
+    """uncertain_hidden_without_decision for noted layer ids that no blocking reuse_decisions entry covers.
+    Covered ids are left to pending_user_decision (unanswered) or are answered."""
+    issues = []
+    for rec in iter_uncertain_hidden(components, extra):
+        bare = [i for i in rec["layer_ids"] if not _decisions_covering(decisions, i)]
+        if bare:
+            issues.append(dict(rec, type="uncertain_hidden_without_decision", layer_ids=bare,
+                               message=UNCERTAIN_HIDDEN_HINT))
+    return issues
+
+
+def hidden_layer_export_issues(layout):
+    """hidden_layer_exported_without_decision: a PNG entry whose layer_id / select_ids include a layer hidden at
+    open (own or through an ancestor, from layers_at_open) without a blocking decision covering it that the user
+    answered with an export-as-state value (recorded by confirm --decision). Skipped: logs without
+    layers_at_open, attribute-only text and bounds-only reuse instances, ids covered by an unanswered decision
+    (pending_user_decision reports those), and a highlight over a base visible at open in the same component's
+    default state."""
+    layers = ((layout or {}).get("export") or {}).get("layers_at_open")
+    if not layers:
+        return []
+    vis = {}
+    for l in layers:
+        if isinstance(l, dict) and l.get("id") is not None:
+            vis[_lid(l["id"])] = bool(l.get("effective_visible", l.get("visible", True))) and l.get("visible", True) is not False
+    decisions = layout.get("reuse_decisions") or []
+    log = (layout.get("manifest_lock") or {}).get("decision_log") or []
+    nodes = [n for n in layout.get("nodes") or [] if isinstance(n, dict)]
+
+    def ids_of(n):
+        ids = n.get("select_ids") or ([n.get("layer_id")] if n.get("layer_id") is not None else [])
+        return [_lid(i) for i in ids if i is not None]
+
+    def in_default_state(n):
+        st = n.get("state")
+        return st is None or (n.get("default_state") is not None and st == n.get("default_state"))
+
+    def has_visible_default_base(n):
+        cid = n.get("component_id")
+        if cid is None:
+            return False
+        for o in nodes:
+            if o is n or o.get("component_id") != cid or not in_default_state(o):
+                continue
+            if (o.get("part_role") or o.get("role") or "").lower() == "highlight":
+                continue
+            if any(vis.get(i) is True for i in ids_of(o)):
+                return True
+        return False
+
+    bad = []
+    for n in nodes:
+        if not n.get("image") or n.get("_bounds_only") or is_attr_text(n.get("kind")):
+            continue
+        hidden = [i for i in ids_of(n) if vis.get(i) is False]
+        if not hidden:
+            continue
+        if (n.get("part_role") or n.get("role") or "").lower() == "highlight" and has_visible_default_base(n):
+            continue
+        for lid in hidden:
+            cover = _decisions_covering(decisions, lid)
+            if any(decision_answer_state(d, log) is not None for d in cover):
+                continue  # pending_user_decision
+            if any(_norm_decision(d.get("decision")) in STATE_EXPORT_DECISIONS for d in cover):
+                continue
+            bad.append({"name": n.get("name"), "layer_id": lid, "component_id": n.get("component_id"),
+                        "state": n.get("state"), "part_role": n.get("part_role") or n.get("role"),
+                        "decision_ids": [d.get("id") for d in cover],
+                        "reason": "user_answer_is_not_export_as_state" if cover else "no_decision"})
+    if not bad:
+        return []
+    return [{"type": "hidden_layer_exported_without_decision", "count": len(bad), "entries": bad[:50],
+             "message": HIDDEN_EXPORT_HINT}]
+
+
 MANIFEST_CHANGED_HINT = (
     "the manifest was edited after the user confirmed it. Do not edit a confirmed manifest during "
     "export / build-layout / validate: restore manifest.confirmed.json, write the wanted change to "
@@ -4798,6 +4981,8 @@ def cmd_flatten(args):
         "pending_reuse_decisions": pending,
         "pending_user_decisions": pending_user_decisions(decisions, manifest_lock_state(path).get("decision_log")
                                                          if path.is_file() else []),
+        "uncertain_hidden_without_decision": uncertain_hidden_issues(manifest.get("components") or [], decisions,
+                                                             None, manifest.get("uncertain_hidden")),
         "entry_count": len(entries),
         "by_kind": dict(Counter(e["kind"] for e in entries)),
         "hidden_entries": sum(1 for e in entries if e.get("hidden")),
@@ -4807,6 +4992,9 @@ def cmd_flatten(args):
         "frame_split_issues": frame_issues,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    for problem in summary["uncertain_hidden_without_decision"]:
+        warn(f"uncertain_hidden without a hidden_layer_state decision: layers {problem['layer_ids']} "
+             f"({problem.get('component_id')}); validate will report it")
     for problem in effect_issues:
         warn(f"group effect would be lost: {problem['name']} (group {problem['effect_group_id']})")
     for problem in frame_issues:
@@ -5218,6 +5406,7 @@ def cmd_build_layout(args):
             "component_type": entry.get("component_type"),
             "part_role": entry.get("part_role"),
             "state": entry.get("state"),
+            "default_state": entry.get("default_state"),
             "default": entry.get("default", True),
             "hidden": entry.get("hidden", False),
         }
@@ -5305,6 +5494,7 @@ def cmd_build_layout(args):
         "effect_groups": effect_groups,
         "effect_issues": effect_issues,
         "reuse_decisions": manifest.get("reuse_decisions") or [],
+        "uncertain_hidden": manifest.get("uncertain_hidden"),
         "manifest_lock": lock,
         "thresholds": resolve_thresholds(thresholds_from_rules_file(manifest.get("naming_rules_file"))),
         "avatar_merge_suspects": [
@@ -6399,6 +6589,9 @@ def cmd_validate(args):
     issues.extend(lock_issues(layout.get("manifest_lock")))
     issues.extend(user_decision_issues(layout.get("reuse_decisions") or [], layout.get("manifest_lock")))
     issues.extend(export_truth_issues(layout, getattr(args, "shipped_exporter", None)))
+    issues.extend(uncertain_hidden_issues(layout.get("components") or [], layout.get("reuse_decisions") or [],
+                                          layout.get("manifest_lock"), layout.get("uncertain_hidden")))
+    issues.extend(hidden_layer_export_issues(layout))
     issues.extend(check_avatar_splits(layout["nodes"], layout.get("reuse_decisions") or [],
                                       layout.get("avatar_merge_suspects") or [], layout.get("tree") or None, thr))
     issues.extend(check_frame_bakes(layout["nodes"], layout.get("tree") or None))
@@ -6585,6 +6778,11 @@ def cmd_validate(args):
             "visible_layer_hidden / visible_layer_unassigned / exporter_modified: the full render must show what the "
             "document showed when opened (minus user-recorded exclusions), every visible pixel layer needs an entry "
             "or an exclusion, and the export must come from the shipped export_slices.psjs.",
+            "uncertain_hidden_without_decision: an uncertain_hidden note whose layer_ids no blocking reuse_decisions "
+            "entry (hidden_layer_state) covers; the note asks nobody.",
+            "hidden_layer_exported_without_decision: a PNG entry uses a layer hidden at open (layers_at_open) as a "
+            "state asset without the user's recorded export-as-state answer (a highlight over a base visible at "
+            "open in the same component's default state is exempt; logs without layers_at_open are skipped).",
         ],
         "issues": issues,
         "placed": len(placed_text),
