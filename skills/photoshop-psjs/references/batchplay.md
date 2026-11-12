@@ -122,6 +122,36 @@ const type = {
 
 色标 `location` 范围是 0–4096。`interfaceIconFrameDimmed` 为 0 和 4096 时出图不同（实测黑白线性渐变：0 接近线性，4096 是 S 曲线，256×64 图约 98% 像素有差异，单通道最大差 12）。默认用 4096，除非要对齐某个特定观感。
 
+## 关掉效果（导出某一侧时）
+
+实测（PS 2026）：
+
+- `set` 图层的 `layerFXVisible: false` **是静默空操作**：不报错，读回仍为 true，效果照常画。不要用它。
+- 普通图层 / 智能对象图层：先选中，再发 `disableLayerFX`，然后读回。
+
+```js
+await batchPlay([{ _obj: "select", _target: [{ _ref: "layer", _id: id }], makeVisible: false,
+                   _options: { dialogOptions: "silent" } }], {});
+await batchPlay([{ _obj: "disableLayerFX", _target: [{ _ref: "layer", _enum: "ordinal", _value: "targetEnum" }],
+                   _options: { dialogOptions: "silent" } }], {});
+const d = (await batchPlay([{ _obj: "get", _target: [{ _ref: "layer", _id: id }],
+                              _options: { dialogOptions: "silent" } }], {}))[0];
+if (d.layerFXVisible !== false) throw new Error("effects still on");
+```
+
+- **组**：`disableLayerFX` 不可用（`silent` 返回 `result: -25920`，「命令“清除效果”当前不可用」；`dontDisplay` 会弹框）。读出组的 `layerEffects`，把每一项（含 `*Multi` 数组里的每一条）的 `enabled` 置 false，`set` 回去，再读回确认没有 `enabled: true`：
+
+```js
+const le = JSON.parse(JSON.stringify((await getLayer(id)).layerEffects));
+for (const k of Object.keys(le)) for (const e of [].concat(le[k])) if (e && typeof e === "object" && "enabled" in e) e.enabled = false;
+await batchPlay([{ _obj: "set", _target: [{ _ref: "property", _property: "layerEffects" },
+                   { _ref: "layer", _enum: "ordinal", _value: "targetEnum" }], to: le,
+                   _options: { dialogOptions: "silent" } }], {});
+```
+
+- 先读再改：没有 `layerEffects`、或已经关掉的层直接跳过。对已关掉的层再发 `disableLayerFX` 也会失败；用 `dontDisplay` 时每次失败都弹一个阻塞框。
+- 只在临时导出文档（或其「编辑内容」打开的内嵌文档）里改，存回的是临时副本。
+
 ## 图层样式：描边 / 内阴影 / 投影
 
 写入目标图层的 `layerEffects`。多描边用 `frameFXMulti`；单条可用 `frameFX`。内阴影必须用 `innerShadowMulti`，否则会被静默忽略。

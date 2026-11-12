@@ -5,7 +5,7 @@ license: MIT-0
 compatibility: "Requires Adobe Photoshop 2023 (v23.5+) or later with UXP scripting, on Windows or macOS. The optional slicing helper needs Python 3 with psd-tools, Pillow and numpy; its validate step also requires uharfbuzz + freetype-py (or uharfbuzz + skia-python), plus scipy for strokes and effect spread, when the layout has dynamic_text or static_text."
 metadata:
   author: younglark
-  version: "1.4.9"
+  version: "1.4.10"
   homepage: https://github.com/younglark/photoshop-skills
 ---
 
@@ -189,6 +189,7 @@ await out.write(JSON.stringify(log, null, 2));
 
 - **多层描边**必须用 `frameFXMulti`（单条可用 `frameFX`）。渐变沿形状外扩用 `gradientType: "shapeburst"`。
 - **`innerShadow` 单键会被静默忽略**，应写成 `innerShadowMulti: [{ _obj: "innerShadow", ... }]`。改完用 `get` 读回 `layerEffects`，确认键真的在。
+- **关图层效果：`set layerFXVisible: false` 是静默空操作**（不报错，读回仍为 true，效果照画）。图层上用 `disableLayerFX`（`_target` 为 `ordinal targetEnum`，先选中该层），然后 `get` 读回 `layerFXVisible === false` 才算关掉。**组**上 `disableLayerFX` 不可用（「命令“清除效果”当前不可用」）：读出该组的 `layerEffects`，把每一项的 `enabled` 置 false 再 `set` 回 `{_ref:"property",_property:"layerEffects"}`，读回确认没有 `enabled: true` 的项。已经关掉或没有效果的层先读再跳过，不要盲目再发一次命令。见 [references/batchplay.md](references/batchplay.md)「关掉效果」。
 - 自定义路径：先 `set` `workPath` 再 `make contentLayer`。这样做出的形状通常 **没有** `keyOriginType`，不是属性栏可改圆角的实时形状。要可编辑圆角，用 `make contentLayer` + `shape._obj = "rectangle"` / `"ellipse"` 且带 `unitValueQuadVersion: 1` 和四角半径。
 - 字体赋的是 **PostScript 名**（如 `textItem.characterStyle.font = "MuseoSansRounded-1000"`），且必须已安装；按用户安装即可，不必装成机器级。
 - RGB 描述符里绿色字段叫 **`grain`**，不是 `green`。不要「修正」这个名字。
@@ -239,6 +240,11 @@ await out.write(JSON.stringify(log, null, 2));
 沿用第 2–5 节的规则：每条描述符 `_options.dialogOptions = "silent"`，轮询结果 JSON，文档 id 守卫，不加额外 CLI 参数，顶层 `await`，`executeAsModal`，需要时 `suspendHistory`。
 
 **实测（Windows / PS 2026，一份列表界面 PSB 副本上的 1080×2340 画板，Asia/Shanghai）：** 修后可见元素 65 条（image 18 / nine_slice 21 / dynamic_text 22 / art_text 4），遮罩动态文字后 mean ΔE **0.047**、PSNR **46.24 dB**。规则文件外置后同一数字仍保持。细节见 [references/slicing.md](references/slicing.md) 第 10 节。第 10 节表里的类型计数是 1.4.8 规则之前测的，不改写。Agent 驱动的组件/状态轮次（10.4）在同一副本上默认态遮罩 PSNR 仍为 46.24 dB；隐藏的页签/导航交替状态已导出并单独出预览，未画出来的状态记入 `missing`。
+
+**1.4.10：** 拆分框与内容时两处修正，都按「效果归属」处理：
+- **内容不能带框色的边。** 包住框和内容两侧的组（或智能对象内层的组）带的内阴影 / 内发光 / 描边 / 斜面浮雕，在只留内容导出时会按内容自己的 alpha 重画，在内容边缘画出一圈框色的边（设计里这些效果画在整组外缘、落在框上，不碰内容）。这些效果和内容无关，**归框**：导出内容时关掉（组用逐项 `enabled: false`，读回确认），框里保留。
+- **框洞内缘的抗锯齿带不逐像素硬解。** 用公式模拟的目标逐像素拟合，低 alpha 的边缘像素会在深色和亮色之间来回跳（阶梯 / 暗圈）。首选 `split-fix --probe`：同一临时副本里把内容像素隐藏、内容形状填成几种纯色（黑、白、中灰、再加彩色），每种导出一次合并图；框在这些**真实渲染**上拟合，换内容用留一法在真实渲染上验证（`swap_is_real_render: true`）。没有探针时，模拟路径在抗锯齿带上把最小二乘的方程按邻域合并求解（`aa_band_smoothed`），结果标为模拟。
+- `split-fix` 另报 `aa_band_noise`（边缘带的颜色跳变，只作诊断）和 `content_check`（框完全透明处，内容导出和合并图不一致时 `rim_suspect: true`，不算通过）。
 
 **1.4.9：** 三条护栏，问题一律进 `validate` 的 `issues`，agent 不能靠自己写的「接受」标记消掉：
 - **效果归属默认判断**：框与它框住的动态内容（头像、标题文字、徽章）叠在一起时，内容外侧、不依赖内容的外部效果（投影、外发光、外描边）默认归框，烘进框、不挂在内容上、不漏进洞里；做法不限（`split-fix` 两张近似只是工具之一）。拆完拼回去低于 `split_match_psnr`（默认 35 dB）时：先套这个默认判断 → 再逐层关效果定位选修法 → 仍低于就**停下**写 `split_avatar` 决定交用户。`validate` 按导出的 PNG 实测（`split_checked`），低于阈值记 `split_below_threshold`，直到该决定记着用户本人的回答（`decided_by: "user"`，用 `confirm --decision ID=VALUE` 记录；agent 抄 `default`、一句「清单确认」都不算）；没有 Photoshop 实测 dB 的 `candidate_unverified` 记 `split_unverified`。

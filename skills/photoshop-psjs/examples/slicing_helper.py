@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import sys
 import time
@@ -2954,6 +2955,7 @@ CONTENT_DEPENDENT_KINDS = {"adjustment", "brightnesscontrast", "levels", "curves
                            "huesaturation", "colorbalance", "blackandwhite", "photofilter", "channelmixer",
                            "colorlookup", "invert", "posterize", "threshold", "selectivecolor", "gradientmap"}
 EFFECT_FIX_PSNR = 40.0     # exact overlay replay (content + frame + blend_mode parts) vs merged; measured 42 dB on PS 2026
+AA_BAND_SMOOTH_RADIUS = 1  # 1.4.10: pool the LSQ fit over a 3x3 neighbourhood on the frame's anti-aliased hole edge
 TWO_PART_PSNR = 35.0       # two-part approx (frame.png over content vs merged, and vs a simulated swap); below this, offer overlays or ask
 HOLE_MIN_FRACTION = 0.05   # enclosed transparent area / bbox area for a frame to count as a ring
 
@@ -3104,14 +3106,18 @@ def effect_fix_suggestion(rec, base_name="<module>_img_avatar"):
                          "when": f"offer to the user if two-part approx drops below ~{TWO_PART_PSNR:.0f} dB on a content swap"})
     exports = {
         "merged": "the layer as designed",
-        "content": "content side only; owner edge effects off and group edge effects off",
+        "content": "content side only; owner edge effects off and group effects off (a group's inner shadow / glow / "
+                   "stroke would otherwise be recomputed on the content-only alpha and paint a frame-coloured rim)",
+        "probes": "preferred: the merged export again with the content pixels hidden and the content shape filled with "
+                  "solid colours (e.g. black, white, mid gray, plus a colour); pass as split-fix --probe R,G,B=PATH",
         "frame_plain": "frame side only; owner edge effects off, group edge effects off, overlay layers hidden",
     }
     for p in optional:
         exports[p["name"]] = p["export"]
     return {"parts": parts, "optional_overlays": optional, "photoshop_exports": exports,
-            "verify": "split-fix --merged M --content C --frame F [--overlay O --overlay-blend MODE] "
-                      "[--swap-content OTHER.png]; default bakes overlays into frame.png (two parts). "
+            "verify": "split-fix --merged M --content C --frame F --probe 0,0,0=P0 --probe 255,255,255=P1 --probe 128,128,128=P2 "
+                      "(preferred: fitted and checked on real renders), or [--overlay O --overlay-blend MODE] "
+                      "[--swap-content OTHER.png] (simulated); default bakes overlays into frame.png (two parts). "
                       f"--emit-overlays keeps them as extra parts. Use the two-part split at >= {TWO_PART_PSNR:.0f} dB "
                       f"on the placeholder and on a swapped content (simulated); otherwise offer overlays or keep merged.",
             "needs_user": [{"id": x["id"], "name": x["name"], "why": x["mechanism"]} for x in needs_user]}
@@ -3316,10 +3322,28 @@ def simulate_overlay_stack(content, frame, overlays, zone):
     return rec
 
 
-def fit_src_over_layer(bases, targets, zone, weights=None):
+def _box_sum(a, r, axes=(0, 1)):
+    """Sum over a (2r+1)x(2r+1) window on the first two axes (zero padded)."""
+    if r <= 0:
+        return a
+    pad = [(r, r), (r, r)] + [(0, 0)] * (a.ndim - 2)
+    p = np.pad(a, pad)
+    c = p.cumsum(0).cumsum(1)
+    c = np.pad(c, [(1, 0), (1, 0)] + [(0, 0)] * (a.ndim - 2))
+    k = 2 * r + 1
+    H, W = a.shape[:2]
+    return c[k:k + H, k:k + W] - c[0:H, k:k + W] - c[k:k + H, 0:W] + c[0:H, 0:W]
+
+
+def fit_src_over_layer(bases, targets, zone, weights=None, smooth_mask=None, smooth_radius=1):
     """Per-pixel least squares: a straight-alpha src-over ``(C, a)`` such that ``(1-a)*B + a*C ≈ T``
     over a set of (base, target) samples. ``bases`` / ``targets`` are name -> HxWx3 or HxWx4 arrays.
-    Only zone pixels where the base is opaque (alpha 255, if present) vote. Returns an RGBA float layer."""
+    Only zone pixels where the base is opaque (alpha 255, if present) vote. Returns an RGBA float layer.
+
+    ``smooth_mask`` (1.4.10): pixels (e.g. the frame's anti-aliased inner edge) where a per-pixel solve is
+    ill-conditioned (low alpha, targets that only approximate the real stack). There the normal equations
+    are pooled over a ``(2r+1)^2`` neighbourhood inside the zone, so neighbouring pixels share one stable
+    colour / alpha instead of alternating dark / bright solutions (stair-step on the hole edge)."""
     names = list(bases)
     Ds = [_as_rgba_f(bases[n])[..., :3] for n in names]
     Ts = [_as_rgba_f(targets[n])[..., :3] for n in names]
@@ -3347,6 +3371,14 @@ def fit_src_over_layer(bases, targets, zone, weights=None):
         ATb[..., ch] = (w * Y[..., ch]).sum(0)
     ATA[..., 3, 3] = (w * (D ** 2).sum(-1)).sum(0)
     ATb[..., 3] = -(w * (D * Y).sum(-1)).sum(0)
+    if smooth_mask is not None and np.any(smooth_mask) and smooth_radius > 0:
+        zm = np.asarray(zone, dtype=bool)
+        ATA_s = _box_sum(ATA * zm[..., None, None], smooth_radius)
+        ATb_s = _box_sum(ATb * zm[..., None], smooth_radius)
+        sm = np.asarray(smooth_mask, dtype=bool) & zm
+        ATA[sm] = ATA_s[sm]
+        ATb[sm] = ATb_s[sm]
+        sum_w = np.where(sm, _box_sum(sum_w * zm, smooth_radius), sum_w)
     ATA = ATA + 1e-6 * np.eye(4)
     X = np.linalg.solve(ATA, ATb[..., None])[..., 0]
     m, a = X[..., :3], np.clip(X[..., 3], 0, 1)
@@ -3381,13 +3413,16 @@ def compose_two_part_frame(merged, content, frame_plain, overlays=(), extra_cont
     c = _as_rgba_f(content)
     frame0 = frame_pixels_from_merged(merged, content, frame_plain)
     zone = content_show_through_zone(content, frame_plain)
+    aa_band = zone & (_as_rgba_f(frame_plain)[..., 3] > 0)
     contents = representative_contents(content, extra_contents)
     sim = {k: simulate_overlay_stack(v, frame0, overlays, zone) for k, v in contents.items()}
     if overlays:
         targets = dict(sim)
         targets["placeholder"] = m
         bases = {k: blend_arrays(_as_rgba_f(v), frame0, "normal") for k, v in contents.items()}
-        residual = fit_src_over_layer(bases, targets, zone)
+        # 1.4.10: never solve the anti-aliased hole edge pixel by pixel (stair-step / dark ring);
+        # pool the normal equations there with the neighbours.
+        residual = fit_src_over_layer(bases, targets, zone, smooth_mask=aa_band, smooth_radius=AA_BAND_SMOOTH_RADIUS)
         frame = blend_arrays(frame0, residual, "normal")
     else:
         residual = np.zeros_like(frame0)
@@ -3407,6 +3442,7 @@ def compose_two_part_frame(merged, content, frame_plain, overlays=(), extra_cont
     probe_vals = [swaps[k]["psnr"] for k in probe] or [99.0]
     all_vals = [x["psnr"] for x in swaps.values()] or [99.0]
     ph = split_match(rec_im, merged_im)
+    cc = content_vs_merged_where_frame_clear(merged, content, frame)
     return {
         "frame": frame_im,
         "recomposite": rec_im,
@@ -3420,10 +3456,153 @@ def compose_two_part_frame(merged, content, frame_plain, overlays=(), extra_cont
         "swap_all_mean_psnr": round(float(np.mean(all_vals)), 2),
         "simulated_swap": True,
         "content_zone_px": int(np.asarray(zone).sum()),
+        "aa_band_px": int(aa_band.sum()),
+        "aa_band_smoothed": bool(overlays) and AA_BAND_SMOOTH_RADIUS > 0,
+        "aa_band_noise": aa_band_noise(frame, aa_band),
+        "content_check": cc,
         "method": "two_part_approx",
         "approx": "least_squares_src_over" if overlays else "frame_from_merged_only",
         "threshold_psnr": TWO_PART_PSNR,
-        "pass": ph["psnr"] >= TWO_PART_PSNR and min(probe_vals) >= TWO_PART_PSNR,
+        "pass": ph["psnr"] >= TWO_PART_PSNR and min(probe_vals) >= TWO_PART_PSNR and not cc["rim_suspect"],
+    }
+
+
+def aa_band_noise(frame, band):
+    """Diagnostic: mean |premultiplied RGB - its 3x3 median| over the anti-aliased band (0-255 scale).
+
+    A median keeps real edges and smooth gradients but not isolated outliers, so high values mean
+    neighbouring edge pixels got alternating colours (stair-step / speckled ring). Report only; compare
+    before / after a change on the same inputs."""
+    band = np.asarray(band, dtype=bool)
+    if not band.any():
+        return None
+    f = _as_rgba_f(frame)
+    pm = f[..., :3] * f[..., 3:4] / 255.0
+    H, W = pm.shape[:2]
+    p = np.pad(pm, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    med = np.median(np.stack([p[dy:dy + H, dx:dx + W] for dy in range(3) for dx in range(3)], 0), 0)
+    return round(float(np.abs(pm - med)[band].mean()), 3)
+
+
+def content_vs_merged_where_frame_clear(merged, content, frame):
+    """Where the frame is fully clear and the content opaque, the content export must equal the merged design.
+
+    A mismatch there means the content export carries pixels the design does not show, e.g. a group's
+    inner shadow / inner glow / stroke recomputed on the content-only alpha after the frame layers were
+    hidden (a frame-coloured rim along the content edge). Those effects belong to the frame: turn them
+    off for the content export (references/batchplay.md, group effects) and keep them in the frame."""
+    m, c, f = _as_rgba_f(merged), _as_rgba_f(content), _as_rgba_f(frame)
+    clear = (f[..., 3] == 0) & (c[..., 3] >= 255) & (m[..., 3] >= 255)
+    n = int(clear.sum())
+    if n == 0:
+        return {"px": 0, "psnr": None, "pct_px_diff_gt16": None, "rim_suspect": False}
+    d = np.abs(m[..., :3] - c[..., :3]).max(-1)[clear]
+    mse = float(((m[..., :3] - c[..., :3]) ** 2)[clear].mean())
+    psnr = 99.0 if mse <= 1e-9 else round(10 * math.log10(255.0 ** 2 / mse), 2)
+    pct = round(float((d > 16).mean() * 100), 3)
+    return {"px": n, "psnr": psnr, "pct_px_diff_gt16": pct,
+            "rim_suspect": bool(psnr < TWO_PART_PSNR)}
+
+
+def _parse_probe_spec(spec):
+    """``R,G,B=PATH`` or ``#RRGGBB=PATH`` (PATH may carry ``#X,Y``)."""
+    key, sep, path = str(spec).partition("=")
+    if not sep:
+        raise SystemExit(f"--probe {spec}: expected R,G,B=PATH or #RRGGBB=PATH")
+    key = key.strip()
+    if key.startswith("#") and len(key) == 7:
+        rgb = tuple(int(key[i:i + 2], 16) for i in (1, 3, 5))
+    else:
+        try:
+            rgb = tuple(int(round(float(v))) for v in key.split(","))
+        except ValueError:
+            raise SystemExit(f"--probe {spec}: bad colour {key!r}")
+    if len(rgb) != 3 or any(v < 0 or v > 255 for v in rgb):
+        raise SystemExit(f"--probe {spec}: colour must be 3 values 0-255")
+    return rgb, path
+
+
+def _solid_like(content, rgb):
+    c = _as_rgba_f(content)
+    out = np.zeros_like(c)
+    out[..., :3] = np.array(rgb, dtype=float)
+    out[..., 3] = c[..., 3]
+    return out
+
+
+def compose_two_part_frame_from_probes(merged, content, probes, frame_plain=None):
+    """1.4.10: two-part split fitted on real Photoshop renders instead of simulated blend formulas.
+
+    ``probes`` is a list of ``(rgb, image)``: the same merged export, but with the content replaced by a solid
+    colour of the same shape (hide the content pixels, recolour the clipping base / content shape). Frame-side
+    effects (inner shadows, inner glow, linear-burn / multiply overlays, group effects) are rendered by
+    Photoshop over each probe, so nothing is simulated.
+
+    - ``zone``: pixels where the probe renders differ (the content shows through). Outside it the frame is the
+      merged export (outer shadows etc., content-independent by construction).
+    - inside the zone, one src-over ``(C, a)`` per pixel by least squares over all probes. With probes that span
+      dark and bright colours the system is well conditioned, also on the low-alpha anti-aliased edge.
+    - swap check: leave-one-out, i.e. the frame fitted without probe k predicts the real render of probe k.
+    - placeholder check: content + frame vs merged; content check: content vs merged where the frame is clear.
+    """
+    m = _as_rgba_f(merged)
+    c = _as_rgba_f(content)
+    probes = [(tuple(int(v) for v in rgb), _as_rgba_f(im)) for rgb, im in probes]
+    if len(probes) < 2:
+        raise ValueError("need at least 2 probe renders (dark and bright)")
+    for rgb, im in probes:
+        if im.shape != m.shape:
+            raise ValueError(f"probe {rgb} must share the merged canvas: {im.shape} vs {m.shape}")
+    lum = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in (p[0] for p in probes)]
+    stack = np.stack([p[1][..., :3] for p in probes], 0)
+    # Content shows through where the probe renders differ by more than one 8-bit step.
+    zone = (stack.max(0) - stack.min(0)).max(-1) > 1.0
+    opaque = c[..., 3] >= 255
+    partial = zone & ~opaque
+    zone_fit = zone & opaque
+
+    def fit(sel):
+        bases = {i: _solid_like(content, probes[i][0]) for i in sel}
+        targets = {i: probes[i][1] for i in sel}
+        layer = fit_src_over_layer(bases, targets, zone_fit)
+        return np.where(zone_fit[..., None], layer, m)
+
+    idx = list(range(len(probes)))
+    frame = fit(idx)
+    # Partly transparent content under a non-opaque frame: the merged pixel already holds content; keep it
+    # (counted in the report) rather than double it at runtime.
+    frame_im = _to_rgba_img(frame)
+    rec = blend_arrays(c, frame, "normal")
+    rec_im = _to_rgba_img(rec)
+    ph = split_match(rec_im, _to_rgba_img(m))
+    loo = {}
+    if len(probes) >= 3:
+        for k in idx:
+            fk = fit([i for i in idx if i != k])
+            got = _to_rgba_img(blend_arrays(_solid_like(content, probes[k][0]), fk, "normal"))
+            loo["%d,%d,%d" % probes[k][0]] = split_match(got, _to_rgba_img(probes[k][1]))
+    insample = {}
+    for rgb, im in probes:
+        got = _to_rgba_img(blend_arrays(_solid_like(content, rgb), frame, "normal"))
+        insample["%d,%d,%d" % rgb] = split_match(got, _to_rgba_img(im))
+    loo_vals = [v["psnr"] for v in loo.values()]
+    band = zone_fit & (frame[..., 3] > 0) & (frame[..., 3] < 255)
+    cc = content_vs_merged_where_frame_clear(merged, content, frame)
+    swap_min = round(float(min(loo_vals)), 2) if loo_vals else None
+    passed = ph["psnr"] >= TWO_PART_PSNR and swap_min is not None and swap_min >= TWO_PART_PSNR
+    return {
+        "frame": frame_im, "recomposite": rec_im, "match": ph,
+        "swap_loo": loo, "swap_in_sample": insample,
+        "swap_min_psnr": swap_min,
+        "swap_mean_psnr": round(float(np.mean(loo_vals)), 2) if loo_vals else None,
+        "swap_is_real_render": True, "simulated_swap": False,
+        "probe_colours": [list(p[0]) for p in probes],
+        "probe_luma_span": round(float(max(lum) - min(lum)), 1),
+        "content_zone_px": int(zone.sum()), "zone_partial_content_px": int(partial.sum()),
+        "aa_band_px": int(band.sum()), "aa_band_noise": aa_band_noise(frame, band),
+        "content_check": cc,
+        "method": "two_part_approx", "approx": "probe_fit_src_over",
+        "threshold_psnr": TWO_PART_PSNR, "pass": bool(passed and not cc["rim_suspect"]),
     }
 
 
@@ -3478,6 +3657,38 @@ def cmd_split_fix(args):
                    "content_zone_px": res["content_zone_px"],
                    "draw_order": ["content (runtime)"] + [p["file"] for p in parts],
                    "plain_frame_over_content": split_match(blend_arrays_img(content, frame), merged)}
+    elif getattr(args, "probe", None):
+        probes = []
+        for spec in args.probe:
+            rgb, path = _parse_probe_spec(spec)
+            probes.append((rgb, _open_canvas_image(path, size)))
+        res = compose_two_part_frame_from_probes(merged, content, probes, frame)
+        res["frame"].save(out / "frame.png")
+        res["recomposite"].save(out / "recomposite.png")
+        parts = [{"file": str(out / "frame.png"), "blend_mode": "normal", "role": "frame",
+                  "split_fix": "two_part_approx", "approx": res["approx"]}]
+        threshold = args.threshold if args.threshold is not None else TWO_PART_PSNR
+        swap_ok = res["swap_min_psnr"] is not None and res["swap_min_psnr"] >= threshold
+        passed = res["match"]["psnr"] >= threshold and swap_ok and not res["content_check"]["rim_suspect"]
+        sheet = write_compare_sheet(
+            [(f"two-part probe fit {res['match']['psnr']} dB (swap LOO min {res['swap_min_psnr']}, real renders)",
+              merged, res["recomposite"])],
+            out / "compare.png", titles=("merged export", "frame over content", "diff x3"))
+        keep = ("match", "swap_loo", "swap_in_sample", "swap_min_psnr", "swap_mean_psnr", "swap_is_real_render",
+                "simulated_swap", "probe_colours", "probe_luma_span", "content_zone_px", "zone_partial_content_px",
+                "aa_band_px", "aa_band_noise", "content_check", "approx")
+        summary = {"mode": "two_part_approx", **{k: res[k] for k in keep},
+                   "threshold_psnr": threshold, "pass": passed, "parts": parts,
+                   "compare_image": str(sheet) if sheet else None,
+                   "draw_order": ["content (runtime)", str(out / "frame.png")],
+                   "note": "frame.png fitted on real Photoshop renders with the content replaced by solid colours "
+                           "(--probe). Swap dB is leave-one-out on those renders, not a formula simulation. "
+                           + ("Fewer than 3 probes: no held-out swap check; add one (e.g. mid gray). "
+                              if res["swap_min_psnr"] is None else "")
+                           + ("content_check.rim_suspect: the content export differs from the design where the "
+                              "frame is clear (group inner shadow / glow / stroke recomputed on the content alpha?); "
+                              "turn those effects off for the content export and re-run. "
+                              if res["content_check"]["rim_suspect"] else "")}
     else:
         extras = []
         for i, spec in enumerate(getattr(args, "swap_content", None) or []):
@@ -3490,7 +3701,8 @@ def cmd_split_fix(args):
         parts = [{"file": str(out / "frame.png"), "blend_mode": "normal", "role": "frame",
                   "split_fix": "two_part_approx", "approx": res["approx"]}]
         threshold = args.threshold if args.threshold is not None else TWO_PART_PSNR
-        passed = res["match"]["psnr"] >= threshold and res["swap_min_psnr"] >= threshold
+        passed = (res["match"]["psnr"] >= threshold and res["swap_min_psnr"] >= threshold
+                  and not res["content_check"]["rim_suspect"])
         sheet = write_compare_sheet(
             [(f"two-part {res['match']['psnr']} dB (swap min {res['swap_min_psnr']}, simulated)",
               merged, res["recomposite"])],
@@ -3501,10 +3713,12 @@ def cmd_split_fix(args):
                    "threshold_psnr": threshold, "pass": passed, "parts": parts,
                    "compare_image": str(sheet) if sheet else None,
                    "content_zone_px": res["content_zone_px"],
+                   "aa_band_px": res["aa_band_px"], "aa_band_smoothed": res["aa_band_smoothed"],
+                   "aa_band_noise": res["aa_band_noise"], "content_check": res["content_check"],
                    "draw_order": ["content (runtime)", str(out / "frame.png")],
                    "note": "frame.png is normal src-over. Swap dB is vs a formula simulation of the overlay "
-                           "stack (linear_burn / multiply / ...), not a Photoshop re-render. If pass is false, "
-                           "offer --emit-overlays or keep the merged export, and ask the user."}
+                           "stack (linear_burn / multiply / ...), not a Photoshop re-render; prefer --probe renders. If pass "
+                           "is false, offer --emit-overlays or keep the merged export, and ask the user."}
     (out / "split_fix.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     keys = [k for k in ("mode", "match", "swap_min_psnr", "swap_mean_psnr", "pass", "compare_image",
                         "plain_frame_over_content") if k in summary]
@@ -5993,6 +6207,9 @@ def build_parser():
     s.add_argument("--overlay", action="append", help="overlay export (one inner layer alone); baked into frame.png by default")
     s.add_argument("--overlay-blend", action="append", help="blend mode for each --overlay (normal, multiply, screen, linear_burn, lighten, darken, linear_dodge)")
     s.add_argument("--swap-content", action="append", help="another content image used to check the two-part approx (and as an extra LS sample); repeatable")
+    s.add_argument("--probe", action="append", help="R,G,B=PATH (or #RRGGBB=PATH): the merged export with the content replaced by that solid colour "
+                   "(same shape). >= 3 probes spanning dark and bright (e.g. black, white, gray): frame.png is fitted on these real "
+                   "renders and checked leave-one-out; --overlay / --swap-content are then not needed. Preferred over the simulation.")
     s.add_argument("--emit-overlays", action="store_true", help="keep overlays as separate parts with blend_mode (exact replay) instead of baking them into frame.png")
     s.add_argument("--canvas", help="W,H of the shared canvas when inputs carry #X,Y offsets")
     s.add_argument("--threshold", type=float, default=None, help="dB gate (default 35 for two-part, 40 for --emit-overlays)")

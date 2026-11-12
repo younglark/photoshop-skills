@@ -72,6 +72,8 @@
 
 **效果归属的默认判断（常识，先于任何修法）。** 框（头像框、标题框、徽章框……）和它框住的动态内容（头像、标题文字、徽章）叠在一起时，落在内容外侧或四周、不依赖内容的外部效果（投影、外发光、外描边等）默认**属于框**：烘进框这一张图，不要挂在内容部件上，也不要漏进框的洞里（拆开后最常见的错误是投影/外发光沿洞的内缘被固化进框，盖到内容上变成暗圈）。这只是默认判断，具体怎么做到用手头的工具（例如 `split-fix` 的两张近似，或用设计给出的单独框资源）；判断依据和做法记在框 part 的 `split_fix` 或 `split.outer_effects: "frame"`。
 
+**内容边缘的框色边、落在内容上的内阴影也归框（1.4.10）。** 只与框的形状有关、不随内容变化的效果——框洞内缘落到内容上的内阴影 / 内发光、包住两侧的组上的内阴影 / 内发光 / 描边 / 斜面浮雕——属于框。注意组效果按组的合成 alpha 画：隐藏框层只留内容导出时，组的 alpha 变成内容的形状，这些效果会沿内容边缘重画，在内容图里留下一圈框色的边（设计里它们画在整组外缘、落在框上）。所以导出内容时要把这类组效果关掉（逐项 `enabled: false`，读回确认，见 [batchplay.md](batchplay.md)「关掉效果」），框一侧保留。如果框色像素是画在内容图层本身里的，就把内容裁 / 遮到洞内，那圈像素归框。
+
 **拆完必须验证。** 用框 + 占位头像按绘制顺序重新拼合，与效果图（合并层的 Photoshop 导出或 `full_render.png` 的同一区域）对比：
 
 - 一致：直接按拆分导出。头像 part `role: avatar`、`placeholder: true`；框 part 可复用（`reuse_of`）。两者都写 `split_method`、`split`（智能对象时）和 `split_evidence`（对比结果、对比图路径、所用工具）。`validate` 最后还会按实际导出的 PNG 拼合再比一次。
@@ -114,7 +116,10 @@
    - 叠在内容上的框侧效果（线性加深、内发光、填充 0 的纯效果层等）**不要默认拆成 overlay 部件**。把它们近似成一层与内容无关的 normal 颜色和 alpha：对每个像素，用占位内容（真实的合并导出当目标）再加上一组代表性内容（变亮 / 变暗 / 反相、纯色、渐变，以及能拿到的另一份真实内容），按最小二乘拟合 `src-over(C, a)`，使「框盖到内容上」接近真实叠法。代表性内容上的「真实」结果用混合公式模拟（线性加深、normal 等，见下表），须在证据里标明是模拟。把这层烘进同一张 `frame.png`。
    - 不要把占位照片的内缘一圈直接裁进框来凑 dB：换内容后会露出旧照片（见 10.11）。
 
-框 part 写 `split_fix: two_part_approx`、`blend_mode: normal`。`split_evidence` 写近似方法、占位内容上的 dB、换内容后的 dB（模拟）和对比图。
+   - **首选：用纯色探针的真实渲染拟合（1.4.10，`split-fix --probe`）。** 在同一临时副本里，把内容像素隐藏、内容形状（剪贴底或内容图层的形状）填成几种纯色，各导出一次合并图（与 merged 同画布）：至少深色、亮色、中灰三种，再加一两种彩色更稳。框侧所有效果（内阴影、内发光、线性加深 / 正片叠底层、组效果）都由 Photoshop 真正画在这些纯色上，不需要公式模拟，也不需要单独导出 overlay。在内容透出来的像素上（各探针渲染不同之处）按最小二乘解 `src-over(C, a)`；深浅不同的探针让方程条件良好，低 alpha 的抗锯齿边缘也稳定。换内容用留一法验证：去掉一种探针重新拟合，预测它的真实渲染。
+   - **不要在框洞内缘的抗锯齿带上逐像素硬解模拟目标。** 模拟只是近似，低 alpha 像素的解会在深色和亮色之间来回跳，拼出来是阶梯和暗圈。没有探针渲染时，模拟路径在这条带上把方程按邻域合并求解（`split_fix.json` 里 `aa_band_smoothed: true`），但模拟的换内容 dB 可能偏乐观，证据里照实写「模拟」。
+
+框 part 写 `split_fix: two_part_approx`、`blend_mode: normal`。`split_evidence` 写近似方法（`probe_fit_src_over` 或 `least_squares_src_over`）、占位内容上的 dB、换内容后的 dB（注明是真实渲染留一法还是模拟）和对比图。
 
 **验证：**
 
@@ -127,6 +132,16 @@ python slicing_helper.py split-fix --merged M.png --content C.png --frame F.png 
 ```
 
 `split_fix.json` 含 `mode: two_part_approx`、`match`、`swap_min_psnr`（变亮 / 变暗 / 反相和 `--swap-content`）、`swap_all_min_psnr`（含纯色诊断）、`simulated_swap: true`、`approx: least_squares_src_over`。通过才按两张导出。
+
+用探针时：
+
+```bash
+python slicing_helper.py split-fix --merged M.png --content C.png --frame F.png \
+  --probe 0,0,0=probe_black.png --probe 255,255,255=probe_white.png --probe 128,128,128=probe_gray.png \
+  --probe 220,40,40=probe_red.png --out-dir out/
+```
+
+`split_fix.json` 含 `approx: probe_fit_src_over`、`swap_loo`（每种探针留一法的 dB）、`swap_min_psnr`、`swap_is_real_render: true`、`simulated_swap: false`、`probe_luma_span`、`zone_partial_content_px`。少于 3 种探针时没有留一法，`swap_min_psnr` 为 null，不算通过。两种路径都报 `aa_band_noise`（抗锯齿带上预乘颜色与 3×3 中值之差，孤立跳变才会抬高它；只作诊断，同一输入改前改后对比用）和 `content_check`：框完全透明、内容不透明的像素上，内容导出应与合并图一致；不一致（低于两张拆法阈值）记 `rim_suspect: true`，不算通过——多半是组效果在内容 alpha 上重画了。框完全盖住的那圈边从合并图上看不出来，仍要靠上面的归属规则在导出时关掉。
 
 **只有两张明显对不上时**（换内容后低于约 35 dB，或占位内容也明显偏低），才把 overlay 部件或保留合并作为选项，带对比图交用户，而不是默认拆成 3–4 张。此时用 `split-fix --emit-overlays`（精确按混合公式叠，阈值 40 dB）。对引擎的要求（`ENGINE_BLEND_NOTES`）：
 
@@ -187,7 +202,7 @@ python slicing_helper.py split-fix --merged M.png --content C.png --frame F.png 
 ```text
 python slicing_helper.py prepare --psd design.psb --out-dir out [--artboard <画板名或id>]
 python slicing_helper.py split-avatar --psd design.psb --candidates out/reuse_candidates.json --out-dir out/avatar_split [--layer-id <id>] [--frame-instance <合并层id>:<框层id>]
-python slicing_helper.py split-fix --merged M.png --content C.png --frame F.png [--overlay O.png --overlay-blend linear_burn ...] [--swap-content other.png] [--emit-overlays] --out-dir out/split_fix   # 默认烘成两张；--emit-overlays 才拆 overlay
+python slicing_helper.py split-fix --merged M.png --content C.png --frame F.png [--probe R,G,B=P.png ...] [--overlay O.png --overlay-blend linear_burn ...] [--swap-content other.png] [--emit-overlays] --out-dir out/split_fix   # 默认烘成两张；--probe 用真实纯色渲染拟合（首选）；--emit-overlays 才拆 overlay
 python slicing_helper.py flatten --manifest out/manifest.json
 python slicing_helper.py preview --manifest out/manifest.json --out out/preview_annotated.png [--ref out/full_render.png]
 python slicing_helper.py build-layout --manifest out/manifest.json --export-log out/export_log.json --slices-dir out/slices --out out/layout.json
@@ -267,7 +282,7 @@ PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))
 | `nine_slice_candidates.json` | 像素启发式给出的九宫格候选（最长的均匀相邻行/列；两边边距都小于 `min_run` 则拒绝）。agent 决定采不采纳。 |
 | `frame_split_candidates.json` | frame 类组（面板、弹窗、卡片、按钮底）的层角色启发式和建议部件（外框 / 标题栏 / 内嵌块 / 装饰），见「frame 类元素」。 |
 | `split-avatar` 输出（另跑） | `<out>/split_candidates.json`：每个疑似合并层的尝试结果、内层分类、`hide_inner_*`、对比数据和 `suggested_parts`；`<out>/<layer_id>/` 下有 avatar / frame / recomposite / compare 图。 |
-| `split-fix` 输出（另跑） | 默认两张：`<out>/frame.png`、`recomposite.png`、`residual.png`、`frame_from_merged.png`、`compare.png`、`split_fix.json`（`mode: two_part_approx`、`match`、`swap_min_psnr`、`simulated_swap`、`approx`、`pass`）。`--emit-overlays` 时另写 `overlay<N>_<mode>.png`，阈值 40 dB。未通过时退出码 2。 |
+| `split-fix` 输出（另跑） | 默认两张：`<out>/frame.png`、`recomposite.png`、`residual.png`、`frame_from_merged.png`、`compare.png`、`split_fix.json`（`mode: two_part_approx`、`match`、`swap_min_psnr`、`simulated_swap`、`approx`、`aa_band_noise`、`content_check`、`pass`；用 `--probe` 时另有 `swap_loo`、`swap_is_real_render`）。`--emit-overlays` 时另写 `overlay<N>_<mode>.png`，阈值 40 dB。未通过时退出码 2。 |
 | `materials.json` | 上述路径和数量统计。 |
 
 阅读顺序建议：先看整图，理解屏幕结构；再对照 `crops_sheet.jpg` / 单张裁切图看每个零件长什么样；用 `crops_index.json` 和 `group_effects.json` 把 id 对回 `tree.json` 的路径、可见性、文本和效果。不要只根据图层名做决定，名称经常不准。
@@ -1109,3 +1124,31 @@ PSNR 按整张导出画布计算（括号内是合并图可见范围）。现状
 列表页 B 的 agent 在第二阶段把 `decision` 填成了 `default`，所以不能只看 `decision` 有没有填。用户只说一句「清单确认」，也不算回答了具体的拆分或复用问题。这类问题要单独问用户，再用 `confirm --decision ID=VALUE` 记录。
 
 **仍有缺口：** agent 如果自己写 `decided_by: "user"`，规则拦不住。好在锁会抓住确认之后的改动；确认之前写入的，只能靠用户审核清单时看到。
+
+
+### 10.14 内容边缘的框色边与框洞内缘的阶梯（1.4.10）
+
+起因：10.13 的列表页 B，用户选了两张拆法后重导，拼回去仍有两处问题。一是框洞内缘有阶梯状的暗圈；二是导出的头像图上沿有一圈浅蓝 / 紫、下沿约 5 行青色，是框的颜色。
+
+**定位（临时副本、读层描述符 + 开关导出）：**
+
+- 头像智能对象内部是一个穿透组，组上开着两条内阴影：一条正片叠底、角度朝下，一条变亮、角度朝上。组内是外环（一个带洞的形状层）、两个填充为 0 的效果层（内发光；线性加深 + 内阴影），以及剪贴在圆角底上的头像图。
+- 合并时组的 alpha 是整块实心，内阴影只画在外缘，落在环上。只留内容导出时组的 alpha 变成头像形状，两条内阴影沿头像边缘重画，就成了那圈框色的边。头像图层本身没有效果，框色不是画在像素里的。
+- 组上 `disableLayerFX` 不可用；逐项 `enabled: false` 再 `set layerEffects` 后读回为全关，重导的头像不再有那圈边（7 行头像，每张约 3200 像素改变，alpha 不变）。
+- 这一圈边全部落在框不透明的区域下，所以拼回去的 dB 几乎不受影响（两种内容在框透明处与合并图的差都在 46.6 dB）。但内容图本身是错的：单独显示头像，或换一个框，就会露出来。
+- 阶梯来自模拟路径：在抗锯齿带上，对模拟出来的目标逐像素拟合，解在深色（如 (3,28,85)）和亮蓝之间来回跳。用真实 Photoshop 渲染核对模拟：1.4.9 的模拟拟合报告换内容 38–40 dB，但在真实纯色渲染上只有约 27 dB，模拟明显偏乐观。
+
+**修法与实测（PS 2026，Asia/Shanghai）：** 内容导出时关掉组效果；同一临时副本里把头像图隐藏、圆角底填 6 种纯色导出，用 `split-fix --probe` 拟合框。
+
+| 指标 | 1.4.9 模拟拟合 | 1.4.10 探针拟合 |
+|---|---|---|
+| 7 行占位：拼回去 vs 合并导出（整张导出画布） | 30.2–31.2 dB（`validate` `split_checked`） | 44.3–46.8 dB |
+| 换内容（留一法，真实渲染；只算内容透出区域 / `split-fix` 整张画布） | — （模拟 37.5–39.9，真实渲染上约 27） | 39.2–47.6 / 43.8–52.1 dB |
+| 抗锯齿带 `aa_band_noise`（同一条带） | 2.86 | 0.33 |
+| 整页（遮罩文字 / 全图） | 35.40 / 35.35 dB | 36.52 / 36.34 dB |
+| `split_below_threshold` | 7 行（低于 35 dB，靠用户决定放行） | 0 行（第 8 行没有可拆的内层，另需用户决定） |
+| 共享框 `reuse_mismatch` | 8 个（约 4.6% 像素差 > 16） | 1 个（第 8 行框形状不同）；第 2 行框尺寸略异，已单独导出 |
+
+只把模拟路径改成抗锯齿带邻域合并、不用探针时，同一输入上占位 33.0 → 33.4 dB，`aa_band_noise` 2.86 → 2.16，真实换内容 27.2 → 27.6 dB：有改善，但离探针拟合很远，所以文档把探针定为首选。
+
+**仍未覆盖：** 探针要求内容形状能单独填色（剪贴底、形状层或内容图层的 alpha）；内容本身半透明、又压在半透明框下的像素（`zone_partial_content_px`）直接取合并图；正片叠底一类与内容相关的混合仍是近似（真实渲染上留一法最低 39 dB）。
