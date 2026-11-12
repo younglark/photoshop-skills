@@ -631,5 +631,165 @@ class Rules14Rendering(unittest.TestCase):
         self.assertGreater(self._alpha(bold).sum(), self._alpha(plain).sum() * 1.05)
 
 
+def find_cjk_font():
+    env = os.environ.get("TEST_CJK_FONT")
+    if env and Path(env).exists():
+        return Path(env)
+    for root in ("/usr/share/fonts", "C:/Windows/Fonts", "/Library/Fonts"):
+        if Path(root).is_dir():
+            for pat in ("NotoSansCJK*", "NotoSerifCJK*", "NotoSansSC*", "NotoSerifSC*"):
+                for f in sorted(Path(root).rglob(pat)):
+                    return f
+    return None
+
+
+class InkShaper(FakeShaper):
+    """FakeShaper with an ink top of 0.7 em and a features argument."""
+
+    def __init__(self):
+        super().__init__()
+        self.features = []
+
+    def ink_top(self, _gid):
+        return 0.7
+
+    def shape(self, s, size, kern, features=None):
+        self.features.append(features)
+        return super().shape(s, size, kern)
+
+
+def _box_attrs(content, width, height, size=30.0):
+    desc = _desc(two_runs=False, fx_visible=False)
+    tk = desc["textKey"]
+    tk["textKey"] = content
+    tk["transform"] = {"xx": 1, "xy": 0, "yx": 0, "yy": 1, "tx": 0, "ty": 0}
+    tk["textShape"] = [{"char": {"_enum": "char", "_value": "box"},
+                        "bounds": {"left": _u(0), "top": _u(0), "right": _u(width), "bottom": _u(height)}}]
+    st = _style(size)
+    st["impliedFontSize"] = _u(size)
+    tk["textStyleRange"] = [{"from": 0, "to": len(content) + 1, "textStyle": st}]
+    tk["paragraphStyleRange"] = [{"from": 0, "to": len(content) + 1, "paragraphStyle": {"align": {"_value": "left"}}}]
+    return T.text_attrs_from_descriptor(desc)
+
+
+class Rules143(unittest.TestCase):
+    """1.4.3: whole-pixel shadow offset, no locl, paragraph (box) wrapping (references/slicing.md 10.8)."""
+
+    def _lines(self, content, width, height=400, **opts):
+        spec = T.text_spec(_box_attrs(content, width, height), doc_size=(1000, 400), options=opts)
+        shaper = InkShaper()
+        glyphs, _f, _a = T.layout_glyphs(spec, lambda _p: shaper, resolve_font=FAKE_FONT)
+        lines = {}
+        for g in glyphs:
+            lines.setdefault(g["line"], []).append(g)
+        return ["".join(g["gid"] for g in lines[k]) for k in sorted(lines)], glyphs, shaper
+
+    def test_shadow_offset_rounds_half_away_with_float_edge(self):
+        dx, dy = T._shadow_offset({"distance": 3, "angle": 120})
+        self.assertLess(dx, 1.5)                      # 1.4999999999999993 in floating point
+        self.assertEqual((T._round_half_away(dx), T._round_half_away(dy)), (2, 3))
+        dx4, dy4 = T._shadow_offset({"distance": 4, "angle": 120})
+        self.assertEqual((T._round_half_away(dx4), T._round_half_away(dy4)), (2, 3))
+        for v, want in ((-1.5, -2), (-0.5, -1), (0.5, 1), (2.49, 2), (-2.121, -2), (0.0, 0)):
+            self.assertEqual(T._round_half_away(v), want, v)
+        self.assertEqual(T.DEFAULT_OPTIONS["shadow_offset_model"], "pixel")
+        self.assertEqual(T.LEGACY_1_3_OPTIONS["shadow_offset_model"], "raster")
+
+    def test_shift_px_moves_whole_pixels(self):
+        a = np.zeros((5, 6))
+        a[1, 1] = 1.0
+        b = T._shift_px(a, 2, 3)
+        self.assertEqual(b[4, 3], 1.0)
+        self.assertEqual(b.sum(), 1.0)
+        c = T._shift_px(a, -1, -1)
+        self.assertEqual(c[0, 0], 1.0)
+        self.assertEqual(T._shift_px(a, 9, 0).sum(), 0.0)
+
+    def test_layout_turns_locl_off(self):
+        _lines, _g, shaper = self._lines("ab 12", 1000)
+        self.assertTrue(shaper.features and all(f == {"locl": False} for f in shaper.features))
+        _lines, _g, shaper = self._lines("ab 12", 1000, font_locl=True)
+        self.assertTrue(all(f is None for f in shaper.features))
+        self.assertFalse(T.DEFAULT_OPTIONS["font_locl"])
+        self.assertTrue(T.LEGACY_1_3_OPTIONS["font_locl"])
+
+    @unittest.skipUnless(HAVE_FT and find_cjk_font(), "uharfbuzz / freetype-py or a Noto CJK font missing")
+    def test_locl_off_keeps_cmap_digits(self):
+        path = find_cjk_font()
+        hbf = T._HBFont.get(path)
+        cmap = T._ft.Face(str(path)).get_char_index(ord("1"))
+        gid = hbf.shape("1", 32, True, features={"locl": False})[0][0]
+        self.assertEqual(gid, cmap)
+
+    def test_greedy_wrap_and_first_baseline(self):
+        # every glyph advances 15 pt (0.5 em at 30 pt)
+        lines, glyphs, _s = self._lines("aaa bbb ccc", 110)
+        self.assertEqual(lines, ["aaa bbb ", "ccc"])
+        self.assertAlmostEqual(glyphs[0]["y"], 0.7 * 30.0, places=6)    # box top + tallest ink
+        self.assertAlmostEqual(glyphs[0]["x"], 0.0, places=6)
+        second = [g for g in glyphs if g["line"] == 1]
+        self.assertAlmostEqual(second[0]["y"] - glyphs[0]["y"], 1.2 * 30.0, places=6)
+        self.assertAlmostEqual(second[0]["x"], 0.0, places=6)
+        lines, _g, _s = self._lines("aaa bbb ccc", 100)
+        self.assertEqual(lines, ["aaa ", "bbb ", "ccc"])
+        lines, _g, _s = self._lines("aaa bbb ccc", 110, box_wrap=False)
+        self.assertEqual(lines, ["aaa bbb ccc"])
+
+    def test_lines_below_the_box_are_hidden(self):
+        # baselines 21, 57, 93: a line is drawn only while its baseline is inside the box
+        lines, _g, _s = self._lines("aaa bbb ccc", 60, height=60)
+        self.assertEqual(lines, ["aaa ", "bbb "])
+        lines, _g, _s = self._lines("aaa bbb ccc", 60, height=56)
+        self.assertEqual(lines, ["aaa "])
+        lines, _g, _s = self._lines("aaa bbb ccc", 60, height=100)
+        self.assertEqual(lines, ["aaa ", "bbb ", "ccc"])
+
+    def test_cjk_line_end_may_overrun_by_an_eighth_em(self):
+        # five glyphs = 75 pt; allowance 0.125 x 30 = 3.75 pt
+        self.assertEqual(self._lines("一二三四五", 73)[0], ["一二三四五"])
+        self.assertEqual(self._lines("一二三四五", 70)[0], ["一二三四", "五"])
+        self.assertEqual(self._lines("一二三四五", 73, box_cjk_overflow_em=0)[0], ["一二三四", "五"])
+        # Latin gets no allowance; a word wider than the box breaks at the last glyph that fits
+        self.assertEqual(self._lines("abcde", 73)[0], ["abcd", "e"])
+        # no line may start with closing punctuation
+        self.assertEqual(self._lines("一二三，", 50)[0], ["一二", "三，"])
+
+    @unittest.skipUnless(HAVE_FT and find_test_font(), "uharfbuzz / freetype-py or a TTF missing")
+    def test_rendered_shadow_is_the_fill_moved_by_whole_pixels(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            shutil.copy(find_test_font(), tmp / "Sample-Font.ttf")
+            T._FONT_INDEX.clear()
+            base = _desc(two_runs=False, fx_visible=True, stroke_enabled=False)
+            base["textKey"]["transform"] = {"xx": 1, "xy": 0, "yx": 0, "yy": 1, "tx": 0, "ty": 0}
+            fx = base["layerEffects"]["dropShadowMulti"][0]
+            fx.update({"enabled": True, "useGlobalAngle": False, "localLightingAngle": _u(120, "angleUnit"),
+                       "distance": _u(3, "pixelsUnit")})
+            plain = json.loads(json.dumps(base))
+            plain["layerEffects"]["dropShadowMulti"][0]["enabled"] = False
+
+            def canvas(desc):
+                im, (x0, y0), _i = T.render_text(T.text_attrs_from_descriptor(desc), renderer="freetype",
+                                                 fonts_dir=str(tmp), doc_size=(400, 200))
+                c = np.zeros((200, 400))
+                a = np.asarray(im)[..., 3] / 255.0
+                c[y0:y0 + a.shape[0], x0:x0 + a.shape[1]] = a
+                return c
+
+            fill, shadowed = canvas(plain), canvas(base)
+            moved = T._shift_px(fill, 2, 3)
+            only = (fill == 0) & (moved > 0)
+            self.assertGreater(only.sum(), 20)
+            self.assertLess(np.abs(shadowed[only] - moved[only]).max(), 2.5 / 255)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_box_wrap_info(self):
+        spec = T.text_spec(_box_attrs("aaa", 100, 100), doc_size=(1000, 400))
+        self.assertEqual(spec["shape"], "box")
+        self.assertTrue(spec["options"]["box_wrap"])
+        self.assertAlmostEqual(spec["options"]["box_cjk_overflow_em"], 0.125)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

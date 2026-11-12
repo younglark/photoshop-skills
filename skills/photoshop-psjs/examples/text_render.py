@@ -54,10 +54,24 @@ references/slicing.md section 10.6; empirical, not documented Photoshop behaviou
      effect (default 50 %). Drop shadow: sigma = size x (1 - spread) / 2.
  10. Faux bold = outline embolden 0.01 x size plus 0.03 x size extra advance;
      faux italic = 0.2 shear.
+ 11. Drop shadow offset (1.4.3): the rendered layer coverage is moved by whole
+     pixels, round half away from zero of distance x (-cos, sin) with a 1e-6
+     tolerance (3 x cos 120 deg is 1.4999999999999993; Photoshop moves 2 px).
+ 12. The font's OpenType ``locl`` feature is not applied (1.4.3). Noto CJK's
+     default language system swaps ASCII digits for tabular figures; Photoshop
+     draws the default proportional digits.
+ 13. Paragraph (box) text (1.4.3): greedy wrap to the box width (break after
+     spaces and around CJK characters, no break before closing / after opening
+     punctuation); a line ending in a CJK character may overrun the box by
+     ``box_cjk_overflow_em`` (0.125) x size; the first baseline is the box top plus
+     the tallest glyph ink of the first line; lines whose baseline falls below the
+     box bottom are hidden. Photoshop's Every-line Composer and its CJK squeeze are
+     not modelled.
 
-Everything not covered (warped text, paragraph wrapping, horizontal / vertical
-scale, gradient strokes, blend modes other than normal, inner effects except
-Color Overlay) is listed per text in the render info so the report never hides it.
+Everything not covered (warped text, justification / hyphenation, horizontal /
+vertical scale, gradient strokes, blend modes other than normal, inner effects
+except Color Overlay) is listed per text in the render info so the report never
+hides it.
 """
 from __future__ import annotations
 
@@ -129,6 +143,17 @@ DEFAULT_OPTIONS = {
     "auto_leading_pct": 1.2,
     "snap_glyph_origin": True,
     "shadow_sigma_div": 2.0,
+    # pixel: shift the rendered layer coverage by the offset rounded to whole pixels (half away
+    # from zero), like a layer style; raster: re-rasterise glyphs at the sub-pixel offset (<= 1.4.2)
+    "shadow_offset_model": "pixel",
+    # False: do not apply the font's OpenType locl feature (Photoshop does not; Noto CJK's
+    # default language system swaps ASCII digits to tabular figures)
+    "font_locl": False,
+    # paragraph (box) text: wrap to the box width; the first baseline sits at the box top plus the
+    # tallest glyph ink of the first line; a line ending in a CJK character may overrun the box by
+    # box_cjk_overflow_em x size (Photoshop squeezes it in)
+    "box_wrap": True,
+    "box_cjk_overflow_em": 0.125,
     # Per anti-alias mode: coverage gamma (cov ** (1/gamma)), outline embolden in px, and which
     # pen-position axes snap to whole pixels. Modes not listed use plain FreeType coverage
     # (antiAliasSharp / antiAliasCrisp matched as is; antiAliasNone has no validated rule).
@@ -166,6 +191,9 @@ LEGACY_1_3_OPTIONS = {
     "faux_bold_k": 0.0,
     "faux_bold_adv_k": 0.0,
     "faux_italic_shear": 0.0,
+    "shadow_offset_model": "raster",
+    "font_locl": True,
+    "box_wrap": False,
 }
 
 # Photoshop layerEffects keys -> engine_effects type names used elsewhere in the skill.
@@ -700,11 +728,20 @@ class _HBFont:
             cls._cache[key] = cls(path)
         return cls._cache[key]
 
-    def shape(self, s, size, kern):
+    def ink_top(self, gid):
+        """Glyph ink top above the baseline, in em."""
+        try:
+            return self.font.get_glyph_extents(gid).y_bearing / self.upem
+        except Exception:
+            return self.ascender
+
+    def shape(self, s, size, kern, features=None):
         buf = _hb.Buffer()
         buf.add_str(s)
         buf.guess_segment_properties()
-        _hb.shape(self.font, buf, {"kern": bool(kern), "liga": True})
+        feats = {"kern": bool(kern), "liga": True}
+        feats.update(features or {})
+        _hb.shape(self.font, buf, feats)
         k = size / self.upem
         return [(i.codepoint, p.x_advance * k, p.x_offset * k, p.y_offset * k)
                 for i, p in zip(buf.glyph_infos, buf.glyph_positions)]
@@ -747,6 +784,53 @@ def line_advance(prev_line_runs, line_runs, opts, auto_pct=None, leading_type=No
     return adv
 
 
+_CJK_RE = re.compile("[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f]")
+_NO_LINE_START = set("，。、；：？！）」』】》〉,.;:?!)]}%")
+_NO_LINE_END = set("（「『【《〈([{")
+
+
+def _break_ok(line, i):
+    """May a line break fall before line[i]?"""
+    if i <= 0 or i >= len(line):
+        return False
+    a, b = line[i - 1], line[i]
+    if b in _NO_LINE_START or a in _NO_LINE_END:
+        return False
+    if a == " " and b != " ":
+        return True
+    return bool(_CJK_RE.match(a) or _CJK_RE.match(b))
+
+
+def wrap_line(line, width_of, max_w, slack_at=None):
+    """Greedy wrap of one hard line into [(a, b)] ranges whose visible width fits *max_w* (pt).
+
+    Breaks after spaces and around CJK characters (no break before closing or after opening
+    punctuation). Trailing spaces stay on the line and do not count. A word wider than the box
+    is broken at the last character that fits. *slack_at(i)* gives extra allowed width (pt) when
+    the line ends with line[i].
+    """
+    out, a, n = [], 0, len(line)
+    while a < n:
+        last = None
+        b = a + 1
+        while b <= n:
+            if b == n or _break_ok(line, b):
+                vis = a + len(line[a:b].rstrip(" "))
+                slack = slack_at(vis - 1) if (slack_at and vis > a) else 0.0
+                if vis == a or width_of(a, vis) <= max_w + slack + 1e-6:
+                    last = b
+                else:
+                    break
+            b += 1
+        if last is None:
+            last = a + 1
+            while last < n and width_of(a, last + 1) <= max_w + 1e-6:
+                last += 1
+        out.append((a, last))
+        a = last
+    return out or [(0, 0)]
+
+
 def layout_glyphs(spec, shaper_for, fonts_dir=None, resolve_font=None):
     """Glyphs in text space: dicts(font_path, size_pt, gid, x, y, color, line).
 
@@ -760,49 +844,113 @@ def layout_glyphs(spec, shaper_for, fonts_dir=None, resolve_font=None):
     text = spec["content"].replace("\r\n", "\r").replace("\n", "\r")
     lines = text.split("\r")
     glyphs, fonts_used = [], {}
-    pos, base = 0, 0.0
+    feats = None if opts.get("font_locl") else {"locl": False}
+    resolve = resolve_font or find_font_file
+
+    def shaper_of(r):
+        path, how = resolve(r["font"], fonts_dir)
+        if path is None:
+            raise TextRenderError(
+                f"font {r['font']!r} not found in fonts_dir {fonts_dir!r}; pass --fonts-dir with the design's fonts")
+        fonts_used[r["font"] or ""] = {"file": str(path) if path else None, "match": how}
+        return path, shaper_for(path)
+
+    def shape(shaper, s, size):
+        if feats:
+            try:
+                return shaper.shape(s, size, spec["kern"], features=feats)
+            except TypeError:
+                pass
+        return shaper.shape(s, size, spec["kern"])
+
+    def segments(start, a, b):
+        segs, i = [], a
+        while i < b:
+            r = _run_at(runs, start + i)
+            j = i
+            while j < b and _run_at(runs, start + j) is r:
+                j += 1
+            segs.append((i, j, r))
+            i = j
+        return segs
+
+    def width(line, start, a, b):
+        w = 0.0
+        for i, j, r in segments(start, a, b):
+            _p, sh = shaper_of(r)
+            fb_adv = float(opts.get("faux_bold_adv_k") or 0.0) * r["size_pt"] if r.get("faux_bold") else 0.0
+            for _gid, adv, _xo, _yo in shape(sh, line[i:j], r["size_pt"]):
+                w += adv + r["tracking"] / 1000.0 * r["size_pt"] + fb_adv
+        return w
+
+    bb = spec.get("box_bounds_pt") if spec.get("shape") == "box" and opts.get("box_wrap") else None
+    if bb:
+        bl, bt = _f(bb.get("left"), 0.0) or 0.0, _f(bb.get("top"), 0.0) or 0.0
+        bw = (_f(bb.get("right"), 0.0) or 0.0) - bl
+        bh = (_f(bb.get("bottom"), 0.0) or 0.0) - bt
+    visual = []  # (hard line text, line start pos, a, b)
+    pos = 0
+    for line in lines:
+        if bb and bw > 0 and line:
+            cjk_em = float(opts.get("box_cjk_overflow_em") or 0.0)
+
+            def slack_at(i, L=line, P=pos):
+                return cjk_em * _run_at(runs, P + i)["size_pt"] if _CJK_RE.match(L[i]) else 0.0
+
+            visual.extend((line, pos, a, b) for a, b in
+                          wrap_line(line, lambda a, b, L=line, P=pos: width(L, P, a, b), bw, slack_at))
+        else:
+            visual.append((line, pos, 0, len(line)))
+        pos += len(line) + 1
+    base = 0.0
     prev_runs = None
     first_ascent = None
-    for li, line in enumerate(lines):
-        segs, i = [], 0
-        while i < len(line):
-            r = _run_at(runs, pos + i)
-            j = i
-            while j < len(line) and _run_at(runs, pos + j) is r:
-                j += 1
-            segs.append((line[i:j], r))
-            i = j
-        line_runs = [r for _, r in segs] or [_run_at(runs, pos)]
-        para = _para_at(paras, pos)
+    for li, (line, start, a, b) in enumerate(visual):
+        segs = [(line[i:j], r) for i, j, r in segments(start, a, b)]
+        line_runs = [r for _, r in segs] or [_run_at(runs, start + a)]
+        para = _para_at(paras, start + a)
         if li > 0:
             base += line_advance(prev_runs, line_runs, opts, para.get("auto_leading_pct"),
                                  leading_type=para.get("leading_type") or opts.get("leading_type"))
-        x = 0.0
+        elif bb:
+            base = bt  # moved down by the first line's tallest ink below
+        if li > 0 and bb and bh > 0 and base > bt + bh:
+            break  # overflow lines are hidden in a text box
+        x = bl if bb else 0.0
+        x0 = x
         lg = []
         for s, r in segs:
             fb_adv = float(opts.get("faux_bold_adv_k") or 0.0) * r["size_pt"] if r.get("faux_bold") else 0.0
-            path, how = (resolve_font or find_font_file)(r["font"], fonts_dir)
-            if path is None:
-                raise TextRenderError(
-                    f"font {r['font']!r} not found in fonts_dir {fonts_dir!r}; pass --fonts-dir with the design's fonts")
-            fonts_used[r["font"] or ""] = {"file": str(path) if path else None, "match": how}
-            shaper = shaper_for(path)
+            path, shaper = shaper_of(r)
             if first_ascent is None:
                 first_ascent = shaper.ascender * r["size_pt"]
             size = r["size_pt"]
-            for gid, adv, xo, yo in shaper.shape(s, size, spec["kern"]):
+            for gid, adv, xo, yo in shape(shaper, s, size):
                 lg.append({"font_path": path, "size_pt": size, "gid": gid, "x": x + xo,
                            "y": base - yo - r["baseline_shift_pt"], "color": r["color"], "line": li,
                            "fb": bool(r.get("faux_bold")), "fi": bool(r.get("faux_italic")), "adv": adv})
                 x += adv + r["tracking"] / 1000.0 * size + fb_adv
-        width = x
-        align = para["align"]
-        dx = -width / 2.0 if "center" in align else (-width if "right" in align else 0.0)
+        if bb and li == 0:
+            asc = 0.0
+            for g in lg:
+                sh = shaper_for(g["font_path"])
+                top = sh.ink_top(g["gid"]) if hasattr(sh, "ink_top") else sh.ascender
+                asc = max(asc, top * g["size_pt"])
+            for g in lg:
+                g["y"] += asc
+            base += asc
+        if bb:
+            vis = width(line, start, a, a + len(line[a:b].rstrip(" ")))
+            align = para["align"]
+            dx = (bw - vis) / 2.0 if "center" in align else ((bw - vis) if "right" in align else 0.0)
+        else:
+            width_ = x - x0
+            align = para["align"]
+            dx = -width_ / 2.0 if "center" in align else (-width_ if "right" in align else 0.0)
         for g in lg:
             g["x"] += dx
         glyphs.extend(lg)
         prev_runs = line_runs
-        pos += len(line) + 1
     return glyphs, fonts_used, (first_ascent or 0.0)
 
 
@@ -1107,6 +1255,23 @@ def _shadow_offset(e):
     return -d * math.cos(ang), d * math.sin(ang)
 
 
+def _round_half_away(v):
+    # 1e-6 absorbs float error: 3 x cos(120 deg) is 1.4999999999999993, Photoshop moves 2 px
+    return int(math.floor(abs(v) + 0.5 + 1e-6)) * (1 if v >= 0 else -1)
+
+
+def _shift_px(a, dx, dy):
+    """Shift a coverage array by whole pixels, filling with 0."""
+    out = np.zeros_like(a)
+    h, w = a.shape
+    ys, yd = (0, dy) if dy >= 0 else (-dy, 0)
+    xs, xd = (0, dx) if dx >= 0 else (-dx, 0)
+    hh, ww = h - abs(dy), w - abs(dx)
+    if hh > 0 and ww > 0:
+        out[yd:yd + hh, xd:xd + ww] = a[ys:ys + hh, xs:xs + ww]
+    return out
+
+
 def render_spec(spec, renderer, fonts_dir=None):
     """Render to (RGBA uint8 image, (x0, y0) artboard position, info)."""
     info = {"renderer": renderer, "effects_drawn": [], "effects_unrendered": [], "approximations": []}
@@ -1127,7 +1292,10 @@ def render_spec(spec, renderer, fonts_dir=None):
     if spec.get("warp") and str(spec["warp"]).lower() not in ("warpnone", "none"):
         info["approximations"].append(f"warp {spec['warp']} not rendered")
     if spec.get("shape") == "box":
-        info["approximations"].append("paragraph (box) text: no wrapping; laid out as point text from its anchor")
+        info["approximations"].append(
+            "paragraph (box) text: greedy wrap to the box width; justification and hyphenation not rendered"
+            if spec["options"].get("box_wrap") and spec.get("box_bounds_pt") else
+            "paragraph (box) text: no wrapping; laid out as point text from its anchor")
     opts0 = spec["options"]
     if any(r["faux_bold"] for r in spec["runs"]):
         info["approximations"].append("faux bold drawn as outline embolden + wider advance (empirical)"
@@ -1181,7 +1349,10 @@ def render_spec(spec, renderer, fonts_dir=None):
         spread = max(0.0, min(100.0, _f(e.get("spread"), 0.0) or 0.0)) / 100.0
         if t == "DropShadow":
             off = _shadow_offset(e)
-            base = _union([post(c) for _, c in raster.fill(glyphs, box, off, extra=emb)], shape)
+            if opts.get("shadow_offset_model") == "pixel":
+                base = _shift_px(fill_union, _round_half_away(off[0]), _round_half_away(off[1]))
+            else:
+                base = _union([post(c) for _, c in raster.fill(glyphs, box, off, extra=emb)], shape)
         else:
             base = fill_union
         if hires_spread:
