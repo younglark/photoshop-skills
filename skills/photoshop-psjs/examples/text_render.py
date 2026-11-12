@@ -9,14 +9,18 @@ dynamic_text attributes written to layout JSON (see references/slicing.md,
   * ``freetype`` (default): HarfBuzz shaping (uharfbuzz) + FreeType outlines,
     no hinting, outline filled directly; strokes with FreeType's round-join
     stroker.
-  * ``skia`` (optional): HarfBuzz shaping + Skia glyph paths (skia-python).
-  * ``pillow``: fallback when the optional packages are missing. It still uses
-    the corrected parameters below, but cannot transform glyphs.
+  * ``skia``: HarfBuzz shaping + Skia glyph paths (skia-python).
 
-Install the optional packages into the project virtualenv:
+There is no fallback renderer. When the packages a renderer needs are missing,
+``select_renderer`` raises ``TextRendererUnavailable`` (with the pip command) and
+validate stops before drawing any text. A text that cannot be rendered (font
+not found, glyph load error) raises ``TextRenderError``; nothing is skipped or
+redrawn with another renderer.
 
-    pip install uharfbuzz freetype-py          # default renderer
-    pip install skia-python                    # only for --text-renderer skia
+Install into the project virtualenv:
+
+    pip install uharfbuzz freetype-py          # freetype renderer (auto prefers it)
+    pip install uharfbuzz skia-python          # only for --text-renderer skia
 
 Parameter reading (the large error source, not the rasterizer):
 
@@ -52,7 +56,7 @@ import re
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 try:  # optional
     import uharfbuzz as _hb  # type: ignore
@@ -90,7 +94,21 @@ try:
 except Exception:  # pragma: no cover
     _ndi = None
 
-RENDERERS = ("auto", "freetype", "skia", "pillow")
+RENDERERS = ("auto", "freetype", "skia")
+INSTALL_FREETYPE = "pip install uharfbuzz freetype-py"
+INSTALL_SKIA = "pip install uharfbuzz skia-python"
+
+
+class TextRendererUnavailable(RuntimeError):
+    """The requested dynamic_text renderer cannot run (missing packages)."""
+
+    def __init__(self, message, install):
+        super().__init__(f"{message}. Install with: {install}")
+        self.install = install
+
+
+class TextRenderError(RuntimeError):
+    """One dynamic_text could not be rendered (e.g. its font was not found)."""
 DEFAULT_OPTIONS = {
     "renderer": "auto",
     "mixed_leading_k": 0.86,
@@ -121,27 +139,30 @@ DRAWN_EFFECTS = {"Stroke", "DropShadow", "OuterGlow", "ColorOverlay"}
 # ---------------------------------------------------------------------------
 
 def select_renderer(requested="auto"):
-    """Return (used, fallback_reason). fallback_reason is None when *requested* is honoured."""
+    """Return the renderer to use: freetype or skia. auto = freetype, else skia.
+
+    Raises TextRendererUnavailable (message + pip command) when the packages are missing,
+    ValueError for an unknown name. Never falls back to another kind of renderer.
+    """
     requested = (requested or "auto").lower()
     if requested not in RENDERERS:
         raise ValueError(f"unknown text renderer {requested!r}; choose one of {RENDERERS}")
     ft_ok = _hb is not None and _ft is not None
-    if requested == "pillow":
-        return "pillow", None
-    if requested in ("auto", "freetype"):
+    if requested == "freetype" or (requested == "auto" and ft_ok):
         if ft_ok:
-            return "freetype", None
+            return "freetype"
         missing = "; ".join(x for x in (_HB_ERR, _FT_ERR) if x)
-        if requested == "auto" and _hb is not None and _skia() is not None:
-            return "skia", f"freetype renderer unavailable ({missing}); used skia"
-        return "pillow", f"freetype renderer unavailable ({missing}); install uharfbuzz and freetype-py"
-    # skia
+        raise TextRendererUnavailable(f"dynamic_text renderer 'freetype' needs uharfbuzz and freetype-py ({missing})",
+                                      INSTALL_FREETYPE)
     if _hb is not None and _skia() is not None:
-        return "skia", None
-    missing = "; ".join(x for x in (_HB_ERR, _SKIA_ERR) if x)
-    if ft_ok:
-        return "freetype", f"skia renderer unavailable ({missing}); used freetype"
-    return "pillow", f"skia renderer unavailable ({missing}); install uharfbuzz and skia-python"
+        return "skia"
+    missing = "; ".join(x for x in (_HB_ERR, _FT_ERR if requested == "auto" else None, _SKIA_ERR) if x)
+    if requested == "auto":
+        raise TextRendererUnavailable(
+            "dynamic_text rendering needs uharfbuzz + freetype-py (or uharfbuzz + skia-python) "
+            f"({missing})", INSTALL_FREETYPE)
+    raise TextRendererUnavailable(f"dynamic_text renderer 'skia' needs uharfbuzz and skia-python ({missing})",
+                                  INSTALL_SKIA)
 
 
 # ---------------------------------------------------------------------------
@@ -370,12 +391,6 @@ def text_spec(text, *, doc_size=None, art_origin=(0, 0), bounds=None, options=No
 # Fonts
 # ---------------------------------------------------------------------------
 
-_SYSTEM_FONT_FALLBACKS = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/Library/Fonts/Arial.ttf",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-    "C:/Windows/Fonts/arial.ttf",
-)
 _FONT_INDEX = {}
 
 
@@ -413,7 +428,10 @@ def _ps_name(path):
 
 
 def find_font_file(name, fonts_dir=None):
-    """(path or None, how). Exact PostScript-name match first, then file-stem matches."""
+    """(path or None, how). Exact file stem / PostScript name first, then partial file-stem match.
+
+    No substitute font: returns (None, "none") when nothing matches.
+    """
     key = (str(fonts_dir or ""), name or "")
     if key in _FONT_INDEX:
         return _FONT_INDEX[key]
@@ -436,11 +454,6 @@ def find_font_file(name, fonts_dir=None):
                 if stem and (needle in stem or stem in needle):
                     found = (p, "partial file name")
                     break
-    if found[0] is None:
-        for cand in [*files[:1], *(Path(x) for x in _SYSTEM_FONT_FALLBACKS)]:
-            if cand and Path(cand).exists():
-                found = (Path(cand), "fallback")
-                break
     _FONT_INDEX[key] = found
     return found
 
@@ -480,41 +493,6 @@ class _HBFont:
                 for i, p in zip(buf.glyph_infos, buf.glyph_positions)]
 
 
-class _PILShaper:
-    """Per-character advances from Pillow (no shaping, no kerning)."""
-    _cache = {}
-    REF = 200.0
-
-    def __init__(self, path):
-        self.path = path
-        try:
-            self.font = ImageFont.truetype(str(path), size=int(self.REF)) if path else ImageFont.load_default()
-        except Exception:
-            self.font = ImageFont.load_default()
-        try:
-            asc, _desc = self.font.getmetrics()
-            self.ascender = asc / self.REF
-        except Exception:
-            self.ascender = 0.8
-
-    @classmethod
-    def get(cls, path):
-        key = str(path)
-        if key not in cls._cache:
-            cls._cache[key] = cls(path)
-        return cls._cache[key]
-
-    def shape(self, s, size, kern):
-        out = []
-        for ch in s:
-            try:
-                adv = self.font.getlength(ch) / self.REF * size
-            except Exception:
-                adv = 0.6 * size
-            out.append((ch, adv, 0.0, 0.0))
-        return out
-
-
 def _run_at(runs, i):
     for r in runs:
         if r["from"] <= i < r["to"]:
@@ -546,10 +524,12 @@ def line_advance(prev_line_runs, line_runs, opts, auto_pct=None):
     return adv
 
 
-def layout_glyphs(spec, shaper_for, fonts_dir=None):
+def layout_glyphs(spec, shaper_for, fonts_dir=None, resolve_font=None):
     """Glyphs in text space: dicts(font_path, size_pt, gid, x, y, color, line).
 
     *shaper_for(path)* returns an object with ``shape(s, size, kern)`` and ``ascender``.
+    *resolve_font(name, fonts_dir)* -> (path, how); defaults to find_font_file. A run whose
+    font cannot be found raises TextRenderError.
     y is the baseline offset in points (down positive).
     """
     opts = spec["options"]
@@ -576,7 +556,10 @@ def layout_glyphs(spec, shaper_for, fonts_dir=None):
         x = 0.0
         lg = []
         for s, r in segs:
-            path, how = find_font_file(r["font"], fonts_dir)
+            path, how = (resolve_font or find_font_file)(r["font"], fonts_dir)
+            if path is None:
+                raise TextRenderError(
+                    f"font {r['font']!r} not found in fonts_dir {fonts_dir!r}; pass --fonts-dir with the design's fonts")
             fonts_used[r["font"] or ""] = {"file": str(path) if path else None, "match": how}
             shaper = shaper_for(path)
             if first_ascent is None:
@@ -781,54 +764,6 @@ class SkiaRaster:
         return self._draw(self._path(glyphs, box, off), box, paint)
 
 
-class PillowRaster:
-    """Fallback: glyph by glyph with Pillow at the scaled size; rotation / skew ignored."""
-    name = "pillow"
-
-    def __init__(self, spec):
-        self.spec = spec
-        self.snap = bool(spec["options"].get("snap_glyph_origin"))
-        self._fonts = {}
-        self.sy = matrix_scale(spec["matrix"])[1]
-
-    def _font(self, path, size_px):
-        key = (str(path), round(size_px, 2))
-        if key not in self._fonts:
-            try:
-                self._fonts[key] = ImageFont.truetype(str(path), size=max(1.0, size_px)) if path else ImageFont.load_default()
-            except Exception:
-                self._fonts[key] = ImageFont.load_default()
-        return self._fonts[key]
-
-    def _draw(self, glyphs, box, off, stroke_w=0):
-        im = Image.new("L", (box.w, box.h), 0)
-        d = ImageDraw.Draw(im)
-        for g in glyphs:
-            X, Y = _origin(self.spec, g, off, self.snap)
-            font = self._font(g["font_path"], g["size_pt"] * self.sy)
-            kw = {"anchor": "ls"}
-            if stroke_w:
-                kw.update(stroke_width=stroke_w, stroke_fill=255)
-            try:
-                d.text((X - box.x0, Y - box.y0), str(g["gid"]), font=font, fill=255, **kw)
-            except (TypeError, ValueError):
-                d.text((X - box.x0, Y - box.y0), str(g["gid"]), font=font, fill=255)
-        return np.asarray(im, dtype=np.float64) / 255.0
-
-    def fill(self, glyphs, box, off=(0.0, 0.0)):
-        by, order = {}, []
-        for g in glyphs:
-            key = tuple(g["color"])
-            if key not in by:
-                by[key] = []
-                order.append(key)
-            by[key].append(g)
-        return [(k, self._draw(by[k], box, off)) for k in order]
-
-    def stroke(self, glyphs, box, radius, off=(0.0, 0.0)):
-        return self._draw(glyphs, box, off, stroke_w=max(1, int(round(radius))))
-
-
 # ---------------------------------------------------------------------------
 # Effects and composition
 # ---------------------------------------------------------------------------
@@ -900,16 +835,15 @@ def render_spec(spec, renderer, fonts_dir=None):
     elif renderer == "skia":
         raster, shaper = SkiaRaster(spec), _HBFont.get
     else:
-        raster, shaper = PillowRaster(spec), _PILShaper.get
-        info["approximations"].append("pillow fallback: no shaping, no kerning, rotation/skew ignored")
+        raise ValueError(f"unknown renderer {renderer!r}")
     glyphs, fonts_used, _asc = layout_glyphs(spec, shaper, fonts_dir)
     info["fonts"] = fonts_used
     info["runs"] = len(spec["runs"])
     info["kern"] = spec["kern"]
     info["kern_reason"] = spec["kern_reason"]
     info["effects_skipped_hidden"] = [{"type": e["type"], "reason": e.get("reason")} for e in spec["effects_hidden"]]
-    if any(v["match"] == "fallback" for v in fonts_used.values()):
-        info["approximations"].append("font not found in fonts_dir; fallback font used")
+    if any(v["match"] == "partial file name" for v in fonts_used.values()):
+        info["approximations"].append("font matched by partial file name; check fonts[*].file")
     if spec.get("warp") and str(spec["warp"]).lower() not in ("warpnone", "none"):
         info["approximations"].append(f"warp {spec['warp']} not rendered")
     if spec.get("shape") == "box":
@@ -1007,12 +941,10 @@ def _erode(a, r):
 
 def render_text(text, *, renderer="auto", fonts_dir=None, doc_size=None, art_origin=(0, 0), bounds=None, options=None):
     """Convenience wrapper: (image, xy, info) for one layout JSON text dict."""
-    used, reason = select_renderer(renderer)
+    used = select_renderer(renderer)
     spec = text_spec(text, doc_size=doc_size, art_origin=art_origin, bounds=bounds, options=options)
     im, xy, info = render_spec(spec, used, fonts_dir)
     info["requested_renderer"] = renderer
-    if reason:
-        info["fallback_reason"] = reason
     return im, xy, info
 
 

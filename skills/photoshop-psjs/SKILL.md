@@ -2,10 +2,10 @@
 name: photoshop-psjs
 description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psjs): write, launch, poll, and verify document create/edit/export from an agent. Covers executeAsModal, batchPlay, file tokens, doc-id safety, and psjs vs UXP plugins vs ExtendScript/JSX. Chinese triggers: psjs驱动Photoshop, UXP脚本, batchPlay, executeAsModal, 用脚本改PSD, 从命令行跑Photoshop脚本, 图层样式脚本, 导出切片, 切图工作流, 九宫格, 切图清单, 布局JSON. Do NOT use for UXP plugin/panel or MCP-bridge development, ExtendScript/JSX-only work, or read-only PSD inspection that psd-tools/ag-psd can do without launching Photoshop."
 license: MIT-0
-compatibility: "Requires Adobe Photoshop 2023 (v23.5+) or later with UXP scripting, on Windows or macOS. The optional slicing helper needs Python 3 with psd-tools, Pillow and numpy; uharfbuzz + freetype-py (or skia-python) are optional for a closer dynamic-text preview."
+compatibility: "Requires Adobe Photoshop 2023 (v23.5+) or later with UXP scripting, on Windows or macOS. The optional slicing helper needs Python 3 with psd-tools, Pillow and numpy; its validate step also requires uharfbuzz + freetype-py (or uharfbuzz + skia-python) when the layout has dynamic text."
 metadata:
   author: younglark
-  version: "1.3.0"
+  version: "1.3.1"
   homepage: https://github.com/younglark/photoshop-skills
 ---
 
@@ -222,7 +222,7 @@ await out.write(JSON.stringify(log, null, 2));
 
 把界面切成游戏引擎可导入的 1x PNG，并产出一份按组件语义组织、引擎无关的中间布局 JSON。细节、schema、命名、识别方法和实测见 [references/slicing.md](references/slicing.md)。**先按该文文首的决策树走：** 打开材料（含组上的图层效果，并为每个受影响的部件选效果方式）→ 识别组件 → 分清共用与随状态变化的零件 → 区分变体与旧稿 → 只给会变的零件记 missing → 判断重复元素是否复用 → 停在审核门闩。脚本与 Python 助手： [examples/export_slices.psjs](examples/export_slices.psjs)、[examples/slicing_helper.py](examples/slicing_helper.py)、[examples/naming_rules.example.json](examples/naming_rules.example.json)、[examples/export_config.example.json](examples/export_config.example.json)。
 
-**Python 环境：** 用项目 venv 运行助手，不要把包装进系统 Python。需要 `psd-tools[composite]`、Pillow、numpy；校验预览里的动态文字另建议装可选的 `uharfbuzz freetype-py`（HarfBuzz + FreeType，未装时退回 Pillow，报告 `text_renderer` 会写明原因）。打开大文档用已核实的 `PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))`（不要猜参数，也不要设置 `ParseLimits.max_objects` 类属性）。详见 slicing.md「Python 环境」。
+**Python 环境：** 用项目 venv 运行助手，不要把包装进系统 Python。需要 `psd-tools[composite]`、Pillow、numpy；布局里有动态文字时 `validate` 还**必须**装 `pip install uharfbuzz freetype-py`（或 `--text-renderer skia` 时 `pip install uharfbuzz skia-python`）。缺了就在画文字前报错退出（非零退出码，报告里有错误和安装命令），没有回退渲染器；某条文字画不出（如找不到字体）也报错。打开大文档用已核实的 `PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))`（不要猜参数，也不要设置 `ParseLimits.max_objects` 类属性）。详见 slicing.md「Python 环境」。
 
 **分工：** 助手只准备材料（默认状态整图、带 id 的逐层裁切图、含隐藏层的图层树、九宫格候选）。跑这个 skill 的 agent 同时阅读这些材料，编写 manifest：组件、部件、规范名、类型、状态和层级。`--rules` 只是可选的项目命名约定。`infer` 仍可产出关键词草稿（`draft_manifest.json`），但不能代替 agent 的清单。
 

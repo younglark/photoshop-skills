@@ -4,12 +4,15 @@
 
     python test_slicing_helper_text_render.py
 
-Rendering tests need a TTF on the machine (DejaVu or any font under the usual
-system folders, or set TEST_FONT=/path/to/font.ttf); the HarfBuzz / FreeType
-tests also need ``pip install uharfbuzz freetype-py``. Missing pieces are skipped.
+Rendering tests need ``pip install uharfbuzz freetype-py`` (Skia test: skia-python)
+and a TTF on the machine (DejaVu or any font under the usual system folders, or
+set TEST_FONT=/path/to/font.ttf); without them they are skipped. The
+"missing packages is an error" tests simulate the import failure and always run.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -96,11 +99,16 @@ class FakeShaper:
         return [(ch, 0.5 * size, 0.0, 0.0) for ch in s]
 
 
+def FAKE_FONT(_name, _fonts_dir):
+    return Path("sample-font.ttf"), "test"
+
+
 def find_test_font():
     env = os.environ.get("TEST_FONT")
     if env and Path(env).exists():
         return Path(env)
-    for p in T._SYSTEM_FONT_FALLBACKS:
+    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/Library/Fonts/Arial.ttf",
+              "/System/Library/Fonts/Supplemental/Arial.ttf", "C:/Windows/Fonts/arial.ttf"):
         if Path(p).exists():
             return Path(p)
     for root in ("/usr/share/fonts", "/Library/Fonts", "C:/Windows/Fonts"):
@@ -166,7 +174,7 @@ class SpecAndLayout(unittest.TestCase):
         spec = self._spec(T.text_attrs_from_descriptor(_desc()))
         self.assertFalse(spec["kern"])
         shaper = FakeShaper()
-        T.layout_glyphs(spec, lambda _p: shaper)
+        T.layout_glyphs(spec, lambda _p: shaper, resolve_font=FAKE_FONT)
         self.assertTrue(shaper.kern_flags and not any(shaper.kern_flags))
         self.assertTrue(T.kern_enabled({"kerning": "metrics"})[0])
         self.assertFalse(T.kern_enabled({"kerning": "manual", "manual_kerning_ranges": 2})[0])
@@ -175,7 +183,7 @@ class SpecAndLayout(unittest.TestCase):
         attrs = T.text_attrs_from_descriptor(_desc())
         for k in (0.86, 0.0):
             spec = self._spec(attrs, mixed_leading_k=k)
-            glyphs, _fonts, _asc = T.layout_glyphs(spec, lambda _p: FakeShaper())
+            glyphs, _fonts, _asc = T.layout_glyphs(spec, lambda _p: FakeShaper(), resolve_font=FAKE_FONT)
             line0 = [g for g in glyphs if g["line"] == 0]
             line1 = [g for g in glyphs if g["line"] == 1]
             self.assertEqual({g["size_pt"] for g in line0}, {30.0})
@@ -198,7 +206,7 @@ class SpecAndLayout(unittest.TestCase):
         desc = _desc(two_runs=False)
         desc["textKey"]["textStyleRange"][0]["textStyle"]["tracking"] = 100
         spec = self._spec(T.text_attrs_from_descriptor(desc))
-        glyphs, _f, _a = T.layout_glyphs(spec, lambda _p: FakeShaper())
+        glyphs, _f, _a = T.layout_glyphs(spec, lambda _p: FakeShaper(), resolve_font=FAKE_FONT)
         step = glyphs[1]["x"] - glyphs[0]["x"]
         self.assertAlmostEqual(step, 0.5 * 30.0 + 100 / 1000.0 * 30.0, places=6)
         width = len(glyphs) * step
@@ -221,20 +229,52 @@ class SpecAndLayout(unittest.TestCase):
         self.assertAlmostEqual(T.line_advance(spec["runs"], spec["runs"], spec["options"]), 33.0)
 
 
+@contextlib.contextmanager
+def missing_packages(hb=True, ft=False, skia=True):
+    """Simulate failed imports of uharfbuzz / freetype-py / skia-python."""
+    saved = (T._hb, T._HB_ERR, T._ft, T._FT_ERR, T._SKIA, T._SKIA_ERR)
+    try:
+        if hb:
+            T._hb, T._HB_ERR = None, "uharfbuzz not importable: simulated"
+        if ft:
+            T._ft, T._FT_ERR = None, "freetype-py not importable: simulated"
+        if skia:
+            T._SKIA, T._SKIA_ERR = None, "skia-python not importable: simulated"
+        yield
+    finally:
+        T._hb, T._HB_ERR, T._ft, T._FT_ERR, T._SKIA, T._SKIA_ERR = saved
+
+
+HAVE_FT = T._hb is not None and T._ft is not None
+
+
 class RendererSelection(unittest.TestCase):
-    def test_fallback_is_reported(self):
-        saved = T._hb
-        try:
-            T._hb = None
-            used, reason = T.select_renderer("auto")
-            self.assertEqual(used, "pillow")
-            self.assertIn("uharfbuzz", reason or "")
-            used, reason = T.select_renderer("pillow")
-            self.assertEqual((used, reason), ("pillow", None))
-        finally:
-            T._hb = saved
-        with self.assertRaises(ValueError):
-            T.select_renderer("gdi")
+    def test_missing_packages_raise_with_install_command(self):
+        with missing_packages(hb=True, ft=True, skia=True):
+            for name in ("auto", "freetype"):
+                with self.assertRaises(T.TextRendererUnavailable) as cm:
+                    T.select_renderer(name)
+                self.assertIn("pip install uharfbuzz freetype-py", str(cm.exception))
+                self.assertEqual(cm.exception.install, T.INSTALL_FREETYPE)
+            with self.assertRaises(T.TextRendererUnavailable) as cm:
+                T.select_renderer("skia")
+            self.assertIn("pip install uharfbuzz skia-python", str(cm.exception))
+
+    def test_freetype_missing_is_not_replaced_when_requested(self):
+        with missing_packages(hb=False, ft=True, skia=False):
+            with self.assertRaises(T.TextRendererUnavailable):
+                T.select_renderer("freetype")
+
+    def test_no_pillow_renderer(self):
+        self.assertEqual(T.RENDERERS, ("auto", "freetype", "skia"))
+        for name in ("pillow", "gdi"):
+            with self.assertRaises(ValueError):
+                T.select_renderer(name)
+        self.assertFalse(hasattr(T, "PillowRaster"))
+
+    @unittest.skipUnless(HAVE_FT, "uharfbuzz / freetype-py not installed")
+    def test_auto_prefers_freetype(self):
+        self.assertEqual(T.select_renderer("auto"), "freetype")
 
 
 @unittest.skipIf(find_test_font() is None, "no TTF font found (set TEST_FONT)")
@@ -267,8 +307,13 @@ class Rendering(unittest.TestCase):
         self.assertTrue(((green[..., 1] > 80) & (green[..., 0] < 60) & (green[..., 3] > 200)).any())
         self.assertEqual(info_on["fonts"]["Sample-Font"]["match"], "file name")
 
-    def test_pillow_fallback_renders_and_hides_effects(self):
-        self._check_stroke_visibility("pillow")
+    @unittest.skipIf(T._hb is None or T._ft is None, "uharfbuzz / freetype-py not installed")
+    def test_missing_font_is_an_error(self):
+        desc = _desc(two_runs=False)
+        desc["textKey"]["textStyleRange"][0]["textStyle"]["fontPostScriptName"] = "Not-Installed-Font"
+        with self.assertRaises(T.TextRenderError) as cm:
+            self._render("freetype", desc)
+        self.assertIn("Not-Installed-Font", str(cm.exception))
 
     @unittest.skipIf(T._hb is None or T._ft is None, "uharfbuzz / freetype-py not installed")
     def test_freetype_renders_and_hides_effects(self):
@@ -292,49 +337,97 @@ class Rendering(unittest.TestCase):
 
 
 class ValidateReport(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.slices = self.tmp / "slices"
+        self.slices.mkdir()
+        self.fonts = self.tmp / "fonts"
+        self.fonts.mkdir()
+        font = find_test_font()
+        if font:
+            shutil.copy(font, self.fonts / "Sample-Font.ttf")
+        T._FONT_INDEX.clear()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _validate(self, attrs, renderer="auto"):
+        layout = {
+            "schema": h.SCHEMA_LAYOUT,
+            "source": {"doc_size": [200, 80], "artboard": {"name": "board", "bounds": [0, 0, 200, 80],
+                                                          "size": [200, 80]}},
+            "nodes": [{"id": "main_text_label", "name": "main_text_label", "kind": "dynamic_text",
+                       "visible_bounds": {"left": 40, "top": 10, "right": 160, "bottom": 60},
+                       "logical_bounds": {"left": 40, "top": 10, "right": 160, "bottom": 60},
+                       "text": attrs, "default": True}],
+            "components": [],
+        }
+        lpath = self.tmp / "layout.json"
+        lpath.write_text(json.dumps(layout), encoding="utf-8")
+        rpath = self.tmp / "full.png"
+        Image.new("RGBA", (200, 80), (30, 30, 30, 255)).save(rpath)
+        out = self.tmp / "validate"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = h.cmd_validate(SimpleNamespace(layout=str(lpath), slices_dir=str(self.slices), full_render=str(rpath),
+                                                out_dir=str(out), fonts_dir=str(self.fonts), group_effects=None,
+                                                reuse_tol_mae=4.0, reuse_tol_pct=1.0, text_renderer=renderer,
+                                                mixed_leading_k=None, snap_glyph_origin=None))
+        report = json.loads((out / "validate_report.json").read_text(encoding="utf-8"))
+        return rc, report, out, err.getvalue()
+
+    def test_validate_fails_before_rendering_without_packages(self):
+        with missing_packages(hb=True, ft=True, skia=True):
+            rc, report, out, err = self._validate(T.text_attrs_from_descriptor(_desc(two_runs=False)))
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["error"]["type"], "text_renderer_unavailable")
+        self.assertEqual(report["error"]["install"], "pip install uharfbuzz freetype-py")
+        self.assertIn("pip install uharfbuzz freetype-py", err)
+        self.assertFalse((out / "recomposite.png").exists(), "no result images on failure")
+        self.assertNotIn("diff_text_rendered", report)
+
+    def test_validate_skia_request_fails_without_skia(self):
+        with missing_packages(hb=False, ft=False, skia=True):
+            rc, report, _out, err = self._validate(T.text_attrs_from_descriptor(_desc(two_runs=False)), "skia")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("pip install uharfbuzz skia-python", err)
+        self.assertEqual(report["text_renderer"]["requested"], "skia")
+
+    @unittest.skipUnless(HAVE_FT, "uharfbuzz / freetype-py not installed")
+    def test_validate_fails_when_a_text_cannot_render(self):
+        attrs = T.text_attrs_from_descriptor(_desc(two_runs=False))
+        attrs["runs"][0]["font"] = attrs["font"] = "Not-Installed-Font"
+        rc, report, out, err = self._validate(attrs)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(report["error"]["type"], "text_render_failed")
+        self.assertIn("main_text_label", report["error"]["message"])
+        self.assertIn("Not-Installed-Font", err)
+        self.assertFalse((out / "recomposite.png").exists())
+
+    @unittest.skipUnless(HAVE_FT and find_test_font(), "uharfbuzz / freetype-py or a TTF missing")
     def test_validate_records_text_renderer(self):
-        tmp = Path(tempfile.mkdtemp())
-        try:
-            slices = tmp / "slices"
-            slices.mkdir()
-            attrs = T.text_attrs_from_descriptor(_desc(two_runs=False))
-            layout = {
-                "schema": h.SCHEMA_LAYOUT,
-                "source": {"doc_size": [200, 80], "artboard": {"name": "board", "bounds": [0, 0, 200, 80],
-                                                              "size": [200, 80]}},
-                "nodes": [{"id": "main_text_label", "name": "main_text_label", "kind": "dynamic_text",
-                           "visible_bounds": {"left": 40, "top": 10, "right": 160, "bottom": 60},
-                           "logical_bounds": {"left": 40, "top": 10, "right": 160, "bottom": 60},
-                           "text": attrs, "default": True}],
-                "components": [],
-            }
-            lpath = tmp / "layout.json"
-            lpath.write_text(json.dumps(layout), encoding="utf-8")
-            rpath = tmp / "full.png"
-            Image.new("RGBA", (200, 80), (30, 30, 30, 255)).save(rpath)
-            fonts = tmp / "fonts"
-            fonts.mkdir()
-            font = find_test_font()
-            if font:
-                shutil.copy(font, fonts / "Sample-Font.ttf")
-            out = tmp / "validate"
-            h.cmd_validate(SimpleNamespace(layout=str(lpath), slices_dir=str(slices), full_render=str(rpath),
-                                           out_dir=str(out), fonts_dir=str(fonts), group_effects=None,
-                                           reuse_tol_mae=4.0, reuse_tol_pct=1.0, text_renderer="pillow",
-                                           mixed_leading_k=None, snap_glyph_origin=None))
-            report = json.loads((out / "validate_report.json").read_text(encoding="utf-8"))
-            tr = report["text_renderer"]
-            self.assertEqual(tr["requested"], "pillow")
-            self.assertEqual(tr["used"], "pillow")
-            self.assertIsNone(tr["fallback_reason"])
-            self.assertAlmostEqual(tr["options"]["mixed_leading_k"], 0.86)
-            self.assertEqual(tr["legacy_v1_text_attrs"], 0)
-            info = report["dynamic_text_render_info"][0]
-            self.assertEqual(info["name"], "main_text_label")
-            self.assertEqual(info["renderer"], "pillow")
-            self.assertEqual(report["dynamic_text_rendered"], 1 if font else report["dynamic_text_rendered"])
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        rc, report, _out, _err = self._validate(T.text_attrs_from_descriptor(_desc(two_runs=False)))
+        tr = report["text_renderer"]
+        self.assertEqual((tr["requested"], tr["used"]), ("auto", "freetype"))
+        self.assertNotIn("fallback_reason", tr)
+        self.assertAlmostEqual(tr["options"]["mixed_leading_k"], 0.86)
+        self.assertEqual(tr["legacy_v1_text_attrs"], 0)
+        info = report["dynamic_text_render_info"][0]
+        self.assertEqual((info["name"], info["renderer"]), ("main_text_label", "freetype"))
+        self.assertEqual(report["dynamic_text_rendered"], 1)
+
+    @unittest.skipUnless(HAVE_FT and find_test_font(), "uharfbuzz / freetype-py or a TTF missing")
+    def test_validate_renders_and_flags_legacy_v1_attrs(self):
+        v1 = {"content": "Label", "font": "Sample-Font", "size": 30.0 * SCALE, "leading": None,
+              "auto_leading": True, "alignment": "center", "color": "#ffffff",
+              "transform": {"xx": SCALE, "xy": 0, "yx": 0, "yy": SCALE},
+              "click_point": {"horizontal": 50, "vertical": 50}}
+        rc, report, _out, err = self._validate(v1)
+        self.assertEqual(report["dynamic_text_rendered"], 1)
+        self.assertEqual(report["text_renderer"]["legacy_v1_text_attrs"], 1)
+        self.assertEqual(report["text_renderer"]["legacy_v1_nodes"], ["main_text_label"])
+        self.assertIn("legacy v1", err)
 
 
 if __name__ == "__main__":

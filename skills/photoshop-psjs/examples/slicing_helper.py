@@ -3,9 +3,9 @@
 """Agent slicing helper: infer a manifest, annotate a preview, build layout JSON, validate.
 
 Requires: psd-tools, Pillow, numpy, and scipy (or psd-tools[composite]) for
-preview compositing and nine-slice analysis. Optional: uharfbuzz + freetype-py
-(or skia-python) for the dynamic_text preview in validate (text_render.py);
-without them validate falls back to Pillow and says so in validate_report.json. Prefer a project virtualenv; do
+preview compositing and nine-slice analysis. validate also needs uharfbuzz +
+freetype-py (or uharfbuzz + skia-python) whenever the layout has dynamic_text
+(text_render.py); without them it exits non-zero before drawing any text. Prefer a project virtualenv; do
 not install packages into the system Python. Open large documents with
 ``PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))``
 (psd-tools 1.26+: ``ParseLimits.max_objects`` defaults to 1_000_000; ``None``
@@ -2935,51 +2935,17 @@ def hex_to_rgba(s, alpha=255):
     return (r, g, b, int(max(0, min(255, alpha))))
 
 
-def iter_font_files(fonts_dir):
-    if not fonts_dir:
-        return
-    root = Path(fonts_dir)
-    folders = [root]
-    if root.is_dir():
-        parent = root.parent
-        for extra in (parent / "fonts_install", parent / "fonts"):
-            if extra.is_dir() and extra not in folders:
-                folders.append(extra)
-    for folder in folders:
-        if not folder.is_dir():
-            continue
-        for pat in ("*.ttf", "*.otf", "*.TTC", "*.ttc", "*.TTF", "*.OTF"):
-            yield from sorted(folder.glob(pat))
-
-
-def load_font_named(name, size, fonts_dir=None):
-    size = max(1, int(round(size or 16)))
-    needle = re.sub(r"[^a-z0-9]+", "", (name or "").lower())
-    ranked = []
-    for path in iter_font_files(fonts_dir):
-        stem = re.sub(r"[^a-z0-9]+", "", path.stem.lower())
-        if needle and (needle == stem or needle in stem or stem in needle):
-            ranked.insert(0, path)
-        else:
-            ranked.append(path)
-    for path in ranked:
-        try:
-            return ImageFont.truetype(str(path), size=size)
-        except Exception:
-            continue
-    return load_font(size)
-
-
 def draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin, text_opts=None):
     """Approximate a dynamic_text node (see text_render.py). Not a PS typography emulator.
 
-    *text_opts*: {"renderer": auto|freetype|skia|pillow, "mixed_leading_k", "snap_glyph_origin", ...}.
-    The returned info names the renderer actually used and any fallback reason.
+    *text_opts*: {"renderer": auto|freetype|skia, "mixed_leading_k", "snap_glyph_origin", ...}.
+    Raises text_render.TextRendererUnavailable / TextRenderError; never switches renderer
+    or skips a text that has content.
     """
     text = node.get("text") or {}
     content = (text.get("content") or "")
     if not content or not str(content).strip():
-        return canvas, {"name": node["name"], "skipped": "empty"}
+        return canvas, {"name": node["name"], "skipped": "empty content (nothing to draw)"}
     opts = dict(text_opts or {})
     requested = opts.pop("renderer", "auto")
     bounds = node.get("logical_bounds") or node.get("visible_bounds") or {}
@@ -2988,18 +2954,14 @@ def draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin, text_opts=N
             text, renderer=requested, fonts_dir=fonts_dir, doc_size=doc_size,
             art_origin=art_origin, bounds=bounds, options=opts,
         )
-    except Exception as exc:  # never lose the whole validate on one odd text layer
-        if requested == "pillow":
-            raise
-        warn(f"text render failed for {node.get('name')} ({exc}); retrying with pillow")
-        im, xy, info = text_render.render_text(
-            text, renderer="pillow", fonts_dir=fonts_dir, doc_size=doc_size,
-            art_origin=art_origin, bounds=bounds, options=opts,
-        )
-        info["fallback_reason"] = f"{requested} renderer raised {type(exc).__name__}: {exc}"
-    info = {"name": node["name"], "rendered": im is not None, "xy": list(xy), **info}
-    if im is not None:
-        canvas = alpha_over(canvas, im, xy)
+    except text_render.TextRendererUnavailable:
+        raise
+    except Exception as exc:
+        raise text_render.TextRenderError(f"dynamic_text {node.get('name')!r}: {exc}") from exc
+    if im is None:
+        raise text_render.TextRenderError(f"dynamic_text {node.get('name')!r}: no glyphs rendered ({info.get('skipped')})")
+    info = {"name": node["name"], "rendered": True, "xy": list(xy), **info}
+    canvas = alpha_over(canvas, im, xy)
     return canvas, info
 
 
@@ -3645,19 +3607,49 @@ def cmd_validate(args):
         "snap_glyph_origin": getattr(args, "snap_glyph_origin", None),
     }
     text_opts = {k: v for k, v in text_opts.items() if v is not None}
-    renderer_used, renderer_fallback = text_render.select_renderer(text_opts["renderer"])
-    if renderer_fallback:
-        warn(f"dynamic_text renderer fallback: {renderer_fallback}")
     default_layout = layout_with_nodes(layout, default_nodes(layout))
+    has_text = any(
+        n.get("kind") == "dynamic_text" and str((n.get("text") or {}).get("content") or "").strip()
+        for n in default_layout["nodes"]
+    )
+    out_dir = Path(args.out_dir)
+    renderer_used = None
+
+    def fail(kind, exc, install=None):
+        msg = str(exc)
+        print(f"error: {msg}", file=sys.stderr, flush=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        failed = {
+            "ok": False,
+            "error": {"type": kind, "message": msg, "install": install},
+            "text_renderer": {"requested": text_opts["renderer"], "used": renderer_used},
+            "artboard": art,
+            "issues": issues + [{"type": kind, "message": msg}],
+            "notes": ["validate stopped: no recomposite or metrics were produced."],
+        }
+        (out_dir / "validate_report.json").write_text(json.dumps(failed, ensure_ascii=False, indent=2), encoding="utf-8")
+        return 2
+
+    if has_text:
+        try:
+            renderer_used = text_render.select_renderer(text_opts["renderer"])
+        except text_render.TextRendererUnavailable as exc:
+            return fail("text_renderer_unavailable", exc, exc.install)
     rec_masked, placed_masked = recomposite(default_layout, slices_dir, (w, h), render_text=False)
-    rec_text, placed_text = recomposite(
-        default_layout, slices_dir, (w, h), render_text=True, fonts_dir=fonts_dir, text_opts=text_opts
-    )
+    try:
+        rec_text, placed_text = recomposite(
+            default_layout, slices_dir, (w, h), render_text=True, fonts_dir=fonts_dir, text_opts=text_opts
+        )
+    except text_render.TextRenderError as exc:
+        return fail("text_render_failed", exc)
     text_infos = [p for p in placed_text if "renderer" in p or p.get("skipped")]
-    text_v1 = sum(
-        1 for n in default_layout["nodes"]
+    legacy_v1 = [
+        n["name"] for n in default_layout["nodes"]
         if n.get("kind") == "dynamic_text" and not text_render.is_v2(n.get("text") or {})
-    )
+    ]
+    if legacy_v1:
+        warn(f"{len(legacy_v1)} dynamic_text node(s) use legacy v1 text attributes (single run, no effect "
+             "visibility); re-export with the current export_slices.psjs")
 
     cw, ch = min(full.width, w), min(full.height, h)
     ref = np.asarray(full.convert("RGBA").crop((0, 0, cw, ch)))
@@ -3674,13 +3666,12 @@ def cmd_validate(args):
     worst10, _all = per_element_diffs(default_layout, ref, rec_t, cw, ch)
     worst10_masked, _ = per_element_diffs(default_layout, ref, rec_m, cw, ch)
 
-    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rec_text.save(out_dir / "recomposite.png")
     rec_masked.save(out_dir / "recomposite_text_masked.png")
     write_side_by_side(
         ref, rec_t, out_dir / "validate_side_by_side.jpg",
-        ("Photoshop full render", f"Recomposite + {renderer_used} text (approx.)", "|diff| x3"),
+        ("Photoshop full render", f"Recomposite + {renderer_used or 'no'} text (approx.)", "|diff| x3"),
     )
     write_side_by_side(
         ref, rec_m, out_dir / "validate_side_by_side_masked.jpg",
@@ -3708,18 +3699,14 @@ def cmd_validate(args):
         "text_renderer": {
             "requested": text_opts["renderer"],
             "used": renderer_used,
-            "fallback_reason": renderer_fallback,
             "options": {k: v for k, v in dict(text_render.DEFAULT_OPTIONS, **text_opts).items() if k != "renderer"},
-            "per_text_fallbacks": [
-                {"name": p.get("name"), "used": p.get("renderer"), "reason": p.get("fallback_reason")}
-                for p in text_infos if p.get("renderer") and p.get("renderer") != renderer_used
-            ],
-            "legacy_v1_text_attrs": text_v1,
+            "legacy_v1_text_attrs": len(legacy_v1),
+            "legacy_v1_nodes": legacy_v1,
         },
         "dynamic_text_rendered": rendered,
         "dynamic_text_render_info": [
             {k: v for k, v in p.items() if k in (
-                "name", "renderer", "fallback_reason", "fonts", "runs", "kern", "kern_reason",
+                "name", "renderer", "fonts", "runs", "kern", "kern_reason",
                 "effects_drawn", "effects_skipped_hidden", "effects_unrendered", "approximations", "skipped")}
             for p in text_infos
         ],
@@ -3746,8 +3733,8 @@ def cmd_validate(args):
             "Default-state recomposite only (parts currently shown in the PSD) is compared to the PS render.",
             "diff_text_rendered: slices + an approximation of dynamic_text (text_renderer.used) vs the PS render. "
             "Preview text is approximate; judge slice accuracy by diff_text_masked.",
-            "text_renderer: freetype = HarfBuzz + FreeType (no hinting), skia = HarfBuzz + Skia paths, "
-            "pillow = fallback when uharfbuzz / freetype-py are missing (see fallback_reason).",
+            "text_renderer: freetype = HarfBuzz + FreeType (no hinting), skia = HarfBuzz + Skia paths. "
+            "There is no fallback: missing packages or an unrenderable text stop validate with an error.",
             "legacy_v1_text_attrs > 0: the export log predates text_attrs_version 2 (single run, no effect "
             "visibility); re-export with the current export_slices.psjs for a closer text preview.",
             "diff_text_masked: slices only; dynamic_text boxes and unemulated engine-effect areas excluded from the metrics.",
@@ -3827,7 +3814,8 @@ def build_parser():
     s.add_argument("--out-dir", required=True)
     s.add_argument("--fonts-dir", default=None, help="Directory of TTF/OTF files used to approximate dynamic_text")
     s.add_argument("--text-renderer", choices=list(text_render.RENDERERS), default="auto",
-                   help="dynamic_text preview renderer: auto (freetype, else skia, else pillow), freetype, skia, pillow")
+                   help="dynamic_text preview renderer: auto (freetype, else skia), freetype, skia. "
+                        "Missing packages are an error, not a fallback")
     s.add_argument("--mixed-leading-k", type=float, default=None,
                    help="Extra drop of a following line, as a fraction of its font-size increase (empirical, default 0.86)")
     s.add_argument("--snap-glyph-origin", dest="snap_glyph_origin", action="store_true", default=None,

@@ -65,7 +65,7 @@ python slicing_helper.py prepare --psd design.psb --out-dir out [--artboard <画
 python slicing_helper.py flatten --manifest out/manifest.json
 python slicing_helper.py preview --manifest out/manifest.json --out out/preview_annotated.png [--ref out/full_render.png]
 python slicing_helper.py build-layout --manifest out/manifest.json --export-log out/export_log.json --slices-dir out/slices --out out/layout.json
-python slicing_helper.py validate --layout out/layout.json --slices-dir out/slices --full-render out/full_render.png --out-dir out/validate [--fonts-dir <字体目录>] [--text-renderer auto|freetype|skia|pillow]
+python slicing_helper.py validate --layout out/layout.json --slices-dir out/slices --full-render out/full_render.png --out-dir out/validate [--fonts-dir <字体目录>] [--text-renderer auto|freetype|skia]
 #   validate 末尾写出 preview_exported_annotated.png / preview_exported_vs_ps.png（最终交付图）
 # flatten / build-layout / validate 自动读取 manifest 旁的 group_effects.json，也可用 --group-effects 指定
 # 可选：关键词草稿，只写 draft_manifest.json，不能代替 agent 编写的 manifest
@@ -82,16 +82,16 @@ python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画�
 python3 -m venv .venv
 # Windows：.venv\Scripts\activate    POSIX：source .venv/bin/activate
 pip install "psd-tools[composite]" pillow numpy
-# 可选：校验预览里的动态文字（HarfBuzz 排版 + FreeType 填充轮廓）
+# 必装（布局里有 dynamic_text 时 validate 需要）：HarfBuzz 排版 + FreeType 填充轮廓
 pip install uharfbuzz freetype-py
-# 可选：--text-renderer skia 时再装
-pip install skia-python
+# 只在 --text-renderer skia 时需要
+pip install uharfbuzz skia-python
 # 之后一律用该环境的解释器调用助手，例如：
 #   .venv\Scripts\python.exe examples/slicing_helper.py prepare ...
 #   .venv/bin/python examples/slicing_helper.py prepare ...
 ```
 
-若工作区附近已有装好这些包的 venv，直接用它的 `python`，不必再装一份。需要的包：`psd-tools`、Pillow、numpy；预览合成与九宫格分析还要 `scipy`（已包含在 `psd-tools[composite]` 里）。`uharfbuzz` + `freetype-py` 可选，只影响 `validate` 里动态文字的预览；没装时退回 Pillow，`validate_report.json` 的 `text_renderer.fallback_reason` 会写明，不会静默降级。
+若工作区附近已有装好这些包的 venv，直接用它的 `python`，不必再装一份。需要的包：`psd-tools`、Pillow、numpy；预览合成与九宫格分析还要 `scipy`（已包含在 `psd-tools[composite]` 里）。布局里有 `dynamic_text` 时，`validate` **必须**有 `uharfbuzz` + `freetype-py`（或 `uharfbuzz` + `skia-python`）。缺了就在画文字前失败：退出码 2，stderr 和 `validate_report.json` 的 `error`（`type: text_renderer_unavailable`、`message`、`install`）给出原因和安装命令，不写拼图和指标。没有回退渲染器。
 
 打开 PSD/PSB 时传入 `ParseLimits`。已在 **psd-tools 1.26.1** 核实的签名是：
 
@@ -596,10 +596,10 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 6. **动态文字预览**（[examples/text_render.py](../examples/text_render.py)）：只是近似，不是 Photoshop 的文字引擎，也不是目标引擎的渲染。要像素一致的文字，让 Photoshop 栅格化文字图层（或临时显示后导出带字整图）做底图；要和上线一致，用目标引擎按同一份布局 JSON 出图。
 
-   - `--text-renderer auto`（默认）：装了 `uharfbuzz` + `freetype-py` 用 `freetype`（HarfBuzz 排版，FreeType 不做 hinting、直接填充轮廓，描边用圆角外扩的轮廓描边）；否则有 `skia-python` 用 `skia`（Skia 轮廓路径）；都没有就退回 `pillow`。也可显式指定。报告 `text_renderer` 记 `requested`、`used`、`fallback_reason`、参数和逐条退回；逐条细节在 `dynamic_text_render_info`（所用字体文件和匹配方式、是否开 kern、画了哪些效果、因总开关或单项关闭而跳过的效果、没画的效果和近似项）。
+   - `--text-renderer auto`（默认）：装了 `uharfbuzz` + `freetype-py` 用 `freetype`（HarfBuzz 排版，FreeType 不做 hinting、直接填充轮廓，描边用圆角外扩的轮廓描边）；否则有 `skia-python` 用 `skia`（Skia 轮廓路径）；也可显式指定 `freetype` 或 `skia`。所需的包缺了就报错退出，不会换渲染器，也没有 Pillow 文字路径。报告 `text_renderer` 记 `requested`、`used`、参数，以及旧格式导出日志的 `legacy_v1_text_attrs` 数量和 `legacy_v1_nodes` 名单（这些节点照常渲染，但只有一个样式片段、不知道效果总开关，stderr 也会警告）；逐条细节在 `dynamic_text_render_info`（所用字体文件和匹配方式、是否开 kern、画了哪些效果、因总开关或单项关闭而跳过的效果、没画的效果和近似项）。
    - 参数解读：字形在文字空间（pt）排版后整体乘图层变换，字号和行距随之缩放；按样式片段取字体、字号、颜色和行距，不是整层一个字号；行距取该行最大值（自动行距 = `auto_leading_pct` × 字号，默认 1.2）；`effects_visible` 为 false 或效果 `enabled: false` 时不画；`kerning: manual` 且没有手动字距对时关闭 OpenType `kern`，`metrics` / `optical` 时打开（optical 只用字体字距对近似）；`tracking` 按 tracking/1000 em 加到每个字形；描边按圆角外扩轮廓，投影按距离、角度、大小、扩展画在下面，外发光同理；颜色叠加改填充色。
    - **经验值，未广泛验证**：`--mixed-leading-k`（默认 0.86）——后一行最大字号比上一行大时，PS 会把这一行再往下推，约为字号增量 × k。只在少量两行混排样本上拟合，不是 PS 公开规则；换字体或排版对不上时先调这个值。`--snap-glyph-origin`（默认开，`--no-snap-glyph-origin` 关闭）——把每个字形的笔位取整到整像素再光栅化；在实测样本上明显更接近 PS（见 10.5），但同样只是观察，不是文档化行为。
-   - 不支持、会记入 `approximations` 的：变形文字、段落文字自动换行、仿粗体/仿斜体、字符水平/垂直缩放、渐变描边、非正常混合模式、颜色叠加以外的内部效果。找不到字体时用后备字体并标出（`fonts[*].match: fallback`），这时文字误差没有参考价值。`--fonts-dir` 指向设计所用字体（Windows 用户安装的字体通常在 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`）。
+   - 不支持、会记入 `approximations` 的：变形文字、段落文字自动换行、仿粗体/仿斜体、字符水平/垂直缩放、渐变描边、非正常混合模式、颜色叠加以外的内部效果。找不到某条文字的字体、或某个字形加载失败时，`validate` 报错退出（`error.type: text_render_failed`，消息里带节点名），不跳过、不换字体也不换渲染器。`--fonts-dir` 指向设计所用字体（Windows 用户安装的字体通常在 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`）。
 
 `Image.paste(..., mask=)` 不是正确的 Porter-Duff over。预览文字复现不了 PS 自己的光栅化、混合模式和效果算法，带文字的指标残差集中在文字本身属于预期。
 
@@ -696,7 +696,7 @@ Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、�
 | 同上，`mixed_leading_k = 0`（不做混排行距修正） | 24.6 dB | — |
 | 同上 + 字形笔位取整（1.3.0 默认） | **42.8 dB** | **35.2 dB** |
 | HarfBuzz + Skia 路径 + 笔位取整 | 40.2 dB | 33.3 dB |
-| Pillow 退回路径（正确参数，无排版） | 26.4 dB | 21.1 dB |
+| Pillow（正确参数，无排版；1.3.1 已删除该路径） | 26.4 dB | 21.1 dB |
 
 整板 `validate`（同一批切图，`diff_text_rendered` 为整图 PSNR；文字框内为只算动态文字框）：
 
@@ -706,7 +706,7 @@ Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、�
 | 1.3.0，旧导出日志（v1 文字属性） | 26.63 dB | 17.0 dB | 47.29 dB |
 | 1.3.0，v2 文字属性，`freetype` | **44.83 dB** | **38.0 dB** | 47.29 dB |
 | 1.3.0，v2，`skia` | 44.21 dB | 36.8 dB | 47.29 dB |
-| 1.3.0，v2，`pillow` | 34.14 dB | 24.4 dB | 47.29 dB |
+| 1.3.0，v2，`pillow`（1.3.1 已删除） | 34.14 dB | 24.4 dB | 47.29 dB |
 | 1.3.0，v2，`freetype --no-snap-glyph-origin` | 37.00 dB | 27.5 dB | 47.29 dB |
 
 要点：
