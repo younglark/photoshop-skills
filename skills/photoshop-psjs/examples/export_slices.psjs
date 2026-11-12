@@ -93,50 +93,159 @@ function rgbHex(c) {
   return "#" + h(r) + h(g) + h(b);
 }
 
-function strokeFromFX(desc) {
-  const fx = desc && desc.layerEffects;
-  if (!fx) return null;
-  const lists = [];
-  if (fx.frameFXMulti) lists.push(...fx.frameFXMulti);
-  else if (fx.frameFX) lists.push(fx.frameFX);
-  for (const e of lists) {
-    if (!e || e.enabled === false) continue;
-    return {
-      enabled: true,
-      position: (e.style && e.style._value) || e.style || null,
-      size: val(e.size),
-      color: e.color ? rgbHex(e.color) : null,
-      opacity: val(e.opacity),
-      mode: (e.mode && e.mode._value) || e.mode || null
-    };
+// Photoshop layerEffects keys -> engine_effects type names (see text_render.py).
+const PS_EFFECT_TYPES = {
+  frameFX: "Stroke", dropShadow: "DropShadow", outerGlow: "OuterGlow", innerShadow: "InnerShadow",
+  innerGlow: "InnerGlow", solidFill: "ColorOverlay", gradientFill: "GradientOverlay",
+  patternFill: "PatternOverlay", chromeFX: "Satin", bevelEmboss: "BevelEmboss"
+};
+const STROKE_POSITIONS = { outsetFrame: "outside", insetFrame: "inside", centeredFrame: "center" };
+
+function enumVal(x) {
+  if (x && typeof x === "object" && "_value" in x) return x._value;
+  return (x == null) ? null : x;
+}
+
+function unitOpacity(v) {
+  const n = val(v);
+  if (n == null) return null;
+  return Math.max(0, Math.min(1, n > 1 ? n / 100 : n));
+}
+
+// Every present effect with its own enabled flag; effects_visible is the layer's master switch.
+function effectsFromDesc(desc) {
+  const fx = (desc && desc.layerEffects) || {};
+  const visible = (desc && desc.layerFXVisible != null) ? !!desc.layerFXVisible : true;
+  const globalAngle = (desc && desc.globalAngle != null) ? val(desc.globalAngle) : 90;
+  const out = [];
+  for (const key of Object.keys(fx)) {
+    const base = key.endsWith("Multi") ? key.slice(0, -5) : key;
+    if (!PS_EFFECT_TYPES[base]) continue;
+    const list = Array.isArray(fx[key]) ? fx[key] : [fx[key]];
+    for (const e of list) {
+      if (!e || typeof e !== "object" || e.present === false) continue;
+      const item = { type: PS_EFFECT_TYPES[base], enabled: e.enabled !== false };
+      if (e.mode) item.blend_mode = String(enumVal(e.mode)).toLowerCase();
+      if (e.color) item.color = rgbHex(e.color);
+      if (e.opacity != null) item.opacity = unitOpacity(e.opacity);
+      if (base === "frameFX") {
+        item.size = val(e.size);
+        const st = enumVal(e.style) || "outsetFrame";
+        item.position = STROKE_POSITIONS[st] || st;
+        item.fill_type = enumVal(e.paintType) || "solidColor";
+      } else if (base === "dropShadow" || base === "innerShadow") {
+        item.size = val(e.blur);
+        item.distance = val(e.distance);
+        item[base === "dropShadow" ? "spread" : "choke"] = val(e.chokeMatte);
+        item.use_global_light = !!e.useGlobalAngle;
+        item.angle = e.useGlobalAngle ? globalAngle : val(e.localLightingAngle);
+      } else if (base === "outerGlow" || base === "innerGlow") {
+        item.size = val(e.blur);
+        item[base === "outerGlow" ? "spread" : "choke"] = val(e.chokeMatte);
+      }
+      out.push(item);
+    }
+  }
+  return { visible: visible, effects: out };
+}
+
+// Legacy single stroke field: only when the layer's effects are visible and the stroke is enabled.
+function strokeFromEffects(fxInfo) {
+  if (!fxInfo.visible) return null;
+  for (const e of fxInfo.effects) {
+    if (e.type !== "Stroke" || !e.enabled) continue;
+    return { enabled: true, position: e.position, size: e.size, color: e.color || null,
+             opacity: e.opacity, mode: e.blend_mode || null };
   }
   return null;
 }
 
+// dynamic_text attributes, text_attrs_version 2 (references/slicing.md). Mirrors
+// text_attrs_from_descriptor() in text_render.py. size / size_px are device pixels
+// (transform applied); size_pt / leading_pt are Photoshop text-space points.
 function parseText(desc) {
   const tk = desc && desc.textKey;
   if (!tk) return null;
   const content = (typeof tk.textKey === "string") ? tk.textKey : (tk.text || "");
-  const ranges = tk.textStyleRange || [];
-  const st = (ranges[0] && ranges[0].textStyle) || {};
-  const para = ((tk.paragraphStyleRange || [])[0] || {}).paragraphStyle || {};
-  const transform = tk.transform || {};
-  const sy = (transform.yy != null) ? transform.yy : 1;
-  const sizeRaw = val(st.size);
+  const tf = tk.transform || {};
+  const m = { xx: tf.xx != null ? tf.xx : 1, xy: tf.xy || 0, yx: tf.yx || 0, yy: tf.yy != null ? tf.yy : 1 };
+  const sx = Math.hypot(m.xx, m.xy) || 1;
+  const sy = Math.hypot(m.yx, m.yy) || 1;
+  const runs = (tk.textStyleRange || []).map((r) => {
+    const st = r.textStyle || {};
+    const sizePt = val(st.size);
+    const implied = val(st.impliedFontSize);
+    const leadPt = val(st.leading);
+    const impliedLead = val(st.impliedLeading);
+    const autoLead = (st.autoLeading == null) ? true : !!st.autoLeading;
+    return {
+      from: r.from || 0,
+      to: r.to || 0,
+      font: st.fontPostScriptName || st.fontName || null,
+      size_pt: sizePt,
+      size_px: (implied != null) ? implied : (sizePt != null ? sizePt * sy : null),
+      color: st.color ? rgbHex(st.color) : "#000000",
+      tracking: st.tracking != null ? val(st.tracking) : 0,
+      auto_leading: autoLead,
+      leading_pt: autoLead ? null : leadPt,
+      leading_px: autoLead ? null : ((impliedLead != null) ? impliedLead : (leadPt != null ? leadPt * sy : null)),
+      baseline_shift_pt: val(st.baselineShift) || 0,
+      faux_bold: !!st.syntheticBold,
+      faux_italic: !!st.syntheticItalic,
+      horizontal_scale: st.horizontalScale != null ? st.horizontalScale : 100,
+      vertical_scale: st.verticalScale != null ? st.verticalScale : 100,
+      auto_kern: enumVal(st.autoKern) || "manual"
+    };
+  });
+  const paragraphs = (tk.paragraphStyleRange || []).map((p) => {
+    const ps = p.paragraphStyle || {};
+    return {
+      from: p.from || 0, to: p.to || 0,
+      align: enumVal(ps.align) || "left",
+      auto_leading_pct: ps.autoLeadingPercentage != null ? val(ps.autoLeadingPercentage) : null
+    };
+  });
+  const kerns = Array.from(new Set(runs.map((r) => String(r.auto_kern)))).sort();
+  const shapes = tk.textShape || [];
+  let shape = "point";
+  let boxPt = null;
+  if (shapes.length && enumVal(shapes[0].char) === "box") {
+    shape = "box";
+    const b = shapes[0].bounds;
+    if (b) boxPt = { left: val(b.left), top: val(b.top), right: val(b.right), bottom: val(b.bottom) };
+  }
+  const fxInfo = effectsFromDesc(desc);
+  const first = runs[0] || {};
   const click = tk.textClickPoint;
+  const warp = tk.warp ? enumVal(tk.warp.warpStyle) : null;
   return {
+    text_attrs_version: 2,
     content: content,
-    font: st.fontPostScriptName || st.fontName || null,
-    size: (sizeRaw != null) ? sizeRaw * sy : null,
-    color: st.color ? rgbHex(st.color) : null,
-    alignment: (para.align && para.align._value) || para.align || null,
-    tracking: st.tracking != null ? val(st.tracking) : null,
-    leading: st.leading != null ? val(st.leading) : null,
-    auto_leading: st.autoLeading != null ? st.autoLeading : null,
-    stroke: strokeFromFX(desc),
+    font: first.font || null,
+    size: (first.size_px != null) ? first.size_px : null,
+    size_pt: (first.size_pt != null) ? first.size_pt : null,
+    color: first.color || null,
+    alignment: paragraphs.length ? paragraphs[0].align : null,
+    tracking: (first.tracking != null) ? first.tracking : null,
+    leading: (first.leading_pt != null) ? first.leading_pt : null,
+    leading_px: (first.leading_px != null) ? first.leading_px : null,
+    auto_leading: (first.auto_leading != null) ? first.auto_leading : null,
+    stroke: strokeFromEffects(fxInfo),
     opacity: (desc.opacity != null) ? (val(desc.opacity) / 255) : null,
+    fill_opacity: (desc.fillOpacity != null) ? (val(desc.fillOpacity) / 255) : null,
     click_point: click ? { horizontal: val(click.horizontal), vertical: val(click.vertical) } : null,
-    transform: transform
+    transform: { xx: m.xx, xy: m.xy, yx: m.yx, yy: m.yy, tx: tf.tx || 0, ty: tf.ty || 0 },
+    scale: { x: sx, y: sy },
+    runs: runs,
+    paragraphs: paragraphs,
+    kerning: kerns.length === 1 ? kerns[0] : (kerns.length ? "mixed" : "manual"),
+    manual_kerning_ranges: (tk.kerningRange || []).length,
+    anti_alias: tk.antiAlias ? enumVal(tk.antiAlias) : null,
+    warp: (warp && warp !== "warpNone") ? warp : null,
+    shape: shape,
+    box_bounds_pt: boxPt,
+    effects_visible: fxInfo.visible,
+    layer_effects: fxInfo.effects
   };
 }
 

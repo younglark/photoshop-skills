@@ -65,7 +65,7 @@ python slicing_helper.py prepare --psd design.psb --out-dir out [--artboard <画
 python slicing_helper.py flatten --manifest out/manifest.json
 python slicing_helper.py preview --manifest out/manifest.json --out out/preview_annotated.png [--ref out/full_render.png]
 python slicing_helper.py build-layout --manifest out/manifest.json --export-log out/export_log.json --slices-dir out/slices --out out/layout.json
-python slicing_helper.py validate --layout out/layout.json --slices-dir out/slices --full-render out/full_render.png --out-dir out/validate [--fonts-dir <字体目录>]
+python slicing_helper.py validate --layout out/layout.json --slices-dir out/slices --full-render out/full_render.png --out-dir out/validate [--fonts-dir <字体目录>] [--text-renderer auto|freetype|skia|pillow]
 #   validate 末尾写出 preview_exported_annotated.png / preview_exported_vs_ps.png（最终交付图）
 # flatten / build-layout / validate 自动读取 manifest 旁的 group_effects.json，也可用 --group-effects 指定
 # 可选：关键词草稿，只写 draft_manifest.json，不能代替 agent 编写的 manifest
@@ -82,12 +82,16 @@ python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画�
 python3 -m venv .venv
 # Windows：.venv\Scripts\activate    POSIX：source .venv/bin/activate
 pip install "psd-tools[composite]" pillow numpy
+# 可选：校验预览里的动态文字（HarfBuzz 排版 + FreeType 填充轮廓）
+pip install uharfbuzz freetype-py
+# 可选：--text-renderer skia 时再装
+pip install skia-python
 # 之后一律用该环境的解释器调用助手，例如：
 #   .venv\Scripts\python.exe examples/slicing_helper.py prepare ...
 #   .venv/bin/python examples/slicing_helper.py prepare ...
 ```
 
-若工作区附近已有装好这些包的 venv，直接用它的 `python`，不必再装一份。需要的包：`psd-tools`、Pillow、numpy；预览合成与九宫格分析还要 `scipy`（已包含在 `psd-tools[composite]` 里）。
+若工作区附近已有装好这些包的 venv，直接用它的 `python`，不必再装一份。需要的包：`psd-tools`、Pillow、numpy；预览合成与九宫格分析还要 `scipy`（已包含在 `psd-tools[composite]` 里）。`uharfbuzz` + `freetype-py` 可选，只影响 `validate` 里动态文字的预览；没装时退回 Pillow，`validate_report.json` 的 `text_renderer.fallback_reason` 会写明，不会静默降级。
 
 打开 PSD/PSB 时传入 `ParseLimits`。已在 **psd-tools 1.26.1** 核实的签名是：
 
@@ -266,7 +270,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 }
 ```
 
-`dynamic_text` 的 `text` 在导出时由 Photoshop 补全（内容、字体 PostScript 名、字号、颜色、描边、对齐、`click_point` 为相对整份文档的百分比）。
+`dynamic_text` 的 `text` 在导出时由 Photoshop 补全（内容、字体 PostScript 名、字号、颜色、描边、对齐、`click_point` 为相对整份文档的百分比；从 1.3.0 起还有样式片段、变换缩放后的像素字号和行距、字距方式、抗锯齿方式、图层效果及其开关，字段见第 8 节「dynamic_text 文字属性」）。
 
 ### 5.1 示例：双页签开关 + 底栏导航
 
@@ -551,19 +555,53 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 - `effect_groups` / `effect_issues`：参与检查的带效果组，以及组效果被悄悄丢掉的部件（应为空）。
 - 坐标是画板像素（1x）。各引擎导入器自己写，不在本 skill 里。
 
+### dynamic_text 文字属性（`text`，`text_attrs_version: 2`）
+
+`export_slices.psjs` 的 `parseText()` 从图层描述符写出，`build-layout` 原样带入并补派生字段（`text_render.complete_text_attrs()`；只加不删）。Python 侧 `text_render.text_attrs_from_descriptor()` 与它逐字段一致，可用于已持有 batchPlay 描述符的流程。
+
+单位约定：**px** 是画板像素（已乘文字图层变换），**pt** 是 Photoshop 文字空间的点（未乘变换）。文字图层常带缩放变换，例如 29.74 pt × 1.345 = 40 px，所以字号和行距都必须乘变换，不能直接把 pt 当像素用。
+
+| 字段 | 含义 |
+| --- | --- |
+| `content` | 文本，换行为 `\r`（PS 原样） |
+| `font` / `size` / `color` / `alignment` / `tracking` | 第一个样式片段的值；`size` 为 px（v1 起就是乘过 y 缩放的值） |
+| `size_pt` | 第一个片段的 pt 字号 |
+| `leading` / `leading_px` / `auto_leading` | 第一个片段的行距：`leading` 为 **pt**（与 v1 含义相同，未乘变换），`leading_px` 为 px；`auto_leading: true` 时两者为 null |
+| `transform` / `scale` | 变换矩阵 `xx, xy, yx, yy, tx, ty`；`scale.x/y` 为矩阵两轴的缩放 |
+| `click_point` | 文字锚点（点文字为首行基线起点），相对整份文档的百分比 |
+| `runs[]` | 样式片段：`from`、`to`（字符下标，含换行）、`font`、`size_pt`、`size_px`、`color`、`tracking`（1/1000 em）、`auto_leading`、`leading_pt`、`leading_px`、`baseline_shift_pt`、`faux_bold`、`faux_italic`、`horizontal_scale`、`vertical_scale`、`auto_kern` |
+| `paragraphs[]` | 段落片段：`from`、`to`、`align`、`auto_leading_pct` |
+| `kerning` | `manual` / `metrics` / `optical`；片段不一致时为 `mixed` |
+| `manual_kerning_ranges` | 手动字距对的数量（字距对本身不导出） |
+| `anti_alias` | PS 抗锯齿方式，如 `antiAliasPlatformGray`、`antiAliasSharp`、`antiAliasCrisp`、`antiAliasStrong`、`antiAliasSmooth` |
+| `warp` / `shape` / `box_bounds_pt` | 变形样式（无变形为 null）；`point` 点文字或 `box` 段落文字及其文字框（pt） |
+| `opacity` / `fill_opacity` | 图层不透明度与填充不透明度（0–1） |
+| `effects_visible` | 图层效果总开关（PS 的 `layerFXVisible`）；false 时所有效果都不画 |
+| `layer_effects[]` | 文字图层上**所有存在的**效果，各带 `enabled`；类型名与 `engine_effects` 相同（`Stroke` 带 `size`、`position` outside/inside/center、`fill_type`；`DropShadow` 带 `size`、`distance`、`spread`、已解析全局光的 `angle`；`OuterGlow` 带 `size`、`spread`） |
+| `stroke` | 兼容字段：仅在 `effects_visible` 且描边启用时给出，否则为 null（1.2.0 及以前不看总开关） |
+
+旧版导出日志（无 `text_attrs_version`，即 v1）仍可用：只有一个样式片段，`leading` 按 pt 乘 y 缩放，描边按 `stroke` 字段。`validate` 报告的 `text_renderer.legacy_v1_text_attrs` 给出这类节点数；想要更接近的文字预览，用新版 `export_slices.psjs` 重新导出。
+
 `tab_group` / `navbar` 默认视为互斥：预览某个子项的 `selected` 时，兄弟项改用 `normal`（或 `off`）。
 
 ---
 
 ## 9. 校验
 
-1. **默认状态**：只拼 `default: true` 的部件（即 PSD 里当前显示的那一态，加上始终可见的 chrome），用 src-over（`Image.alpha_composite`）叠回画板，与 Photoshop 整图比像素差 / CIEDE2000 ΔE。同时报告 Pillow 渲染动态文字后的数字、以及遮罩动态文字区域后的数字，并列出误差最大的 10 条。再检查漏切、重名、空图。
+1. **默认状态**：只拼 `default: true` 的部件（即 PSD 里当前显示的那一态，加上始终可见的 chrome），用 src-over（`Image.alpha_composite`）叠回画板，与 Photoshop 整图比像素差 / CIEDE2000 ΔE。同时报告画上动态文字近似后的数字（`diff_text_rendered`）、以及遮罩动态文字区域后的数字（`diff_text_masked`），并列出误差最大的 10 条。再检查漏切、重名、空图。**判断切图精度只看遮罩后的指标**；带文字的数字只说明预览和效果图有多像。
 2. **引擎效果**：`effect_mode: engine` 的部件，投影 / 外发光按 Pillow 近似画在部件下面（alpha → 按角度/距离偏移 → 扩展后高斯模糊 → 颜色/不透明度，普通混合），报告列在 `engine_effects_emulated`。描边、内阴影、叠加等无法模拟的，按估计的 `effect_bounds` 把外圈（内部效果则整框）从遮罩指标里去掉，列在 `engine_effects_unemulated`。`issues` 里的 `group_effect_lost` 表示选了带效果组的子层却既没烘焙也没写 `engine_effects`，必须修。
 3. **复用实例**：每个带 `reuse_of` 的默认态节点，在其可见框内（去掉动态文字与无法模拟的效果区域）比 PS 整图与拼图。MAE > `--reuse-tol-mae`（默认 4）或差值 >16 的像素占比 > `--reuse-tol-pct`（默认 1%）时记为 `reuse_mismatch`（含实例名、区域、指标和 `validate/reuse/<名>.png` 对比图）；`reuse_accepted` 的改记 `reuse_mismatch_accepted`。逐实例数据在 `reuse_checked`。
 4. **交替状态**：对每个交互组件的非默认状态（含仅存在于 `missing` 中的状态），按「共用部件 + 该状态部件」拼图，互斥组的兄弟项切到对应态，写出 `validate/states/<component_id>_<state>.png`。只对真正缺失的、按设计随状态变化的零件画红框并标 `missing`。这些预览**不**和默认态整图比 PSNR（对不上是正常的）。
 5. **导出后标注预览（最终交付）**：用实际导出的 PNG 按布局 JSON 拼默认态（同上，含引擎效果近似），再按审核预览的样式画标注：每个切图按 `visible_bounds` 画框、规范名、九宫格线、类型和 `fx:baked` / `fx:engine`，复用实例的标签后缀为 `→ <共享名>`。写出 `validate/preview_exported_annotated.png` 和 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注），路径记在报告的 `exported_preview`。把它们交给用户。
 
-`Image.paste(..., mask=)` 不是正确的 Porter-Duff over。Pillow 无法复现 PS 的混合模式、文字 hinting 和描边，遮罩后若残差集中在重叠层或文字本身，属于预期。
+6. **动态文字预览**（[examples/text_render.py](../examples/text_render.py)）：只是近似，不是 Photoshop 的文字引擎，也不是目标引擎的渲染。要像素一致的文字，让 Photoshop 栅格化文字图层（或临时显示后导出带字整图）做底图；要和上线一致，用目标引擎按同一份布局 JSON 出图。
+
+   - `--text-renderer auto`（默认）：装了 `uharfbuzz` + `freetype-py` 用 `freetype`（HarfBuzz 排版，FreeType 不做 hinting、直接填充轮廓，描边用圆角外扩的轮廓描边）；否则有 `skia-python` 用 `skia`（Skia 轮廓路径）；都没有就退回 `pillow`。也可显式指定。报告 `text_renderer` 记 `requested`、`used`、`fallback_reason`、参数和逐条退回；逐条细节在 `dynamic_text_render_info`（所用字体文件和匹配方式、是否开 kern、画了哪些效果、因总开关或单项关闭而跳过的效果、没画的效果和近似项）。
+   - 参数解读：字形在文字空间（pt）排版后整体乘图层变换，字号和行距随之缩放；按样式片段取字体、字号、颜色和行距，不是整层一个字号；行距取该行最大值（自动行距 = `auto_leading_pct` × 字号，默认 1.2）；`effects_visible` 为 false 或效果 `enabled: false` 时不画；`kerning: manual` 且没有手动字距对时关闭 OpenType `kern`，`metrics` / `optical` 时打开（optical 只用字体字距对近似）；`tracking` 按 tracking/1000 em 加到每个字形；描边按圆角外扩轮廓，投影按距离、角度、大小、扩展画在下面，外发光同理；颜色叠加改填充色。
+   - **经验值，未广泛验证**：`--mixed-leading-k`（默认 0.86）——后一行最大字号比上一行大时，PS 会把这一行再往下推，约为字号增量 × k。只在少量两行混排样本上拟合，不是 PS 公开规则；换字体或排版对不上时先调这个值。`--snap-glyph-origin`（默认开，`--no-snap-glyph-origin` 关闭）——把每个字形的笔位取整到整像素再光栅化；在实测样本上明显更接近 PS（见 10.5），但同样只是观察，不是文档化行为。
+   - 不支持、会记入 `approximations` 的：变形文字、段落文字自动换行、仿粗体/仿斜体、字符水平/垂直缩放、渐变描边、非正常混合模式、颜色叠加以外的内部效果。找不到字体时用后备字体并标出（`fonts[*].match: fallback`），这时文字误差没有参考价值。`--fonts-dir` 指向设计所用字体（Windows 用户安装的字体通常在 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`）。
+
+`Image.paste(..., mask=)` 不是正确的 Porter-Duff over。预览文字复现不了 PS 自己的光栅化、混合模式和效果算法，带文字的指标残差集中在文字本身属于预期。
 
 ---
 
@@ -644,3 +682,39 @@ Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、�
 | 校验 | 约 12.7 秒。漏切 / 重名 / 空图：0。按 PSD 绘制顺序拼默认态后，遮罩动态文字：MAE 0.076，PSNR **46.24 dB**，mean ΔE **0.047**（与 10.2 / 10.3 一致）。Pillow 文字全图：PSNR 23.39 dB，mean ΔE 1.041。另写出 4 张交替状态预览（右侧页签 normal、左侧页签 selected、中间导航 selected、右侧导航 normal），只供目视，不和默认整图比 PSNR。 |
 
 要点：默认态数字要和以前对齐，清单条目必须按 PSD 自下而上的顺序绘制；`flatten` / `build-layout` 在提供 `layer_tree` 时会排这个序。顺序不对时（例如把页签中缝画在高亮下面），遮罩 PSNR 会掉到约 38 dB。
+
+### 10.5 动态文字预览渲染（1.3.0，另一份列表界面副本）
+
+样本：一块 1080×2340 列表界面画板上的 19 条动态文字。拉丁字母，单行或两行（两行为小字号标签 + 大字号数字混排），同一字体族的两种字重，文字图层都带约 1.345 的缩放变换；9 条带可见的描边或投影，另有几条的描边被图层效果总开关隐藏。抗锯齿 18 条为 `antiAliasPlatformGray`，1 条为 `antiAliasSharp`。基准是让 Photoshop 把每条文字图层单独栅格化（效果关、开各一张）。时间为 Asia/Shanghai（UTC+8）。
+
+逐条文字（只算有字的像素，叠在 50% 灰上比 PSNR）：
+
+| 渲染 | 无效果 | 带效果（9 条） |
+|------|--------|----------------|
+| 1.2.0 Pillow（旧参数解读） | 17.2 dB | 16.4 dB |
+| 正确参数 + HarfBuzz + FreeType，亚像素笔位 | 28.7 dB | 23.5 dB |
+| 同上，`mixed_leading_k = 0`（不做混排行距修正） | 24.6 dB | — |
+| 同上 + 字形笔位取整（1.3.0 默认） | **42.8 dB** | **35.2 dB** |
+| HarfBuzz + Skia 路径 + 笔位取整 | 40.2 dB | 33.3 dB |
+| Pillow 退回路径（正确参数，无排版） | 26.4 dB | 21.1 dB |
+
+整板 `validate`（同一批切图，`diff_text_rendered` 为整图 PSNR；文字框内为只算动态文字框）：
+
+| 运行 | `diff_text_rendered` | 文字框内 | `diff_text_masked` |
+|------|----------------------|----------|--------------------|
+| 1.2.0（Pillow） | 25.07 dB | 15.3 dB | 47.29 dB |
+| 1.3.0，旧导出日志（v1 文字属性） | 26.63 dB | 17.0 dB | 47.29 dB |
+| 1.3.0，v2 文字属性，`freetype` | **44.83 dB** | **38.0 dB** | 47.29 dB |
+| 1.3.0，v2，`skia` | 44.21 dB | 36.8 dB | 47.29 dB |
+| 1.3.0，v2，`pillow` | 34.14 dB | 24.4 dB | 47.29 dB |
+| 1.3.0，v2，`freetype --no-snap-glyph-origin` | 37.00 dB | 27.5 dB | 47.29 dB |
+
+要点：
+
+- 误差主要来自参数读错，而不是光栅化算法：行距没乘变换（45 px 被当成 33.5 px）、两行混排只用一个字号、被总开关隐藏的描边照画。
+- 混排行距系数 0.86 是在这 5 条两行样本上拟合的；取 0.75 或 1.0 时逐条 PSNR 掉到约 37 dB。
+- 本样本的手动字距为 `manual` 且没有字距对；打开 `kern` 反而掉约 2 dB。
+- v2 文字属性取自同一批图层描述符：用 `text_render.text_attrs_from_descriptor()` 解析，与新版 `export_slices.psjs` 的 `parseText()` 在全部 19 条上逐字段一致（Node 下对照）。这一轮没有重跑 Photoshop 导出。
+- 遮罩后的 47.29 dB 不变，说明改动只影响文字预览，不影响切图校验。
+- **未验证**：中文与 CJK 标点挤压、段落文字、变形文字、其它抗锯齿方式、仿粗体、渐变描边、macOS 上的 Photoshop 光栅化。笔位取整和混排行距系数都只在这一份样本上成立。
+

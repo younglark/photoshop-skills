@@ -3,7 +3,9 @@
 """Agent slicing helper: infer a manifest, annotate a preview, build layout JSON, validate.
 
 Requires: psd-tools, Pillow, numpy, and scipy (or psd-tools[composite]) for
-preview compositing and nine-slice analysis. Prefer a project virtualenv; do
+preview compositing and nine-slice analysis. Optional: uharfbuzz + freetype-py
+(or skia-python) for the dynamic_text preview in validate (text_render.py);
+without them validate falls back to Pillow and says so in validate_report.json. Prefer a project virtualenv; do
 not install packages into the system Python. Open large documents with
 ``PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))``
 (psd-tools 1.26+: ``ParseLimits.max_objects`` defaults to 1_000_000; ``None``
@@ -33,6 +35,9 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import text_render  # noqa: E402  (sibling module; optional deps are imported lazily inside)
 
 try:
     from psd_tools import PSDImage
@@ -2735,6 +2740,8 @@ def cmd_build_layout(args):
             else:
                 kind = "image"
         text = item.get("text") or entry.get("text")
+        if kind == "dynamic_text" and isinstance(text, dict):
+            text = text_render.complete_text_attrs(text)
         node = {
             "id": name,
             "name": name,
@@ -2814,6 +2821,9 @@ def cmd_build_layout(args):
             "anchor is the center of logical_bounds; pivot is normalized (0.5, 0.5).",
             "Nodes with reuse_of share one image (image = <reuse_of>.png); each instance keeps its own bounds.",
             "Engine importers are out of scope for this schema.",
+            "dynamic_text text: size / size_px / leading_px are device pixels (layer transform applied); "
+            "size_pt / leading / leading_pt are Photoshop text-space points. text_attrs_version 2 adds runs, "
+            "paragraphs, kerning, anti_alias, effects_visible and layer_effects (references/slicing.md).",
         ],
     }
     out = Path(args.out)
@@ -2960,75 +2970,37 @@ def load_font_named(name, size, fonts_dir=None):
     return load_font(size)
 
 
-def draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin):
-    """Approximate a dynamic_text node with Pillow. Not a PS typography emulator."""
+def draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin, text_opts=None):
+    """Approximate a dynamic_text node (see text_render.py). Not a PS typography emulator.
+
+    *text_opts*: {"renderer": auto|freetype|skia|pillow, "mixed_leading_k", "snap_glyph_origin", ...}.
+    The returned info names the renderer actually used and any fallback reason.
+    """
     text = node.get("text") or {}
-    content = (text.get("content") or "").replace("\r", "\n")
+    content = (text.get("content") or "")
     if not content or not str(content).strip():
         return canvas, {"name": node["name"], "skipped": "empty"}
-    size = text.get("size") or 24
-    font = load_font_named(text.get("font"), size, fonts_dir)
-    opacity = text.get("opacity")
-    alpha = int(round((opacity if opacity is not None else 1) * 255)) if (opacity is None or opacity <= 1) else int(round(opacity / 100.0 * 255))
-    color = hex_to_rgba(text.get("color") or "#ffffff", alpha)
-    stroke = text.get("stroke") or {}
-    stroke_w = 0
-    stroke_fill = None
-    if stroke and stroke.get("enabled") is not False and stroke.get("size"):
-        stroke_w = max(0, int(round(float(stroke.get("size") or 0))))
-        sop = stroke.get("opacity")
-        if sop is None:
-            sa = 255
-        elif sop <= 1:
-            sa = int(round(sop * 255))
-        else:
-            sa = int(round(sop / 100.0 * 255))
-        stroke_fill = hex_to_rgba(stroke.get("color") or "#000000", sa)
-    align = str(text.get("alignment") or "left").lower()
-    if "center" in align:
-        anchor = "ms"
-    elif "right" in align:
-        anchor = "rs"
-    else:
-        anchor = "ls"
-    ox, oy = art_origin
-    dw, dh = doc_size if doc_size and all(doc_size) else (None, None)
-    cp = text.get("click_point") or {}
-    if cp and cp.get("horizontal") is not None and dw:
-        ax = cp["horizontal"] / 100.0 * dw - ox
-        ay = cp["vertical"] / 100.0 * dh - oy
-    else:
-        box = node.get("logical_bounds") or node.get("visible_bounds") or {}
-        ax = (box.get("left", 0) + box.get("right", 0)) / 2.0
-        ay = box.get("bottom", 0)
-        if "center" not in align:
-            ax = box.get("left", ax)
-    lines = content.split("\n")
-    leading = text.get("leading")
-    if leading:
-        line_h = float(leading)
-    else:
-        line_h = float(size) * 1.2
-    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-    for i, line in enumerate(lines):
-        y = ay + i * line_h
-        kwargs = {"font": font, "fill": color, "anchor": anchor}
-        if stroke_w:
-            kwargs["stroke_width"] = stroke_w
-            kwargs["stroke_fill"] = stroke_fill
-        try:
-            draw.text((ax, y), line, **kwargs)
-        except TypeError:
-            draw.text((ax, y), line, font=font, fill=color)
-    return Image.alpha_composite(canvas, layer), {
-        "name": node["name"],
-        "xy": [round(ax, 2), round(ay, 2)],
-        "anchor": anchor,
-        "rendered": True,
-        "font": text.get("font"),
-        "size": size,
-    }
+    opts = dict(text_opts or {})
+    requested = opts.pop("renderer", "auto")
+    bounds = node.get("logical_bounds") or node.get("visible_bounds") or {}
+    try:
+        im, xy, info = text_render.render_text(
+            text, renderer=requested, fonts_dir=fonts_dir, doc_size=doc_size,
+            art_origin=art_origin, bounds=bounds, options=opts,
+        )
+    except Exception as exc:  # never lose the whole validate on one odd text layer
+        if requested == "pillow":
+            raise
+        warn(f"text render failed for {node.get('name')} ({exc}); retrying with pillow")
+        im, xy, info = text_render.render_text(
+            text, renderer="pillow", fonts_dir=fonts_dir, doc_size=doc_size,
+            art_origin=art_origin, bounds=bounds, options=opts,
+        )
+        info["fallback_reason"] = f"{requested} renderer raised {type(exc).__name__}: {exc}"
+    info = {"name": node["name"], "rendered": im is not None, "xy": list(xy), **info}
+    if im is not None:
+        canvas = alpha_over(canvas, im, xy)
+    return canvas, info
 
 
 def _fx_opacity(eff):
@@ -3137,7 +3109,8 @@ def unemulated_effect_mask(layout, cw, ch):
     return mask, listed
 
 
-def recomposite(layout, slices_dir, canvas_size, render_text=False, fonts_dir=None, emulate_effects=True):
+def recomposite(layout, slices_dir, canvas_size, render_text=False, fonts_dir=None, emulate_effects=True,
+                text_opts=None):
     w, h = canvas_size
     canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     placed = []
@@ -3148,7 +3121,7 @@ def recomposite(layout, slices_dir, canvas_size, render_text=False, fonts_dir=No
     for node in layout["nodes"]:
         if node["kind"] == "dynamic_text":
             if render_text:
-                canvas, info = draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin)
+                canvas, info = draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin, text_opts)
                 placed.append(info)
             continue
         image_name = node.get("image")
@@ -3666,10 +3639,24 @@ def cmd_validate(args):
     issues.extend(find_silent_effect_loss(layout["nodes"], effect_groups))
 
     fonts_dir = getattr(args, "fonts_dir", None)
+    text_opts = {
+        "renderer": getattr(args, "text_renderer", None) or "auto",
+        "mixed_leading_k": getattr(args, "mixed_leading_k", None),
+        "snap_glyph_origin": getattr(args, "snap_glyph_origin", None),
+    }
+    text_opts = {k: v for k, v in text_opts.items() if v is not None}
+    renderer_used, renderer_fallback = text_render.select_renderer(text_opts["renderer"])
+    if renderer_fallback:
+        warn(f"dynamic_text renderer fallback: {renderer_fallback}")
     default_layout = layout_with_nodes(layout, default_nodes(layout))
     rec_masked, placed_masked = recomposite(default_layout, slices_dir, (w, h), render_text=False)
     rec_text, placed_text = recomposite(
-        default_layout, slices_dir, (w, h), render_text=True, fonts_dir=fonts_dir
+        default_layout, slices_dir, (w, h), render_text=True, fonts_dir=fonts_dir, text_opts=text_opts
+    )
+    text_infos = [p for p in placed_text if "renderer" in p or p.get("skipped")]
+    text_v1 = sum(
+        1 for n in default_layout["nodes"]
+        if n.get("kind") == "dynamic_text" and not text_render.is_v2(n.get("text") or {})
     )
 
     cw, ch = min(full.width, w), min(full.height, h)
@@ -3693,7 +3680,7 @@ def cmd_validate(args):
     rec_masked.save(out_dir / "recomposite_text_masked.png")
     write_side_by_side(
         ref, rec_t, out_dir / "validate_side_by_side.jpg",
-        ("Photoshop full render", "Recomposite + Pillow text", "|diff| x3"),
+        ("Photoshop full render", f"Recomposite + {renderer_used} text (approx.)", "|diff| x3"),
     )
     write_side_by_side(
         ref, rec_m, out_dir / "validate_side_by_side_masked.jpg",
@@ -3718,7 +3705,24 @@ def cmd_validate(args):
         "default_node_count": len(default_layout["nodes"]),
         "by_kind": dict(Counter(n["kind"] for n in default_layout["nodes"])),
         "fonts_dir": fonts_dir,
+        "text_renderer": {
+            "requested": text_opts["renderer"],
+            "used": renderer_used,
+            "fallback_reason": renderer_fallback,
+            "options": {k: v for k, v in dict(text_render.DEFAULT_OPTIONS, **text_opts).items() if k != "renderer"},
+            "per_text_fallbacks": [
+                {"name": p.get("name"), "used": p.get("renderer"), "reason": p.get("fallback_reason")}
+                for p in text_infos if p.get("renderer") and p.get("renderer") != renderer_used
+            ],
+            "legacy_v1_text_attrs": text_v1,
+        },
         "dynamic_text_rendered": rendered,
+        "dynamic_text_render_info": [
+            {k: v for k, v in p.items() if k in (
+                "name", "renderer", "fallback_reason", "fonts", "runs", "kern", "kern_reason",
+                "effects_drawn", "effects_skipped_hidden", "effects_unrendered", "approximations", "skipped")}
+            for p in text_infos
+        ],
         "diff_text_rendered": m_text_all,
         "diff_text_rendered_excluding_text_boxes": m_text_masked_regions,
         "diff_text_masked": m_masked,
@@ -3740,12 +3744,18 @@ def cmd_validate(args):
         ],
         "notes": [
             "Default-state recomposite only (parts currently shown in the PSD) is compared to the PS render.",
-            "diff_text_rendered: slices + Pillow approximation of dynamic_text vs the PS render.",
+            "diff_text_rendered: slices + an approximation of dynamic_text (text_renderer.used) vs the PS render. "
+            "Preview text is approximate; judge slice accuracy by diff_text_masked.",
+            "text_renderer: freetype = HarfBuzz + FreeType (no hinting), skia = HarfBuzz + Skia paths, "
+            "pillow = fallback when uharfbuzz / freetype-py are missing (see fallback_reason).",
+            "legacy_v1_text_attrs > 0: the export log predates text_attrs_version 2 (single run, no effect "
+            "visibility); re-export with the current export_slices.psjs for a closer text preview.",
             "diff_text_masked: slices only; dynamic_text boxes and unemulated engine-effect areas excluded from the metrics.",
             "effect_mode 'engine': DropShadow / OuterGlow are approximated with Pillow (normal blend, Gaussian blur); "
             "other engine effects are listed in engine_effects_unemulated and masked.",
             "preview_exported_annotated.png is drawn on the recomposite of the exported PNGs; show it to the user as the final check.",
-            "Pillow cannot emulate Photoshop blend modes, layer effects on type, or hinting; residual error there is expected.",
+            "Photoshop's own text rasteriser, blend modes and effect algorithms are not reproduced; residual error "
+            "on dynamic_text is expected. For pixel-identical text, rasterise the text layers in Photoshop.",
             "visible_bounds use post-trim insets (before.left - after.left) so the PNG origin matches the tight opaque box.",
             "Alternate states are written to validate/states/<component>_<state>.png for visual check, not measured against the default render.",
         ],
@@ -3816,6 +3826,14 @@ def build_parser():
     s.add_argument("--full-render", required=True)
     s.add_argument("--out-dir", required=True)
     s.add_argument("--fonts-dir", default=None, help="Directory of TTF/OTF files used to approximate dynamic_text")
+    s.add_argument("--text-renderer", choices=list(text_render.RENDERERS), default="auto",
+                   help="dynamic_text preview renderer: auto (freetype, else skia, else pillow), freetype, skia, pillow")
+    s.add_argument("--mixed-leading-k", type=float, default=None,
+                   help="Extra drop of a following line, as a fraction of its font-size increase (empirical, default 0.86)")
+    s.add_argument("--snap-glyph-origin", dest="snap_glyph_origin", action="store_true", default=None,
+                   help="Round glyph pen positions to whole pixels (default on)")
+    s.add_argument("--no-snap-glyph-origin", dest="snap_glyph_origin", action="store_false",
+                   help="Keep sub-pixel glyph positions")
     s.add_argument("--group-effects", default=None, help="Optional group_effects.json for the silent effect-loss check")
     s.add_argument("--reuse-tol-mae", type=float, default=4.0, help="Per-instance MAE above which a reused image is a reuse_mismatch")
     s.add_argument("--reuse-tol-pct", type=float, default=1.0, help="Per-instance %% of pixels with diff > 16 above which it is a reuse_mismatch")

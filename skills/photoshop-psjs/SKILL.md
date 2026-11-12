@@ -2,10 +2,10 @@
 name: photoshop-psjs
 description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psjs): write, launch, poll, and verify document create/edit/export from an agent. Covers executeAsModal, batchPlay, file tokens, doc-id safety, and psjs vs UXP plugins vs ExtendScript/JSX. Chinese triggers: psjs驱动Photoshop, UXP脚本, batchPlay, executeAsModal, 用脚本改PSD, 从命令行跑Photoshop脚本, 图层样式脚本, 导出切片, 切图工作流, 九宫格, 切图清单, 布局JSON. Do NOT use for UXP plugin/panel or MCP-bridge development, ExtendScript/JSX-only work, or read-only PSD inspection that psd-tools/ag-psd can do without launching Photoshop."
 license: MIT-0
-compatibility: "Requires Adobe Photoshop 2023 (v23.5+) or later with UXP scripting, on Windows or macOS. The optional slicing helper needs Python 3 with psd-tools, Pillow and numpy."
+compatibility: "Requires Adobe Photoshop 2023 (v23.5+) or later with UXP scripting, on Windows or macOS. The optional slicing helper needs Python 3 with psd-tools, Pillow and numpy; uharfbuzz + freetype-py (or skia-python) are optional for a closer dynamic-text preview."
 metadata:
   author: younglark
-  version: "1.2.0"
+  version: "1.3.0"
   homepage: https://github.com/younglark/photoshop-skills
 ---
 
@@ -222,7 +222,7 @@ await out.write(JSON.stringify(log, null, 2));
 
 把界面切成游戏引擎可导入的 1x PNG，并产出一份按组件语义组织、引擎无关的中间布局 JSON。细节、schema、命名、识别方法和实测见 [references/slicing.md](references/slicing.md)。**先按该文文首的决策树走：** 打开材料（含组上的图层效果，并为每个受影响的部件选效果方式）→ 识别组件 → 分清共用与随状态变化的零件 → 区分变体与旧稿 → 只给会变的零件记 missing → 判断重复元素是否复用 → 停在审核门闩。脚本与 Python 助手： [examples/export_slices.psjs](examples/export_slices.psjs)、[examples/slicing_helper.py](examples/slicing_helper.py)、[examples/naming_rules.example.json](examples/naming_rules.example.json)、[examples/export_config.example.json](examples/export_config.example.json)。
 
-**Python 环境：** 用项目 venv 运行助手，不要把包装进系统 Python。需要 `psd-tools[composite]`、Pillow、numpy。打开大文档用已核实的 `PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))`（不要猜参数，也不要设置 `ParseLimits.max_objects` 类属性）。详见 slicing.md「Python 环境」。
+**Python 环境：** 用项目 venv 运行助手，不要把包装进系统 Python。需要 `psd-tools[composite]`、Pillow、numpy；校验预览里的动态文字另建议装可选的 `uharfbuzz freetype-py`（HarfBuzz + FreeType，未装时退回 Pillow，报告 `text_renderer` 会写明原因）。打开大文档用已核实的 `PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))`（不要猜参数，也不要设置 `ParseLimits.max_objects` 类属性）。详见 slicing.md「Python 环境」。
 
 **分工：** 助手只准备材料（默认状态整图、带 id 的逐层裁切图、含隐藏层的图层树、九宫格候选）。跑这个 skill 的 agent 同时阅读这些材料，编写 manifest：组件、部件、规范名、类型、状态和层级。`--rules` 只是可选的项目命名约定。`infer` 仍可产出关键词草稿（`draft_manifest.json`），但不能代替 agent 的清单。
 
@@ -233,7 +233,7 @@ await out.write(JSON.stringify(log, null, 2));
 3. **审核门闩**：`flatten` + `preview` 产出标注预览和 JSON（标签带 `fx:baked` / `fx:engine`，引擎效果画出估计范围，便于用户在审核时改方式；`flatten` 会在 `effect_issues` 里列出会丢效果的部件）。用户改 JSON 确认；`status` 在确认前保持 `pending_review`。`preview` 会跳过倒置或空的包围盒并给出警告，不要因此中断。
 4. **导出（`.psjs`）**：脚本只硬编码一个 `CONFIG_URL`，从作业 JSON 读路径。按 `layer_id` / `select_ids` 导出 1x PNG：`baked` 选组，效果烘焙进图；`engine` 选子层合并，图里不含组效果。带 `reuse_of` 的实例只导出一张共享图，其余实例只记边界。`dynamic_text` 不出图，只导出文本属性；`art_text` 出图。隐藏状态层会临时显示再恢复，文档不保存。
 5. **布局 JSON**：按组件语义组织（如 `screen > tab_group > tab > state > part`），源图层 id/路径仅供对照。记录可见尺寸（含烘焙效果）、逻辑尺寸（不含效果）、锚点、九宫格、文本属性和图片；`engine` 部件另带 `effect_mode`、`engine_effects`、`effect_reason` 和估计的 `effect_bounds`；复用实例的 `image` 都指向共享图，各自保留位置和边界。各引擎导入器自己写。
-6. **校验**：只把**默认状态**按 src-over 拼回去，和 PS 整图比像素差 / CIEDE2000 ΔE（含 Pillow 动态文字版与遮罩版，并列误差最大的 10 条）。`engine` 部件的投影/外发光用 Pillow 近似画上；其它引擎效果（描边等）的估计范围从遮罩指标里去掉，并列入 `engine_effects_unemulated`。再为每个交替状态写出预览图供目视检查。同时检查漏切、重名、空图，组效果被悄悄丢掉的部件（`group_effect_lost`），以及复用后与设计不一致的实例（`reuse_mismatch`，附逐实例对比图；按复用规则拆开或交用户决定后重跑）。
+6. **校验**：只把**默认状态**按 src-over 拼回去，和 PS 整图比像素差 / CIEDE2000 ΔE（含动态文字近似渲染版与遮罩版，并列误差最大的 10 条）。动态文字按布局 JSON 的文字属性（按变换缩放的字号/行距、样式片段、效果开关、字距方式）用 HarfBuzz + FreeType 近似画出，只是预览，不等于 Photoshop 或引擎的效果；**切图精度看遮罩文字后的指标**，要像素一致的文字就让 Photoshop 栅格化文字图层导出。`engine` 部件的投影/外发光用 Pillow 近似画上；其它引擎效果（描边等）的估计范围从遮罩指标里去掉，并列入 `engine_effects_unemulated`。再为每个交替状态写出预览图供目视检查。同时检查漏切、重名、空图，组效果被悄悄丢掉的部件（`group_effect_lost`），以及复用后与设计不一致的实例（`reuse_mismatch`，附逐实例对比图；按复用规则拆开或交用户决定后重跑）。
 7. **跑完再收尾**：确认后，导出、`build-layout`、`validate` 要连续跑完；写出 `export_log.json` 不算完成，读过 `validate/validate_report.json`（`issues`、遮罩 PSNR / ΔE）才算完成。`validate` 最后会用**实际导出的 PNG** 拼出默认态，再画上与审核预览同样的标注（按 `visible_bounds` 的框、规范名、九宫格线、类型与效果方式，复用实例加 `→ <共享名>`），写出 `validate/preview_exported_annotated.png` 和与 PS 整图并排的 `validate/preview_exported_vs_ps.png`。**这两张图是交给用户的最终成果**，连同报告要点一起给。导出前的审核预览流程不变。长命令设超时并写日志，失败就读日志修正重跑，不要静默停下。
 
 沿用第 2–5 节的规则：每条描述符 `_options.dialogOptions = "silent"`，轮询结果 JSON，文档 id 守卫，不加额外 CLI 参数，顶层 `await`，`executeAsModal`，需要时 `suspendHistory`。

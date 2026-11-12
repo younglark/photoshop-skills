@@ -20,6 +20,8 @@ OpenClaw and other agents that load `SKILL.md`.
 - An agent that can run shell commands on the machine where Photoshop is installed.
 - For the slicing workflow (optional): Python 3 with `psd-tools`, `Pillow`, `numpy`
   (`scipy` for some gradient composites).
+  Optional: `uharfbuzz` + `freetype-py` (or `skia-python`) for a closer dynamic-text
+  preview in `validate`; without them it falls back to Pillow and says so in the report.
 
 ## Install
 
@@ -55,6 +57,7 @@ skills/
       run_job.psjs           # minimal guarded job script template
       export_slices.psjs     # slice export template
       slicing_helper.py      # prepare / preview / build-layout / validate helper
+      text_render.py         # dynamic-text preview renderer (HarfBuzz + FreeType / Skia / Pillow)
       *.example.json         # config templates
 ```
 
