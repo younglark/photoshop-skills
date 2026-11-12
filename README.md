@@ -21,7 +21,7 @@ OpenClaw and other agents that load `SKILL.md`.
 - For the slicing workflow (optional): Python 3 with `psd-tools`, `Pillow`, `numpy`
   (`scipy` for some gradient composites).
   `validate` also **requires** `uharfbuzz` + `freetype-py` (or `uharfbuzz` + `skia-python`
-  with `--text-renderer skia`) when the layout has dynamic text:
+  with `--text-renderer skia`) when the layout has dynamic_text or static_text:
   `pip install uharfbuzz freetype-py`. Without them it exits with an error before drawing
   any text; there is no fallback renderer.
 

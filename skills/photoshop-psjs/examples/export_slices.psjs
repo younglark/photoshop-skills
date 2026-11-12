@@ -161,7 +161,11 @@ function strokeFromEffects(fxInfo) {
   return null;
 }
 
-// dynamic_text attributes, text_attrs_version 2 (references/slicing.md). Mirrors
+function isAttrText(kind) {
+  return kind === "dynamic_text" || kind === "static_text";
+}
+
+// dynamic_text / static_text attributes, text_attrs_version 2 (references/slicing.md). Mirrors
 // text_attrs_from_descriptor() in text_render.py. size / size_px are device pixels
 // (transform applied); size_pt / leading_pt are Photoshop text-space points.
 function parseText(desc) {
@@ -548,13 +552,13 @@ try {
           item.logical_bounds = bounds.logical;
           item.visible_bounds = bounds.visible;
           item.boundsNoEffects = bounds.logical;
-          if (entry.kind === "dynamic_text" || desc.textKey) {
+          if (isAttrText(entry.kind) || desc.textKey) {
             item.text = parseText(desc) || entry.text || null;
           }
           if (entry.reuse_of) item.reuse_of = entry.reuse_of;
-          // Reused instance (export_png === false): record bounds only; build-layout
-          // places the shared image (exported once by its source instance) here.
-          if (entry.kind === "dynamic_text" || entry.export_png === false) {
+          // Reused instance (export_png === false) or attribute-only text: record
+          // bounds / text attrs only; build-layout places shared images, if any.
+          if (isAttrText(entry.kind) || entry.export_png === false) {
             if (entry.export_png === false) item.bounds_only = true;
             item.ok = true;
             if (revealed && revealed.length) {

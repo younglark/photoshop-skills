@@ -55,7 +55,7 @@
 - 头像框：很可能复用。**头像图本身是运行时动态内容**，必须和框分开：单独一个 part，`role: avatar`、`placeholder: true`，导出 PSD 里的示意图作占位，绝不和框烘焙在一起。PSD 里头像和框在同一层或同一个智能对象里时，agent 先按下文的手段拆；拆不开或拆后与效果图对不上，才写 `reuse_decisions`（`type: split_avatar`）交用户，此时默认值不能是合并导出。
 - 面板 / 弹窗 / 卡片 / 按钮底：通常是外框（可九宫）+ 标题栏条（横向三宫或并入外框）+ 内嵌底块（可九宫）+ 不可拉伸的装饰（纹理、半调圆点、光斑），按这些层次分别导出，装饰单独成图叠放，不落在九宫可拉伸区。
 - 道具/图标格、同款按钮、按名次的奖牌/徽章（少量固定集合）、货币图标、进度条的底和填充：典型的可复用资源。
-- 玩家名、分数、数字：`dynamic_text`。
+- 玩家名、分数、数字：`dynamic_text`（只出属性）。固定标签只带纯色填充和描边/投影时用 `static_text`（只出属性）；仅当有引擎画不了的效果（渐变、斜面浮雕、变形、图案叠加、绸缎、内发光等）或已栅格化时才用 `art_text` 出图。文字条目都不得带九宫边距。
 
 `reuse_candidates.json` 里每组带 `evidence.ui_role_prior`（`type: ui_role_prior`，按图层名/路径关键词猜的角色和先验：`likely_reuse`、`small_fixed_set`、`dynamic_placeholder`），以及 `avatar_merge_suspects`（疑似头像与框合并的层）。这些只是证据，由 agent 判断。
 
@@ -191,7 +191,7 @@ python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画�
 python3 -m venv .venv
 # Windows：.venv\Scripts\activate    POSIX：source .venv/bin/activate
 pip install "psd-tools[composite]" pillow numpy
-# 必装（布局里有 dynamic_text 时 validate 需要）：HarfBuzz 排版 + FreeType 填充轮廓；scipy 用于描边/扩展
+# 必装（布局里有 dynamic_text / static_text 时 validate 需要）：HarfBuzz 排版 + FreeType 填充轮廓；scipy 用于描边/扩展
 pip install uharfbuzz freetype-py scipy
 # 只在 --text-renderer skia 时需要
 pip install uharfbuzz skia-python
@@ -200,7 +200,7 @@ pip install uharfbuzz skia-python
 #   .venv/bin/python examples/slicing_helper.py prepare ...
 ```
 
-若工作区附近已有装好这些包的 venv，直接用它的 `python`，不必再装一份。需要的包：`psd-tools`、Pillow、numpy；预览合成与九宫格分析还要 `scipy`（已包含在 `psd-tools[composite]` 里）。布局里有 `dynamic_text` 时，`validate` **必须**有 `uharfbuzz` + `freetype-py`（或 `uharfbuzz` + `skia-python`）。缺了就在画文字前失败：退出码 2，stderr 和 `validate_report.json` 的 `error`（`type: text_renderer_unavailable`、`message`、`install`）给出原因和安装命令，不写拼图和指标。没有回退渲染器。
+若工作区附近已有装好这些包的 venv，直接用它的 `python`，不必再装一份。需要的包：`psd-tools`、Pillow、numpy；预览合成与九宫格分析还要 `scipy`（已包含在 `psd-tools[composite]` 里）。布局里有 `dynamic_text` 或 `static_text` 时，`validate` **必须**有 `uharfbuzz` + `freetype-py`（或 `uharfbuzz` + `skia-python`）。缺了就在画文字前失败：退出码 2，stderr 和 `validate_report.json` 的 `error`（`type: text_renderer_unavailable`、`message`、`install`）给出原因和安装命令，不写拼图和指标。没有回退渲染器。
 
 打开 PSD/PSB 时传入 `ParseLimits`。已在 **psd-tools 1.26.1** 核实的签名是：
 
@@ -288,7 +288,7 @@ PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))
 
    单个特殊样式的列表行（例如只有一行画了 self 高亮）只是**这一行的一个实例**，不是「每一行都该有 self / 这一行还缺 normal」。不要给其它行推断缺失的 self，也不要给这一行推断缺失的 normal，除非设计里每行都画出了成套状态变体。
 5. **导出目标要看效果在哪一层。** 图层效果（如投影、外发光、描边）经常加在代表该元素的**父组**上，内层叶子（智能对象、形状）自身没有效果。选 `layer_id` / `select_ids` 时，检查最近的父组（或代表该元素的组）：组有效果而叶子没有，按第 1 节前的「组效果：烘焙还是引擎绘制」选 `effect_mode`。`baked` 选组 id，可见框用组的含效果框；`engine` 选子层，并写 `engine_effects`。组 id 没有裁切图时同样如此。例如某个图标组 `<item>` 上有 DropShadow、内层叶子没有：`baked` 写该组 id；`engine` 写子层 id + `"effect_mode": "engine"` + 抄自 `effect_params` 的 `engine_effects`。不能只写子层而什么都不记。
-6. 底图、高亮、图标、文字始终是独立 `parts`。类型仍是 `image` | `nine_slice` | `dynamic_text` | `art_text`。可变文案（分数、名字、倒计时、1–2 位名次）用 `dynamic_text`（只出属性，不出图）；带效果的固定标签（页签名、导航名、标题）用 `art_text`（出图）。
+6. 底图、高亮、图标、文字始终是独立 `parts`。类型是 `image` | `nine_slice` | `dynamic_text` | `static_text` | `art_text`。可变文案（分数、名字、倒计时、1–2 位名次）用 `dynamic_text`（只出属性，不出图）。固定文案（页签名、导航名、标题等）默认也只出属性：纯色填充，可带描边和/或投影，用 `static_text`，参数写在 `text.layer_effects` / `text.stroke`，由引擎绘制。只有引擎画不了时才用 `art_text` 出图：渐变填充或渐变叠加、斜面浮雕、变形（或非仿射变换）、图案叠加、绸缎、内发光、内阴影、外发光、颜色叠加，以及已栅格化或非文字图层；未知效果同样保守地出图。渐变/图案描边也出图。`dynamic_text`、`static_text`、`art_text` 都不得带九宫边距（不要对文字图做九宫分析）。
 7. 重复元素按「重复元素：复用还是分开」处理：逻辑上该复用的导出一张、各实例用 `reuse_of` 引用；与设计对不上的拆开；有证据却对不上的交用户决定。头像图与头像框分开（先自己拆，拆不开才问）；frame 类元素按视觉层次拆成九宫 / 三宫 / 装饰部件。全部 1x。
 
 ---
@@ -401,7 +401,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 }
 ```
 
-`dynamic_text` 的 `text` 在导出时由 Photoshop 补全（内容、字体 PostScript 名、字号、颜色、描边、对齐、`click_point` 为相对整份文档的百分比；从 1.3.0 起还有样式片段、变换缩放后的像素字号和行距、字距方式、抗锯齿方式、图层效果及其开关，字段见第 8 节「dynamic_text 文字属性」）。
+`dynamic_text` 和 `static_text` 的 `text` 在导出时由 Photoshop 补全（内容、字体 PostScript 名、字号、颜色、描边、对齐、`click_point` 为相对整份文档的百分比；从 1.3.0 起还有样式片段、变换缩放后的像素字号和行距、字距方式、抗锯齿方式、图层效果及其开关，字段见第 8 节「属性文字」）。`static_text` 的描边和投影也在这些字段里，供引擎绘制。
 
 ### 5.1 示例：双页签开关 + 底栏导航
 
@@ -447,7 +447,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
                     {
                       "name": "main_tab_left_selected",
                       "role": "text",
-                      "kind": "art_text",
+                      "kind": "static_text",
                       "layer_id": 211,
                       "hidden": false,
                       "source_name": "Left on"
@@ -460,7 +460,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
                     {
                       "name": "main_tab_left_normal",
                       "role": "text",
-                      "kind": "art_text",
+                      "kind": "static_text",
                       "layer_id": 212,
                       "hidden": true,
                       "source_name": "Left off"
@@ -482,7 +482,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
                     {
                       "name": "main_tab_right_normal",
                       "role": "text",
-                      "kind": "art_text",
+                      "kind": "static_text",
                       "layer_id": 221,
                       "hidden": false,
                       "source_name": "Right off"
@@ -495,7 +495,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
                     {
                       "name": "main_tab_right_selected",
                       "role": "text",
-                      "kind": "art_text",
+                      "kind": "static_text",
                       "layer_id": 222,
                       "hidden": true,
                       "source_name": "Right on"
@@ -551,7 +551,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
                     {
                       "name": "main_img_item_a_selected",
                       "role": "text",
-                      "kind": "art_text",
+                      "kind": "static_text",
                       "layer_id": 312,
                       "hidden": false
                     },
@@ -634,7 +634,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 }
 ```
 
-要点：高亮是 `tab_group` 上的共享部件，没有和某个页签的文案烤在一起。导航图标若在各状态下不变，放在该 `nav_item` 的 `shared` 里，文件名不加 `_selected` / `_normal`。`missing` 只记录按设计会变却没画出来的零件（例如某项没有 selected 底或高亮），不要因为「没有另一态的图标」去标共用图标。忽略旧稿不会让共用图标变成 missing。`flatten` 之后，隐藏的状态部件会带 `hidden: true`，导出脚本会临时显示再恢复；共用部件会出现在每一个状态的预览里。
+要点：页签和导航上的固定文案是 `static_text`（示例里只有描边/投影能画的效果，只出属性）。若标题带渐变、斜面浮雕或变形，才用 `art_text` 出图。文字部件不要写 `nine_slice`。高亮是 `tab_group` 上的共享部件，没有和某个页签的文案烤在一起。导航图标若在各状态下不变，放在该 `nav_item` 的 `shared` 里，文件名不加 `_selected` / `_normal`。`missing` 只记录按设计会变却没画出来的零件（例如某项没有 selected 底或高亮），不要因为「没有另一态的图标」去标共用图标。忽略旧稿不会让共用图标变成 missing。`flatten` 之后，隐藏的状态部件会带 `hidden: true`，导出脚本会临时显示再恢复；共用部件会出现在每一个状态的预览里。
 
 ---
 
@@ -651,7 +651,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 ## 7. 导出
 
-[examples/export_slices.psjs](../examples/export_slices.psjs) 只硬编码一个 `CONFIG_URL`，从作业 JSON 读路径（见 [export_config.example.json](../examples/export_config.example.json)）。按 `layer_id`（及 `select_ids` 里的剪贴层）导出 1x PNG，图层效果烘焙进图；带 `reuse_of` 的实例只导出一张共享图（见下）。`dynamic_text` 不出图，只写文本属性；`art_text` 出图。
+[examples/export_slices.psjs](../examples/export_slices.psjs) 只硬编码一个 `CONFIG_URL`，从作业 JSON 读路径（见 [export_config.example.json](../examples/export_config.example.json)）。按 `layer_id`（及 `select_ids` 里的剪贴层）导出 1x PNG，图层效果烘焙进图；带 `reuse_of` 的实例只导出一张共享图（见下）。`dynamic_text` 和 `static_text` 不出图，只写文本属性（含描边、投影）；`art_text` 出图。
 
 带 `reuse_of` 的条目由 `flatten` 分配：源实例（名称等于共享名的那条，否则第一条默认态实例）导出 `<共享名>.png`（`image_name`），其余实例 `export_png: false`，脚本只记录它们的边界，不再出图。
 
@@ -681,15 +681,15 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 ```
 
 - `components`：与 manifest 相同的语义树，但每个 part 已补上导出后的 `image`、`visible_bounds`、`logical_bounds`、`nine_slice`、文本属性。
-- `nodes`：扁平列表，便于引擎遍历和校验放置。每条含 `name`、`kind`、`component_id`、`part_role`、`state`、`default`、`hidden`、`visible_bounds`（含烘焙效果，画板坐标）、`logical_bounds`（不含效果）、`anchor`（逻辑框中心）、`pivot`（0.5, 0.5）、`nine_slice`、`image`、`text`。有 `effect_mode` 时附 `effect_mode`、`effect_reason`；`engine` 还附 `engine_effects` 和 `effect_bounds`（逻辑框按各效果的距离/角度/大小外扩的**估计**范围，`effect_bounds_estimated: true`，不是 PS 的精确框），此时 `logical_bounds` = `visible_bounds` = 图片框。`components` 里对应的 part 也带这些字段。
+- `nodes`：扁平列表，便于引擎遍历和校验放置。每条含 `name`、`kind`、`component_id`、`part_role`、`state`、`default`、`hidden`、`visible_bounds`（含烘焙效果，画板坐标）、`logical_bounds`（不含效果）、`anchor`（逻辑框中心）、`pivot`（0.5, 0.5）、`nine_slice`、`image`、`text`。`dynamic_text` / `static_text` 的 `image` 和 `nine_slice` 均为 null；`art_text` 出图但 `nine_slice` 也必须为 null。`validate` 若发现文字条目带九宫边距，记 `text_has_nine_slice`。有 `effect_mode` 时附 `effect_mode`、`effect_reason`；`engine` 还附 `engine_effects` 和 `effect_bounds`（逻辑框按各效果的距离/角度/大小外扩的**估计**范围，`effect_bounds_estimated: true`，不是 PS 的精确框），此时 `logical_bounds` = `visible_bounds` = 图片框。`components` 里对应的 part 也带这些字段。
 - 复用：带 `reuse_of` 的节点 `image` 都是 `<共享名>.png`，九宫格取源实例；非源实例的 `visible_bounds` = 源实例可见框按两者逻辑框原点的差平移。顶层附 `reuse_decisions`。
 - `blend_mode`：part 的混合模式原样带出。两张拆法的框是 `normal`。`split_fix` 记修法（`two_part_approx` / `frame_from_merged` / `overlay_part`）。
 - `effect_groups` / `effect_issues`：参与检查的带效果组，以及组效果被悄悄丢掉的部件（应为空）。
 - 坐标是画板像素（1x）。各引擎导入器自己写，不在本 skill 里。
 
-### dynamic_text 文字属性（`text`，`text_attrs_version: 2`）
+### 属性文字（`dynamic_text` / `static_text` 的 `text`，`text_attrs_version: 2`）
 
-`export_slices.psjs` 的 `parseText()` 从图层描述符写出，`build-layout` 原样带入并补派生字段（`text_render.complete_text_attrs()`；只加不删）。Python 侧 `text_render.text_attrs_from_descriptor()` 与它逐字段一致，可用于已持有 batchPlay 描述符的流程。
+`dynamic_text`（运行时可变文案）和 `static_text`（引擎可绘制的固定标签）共用这套字段；描边和投影写在 `layer_effects` 以及兼容字段 `stroke` 里，由引擎按同一份布局绘制。`export_slices.psjs` 的 `parseText()` 从图层描述符写出，`build-layout` 原样带入并补派生字段（`text_render.complete_text_attrs()`；只加不删）。Python 侧 `text_render.text_attrs_from_descriptor()` 与它逐字段一致，可用于已持有 batchPlay 描述符的流程。
 
 单位约定：**px** 是画板像素（已乘文字图层变换），**pt** 是 Photoshop 文字空间的点（未乘变换）。文字图层常带缩放变换，例如 29.74 pt × 1.345 = 40 px，所以字号和行距都必须乘变换，不能直接把 pt 当像素用。
 
@@ -720,15 +720,15 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 ## 9. 校验
 
-1. **默认状态**：只拼 `default: true` 的部件（即 PSD 里当前显示的那一态，加上始终可见的 chrome），用 src-over（`Image.alpha_composite`）叠回画板，与 Photoshop 整图比像素差 / CIEDE2000 ΔE。同时报告画上动态文字近似后的数字（`diff_text_rendered`）、以及遮罩动态文字区域后的数字（`diff_text_masked`），并列出误差最大的 10 条。再检查漏切、重名、空图。**判断切图精度只看遮罩后的指标**；带文字的数字只说明预览和效果图有多像。
+1. **默认状态**：只拼 `default: true` 的部件（即 PSD 里当前显示的那一态，加上始终可见的 chrome），用 src-over（`Image.alpha_composite`）叠回画板，与 Photoshop 整图比像素差 / CIEDE2000 ΔE。同时报告画上属性文字（`dynamic_text` / `static_text`）近似后的数字（`diff_text_rendered`）、以及遮罩这些文字区域后的数字（`diff_text_masked`），并列出误差最大的 10 条。再检查漏切、重名、空图。**判断切图精度只看遮罩后的指标**；带文字的数字只说明预览和效果图有多像。
 2. **引擎效果**：`effect_mode: engine` 的部件，投影 / 外发光按 Pillow 近似画在部件下面（alpha → 按角度/距离偏移 → 扩展后高斯模糊 → 颜色/不透明度，普通混合），报告列在 `engine_effects_emulated`。描边、内阴影、叠加等无法模拟的，按估计的 `effect_bounds` 把外圈（内部效果则整框）从遮罩指标里去掉，列在 `engine_effects_unemulated`。`issues` 里的 `group_effect_lost` 表示选了带效果组的子层却既没烘焙也没写 `engine_effects`，必须修。部件带 `blend_mode` 时按对应公式叠到画布上（normal / multiply / screen / linear_burn / lighten / darken / linear_dodge；其它模式按 normal 画并在 `placed` 里记 `blend_mode_approximated_normal`）。拆分相关的 `outer_effect_into_hole`、`blend_mode_content_dependent`、`blend_mode_not_replayable` 见「拆开后拼回去对不上」。
-3. **复用实例**：每个带 `reuse_of` 的默认态节点，在其可见框内（去掉动态文字与无法模拟的效果区域）比 PS 整图与拼图。MAE > `--reuse-tol-mae`（默认 4）或差值 >16 的像素占比 > `--reuse-tol-pct`（默认 1%）时记为 `reuse_mismatch`（含实例名、区域、指标和 `validate/reuse/<名>.png` 对比图）；`reuse_accepted` 的改记 `reuse_mismatch_accepted`。逐实例数据在 `reuse_checked`。
+3. **复用实例**：每个带 `reuse_of` 的默认态节点，在其可见框内（去掉属性文字与无法模拟的效果区域）比 PS 整图与拼图。MAE > `--reuse-tol-mae`（默认 4）或差值 >16 的像素占比 > `--reuse-tol-pct`（默认 1%）时记为 `reuse_mismatch`（含实例名、区域、指标和 `validate/reuse/<名>.png` 对比图）；`reuse_accepted` 的改记 `reuse_mismatch_accepted`。逐实例数据在 `reuse_checked`。
 4. **交替状态**：对每个交互组件的非默认状态（含仅存在于 `missing` 中的状态），按「共用部件 + 该状态部件」拼图，互斥组的兄弟项切到对应态，写出 `validate/states/<component_id>_<state>.png`。只对真正缺失的、按设计随状态变化的零件画红框并标 `missing`。这些预览**不**和默认态整图比 PSNR（对不上是正常的）。
 5. **导出后标注预览（最终交付）**：用实际导出的 PNG 按布局 JSON 拼默认态（同上，含引擎效果近似），再按审核预览的样式画标注：每个切图按 `visible_bounds` 画框、规范名、九宫格线、类型和 `fx:baked` / `fx:engine`，复用实例的标签后缀为 `→ <共享名>`。写出 `validate/preview_exported_annotated.png` 和 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注），路径记在报告的 `exported_preview`。把它们交给用户。
 
-6. **动态文字预览**（[examples/text_render.py](../examples/text_render.py)）：只是近似，不是 Photoshop 的文字引擎，也不是目标引擎的渲染。要像素一致的文字，让 Photoshop 栅格化文字图层（或临时显示后导出带字整图）做底图；要和上线一致，用目标引擎按同一份布局 JSON 出图。
+6. **属性文字预览**（`dynamic_text` / `static_text`，[examples/text_render.py](../examples/text_render.py)）：只是近似，不是 Photoshop 的文字引擎，也不是目标引擎的渲染。投影按规则画出，总开关或单项关闭的效果不画；没有 Pillow 回退。要像素一致的文字，让 Photoshop 栅格化文字图层（或临时显示后导出带字整图）做底图；要和上线一致，用目标引擎按同一份布局 JSON 出图。
 
-   - `--text-renderer auto`（默认）：装了 `uharfbuzz` + `freetype-py` 用 `freetype`（HarfBuzz 排版，FreeType 不做 hinting、直接填充轮廓，描边用圆角外扩的轮廓描边）；否则有 `skia-python` 用 `skia`（Skia 轮廓路径）；也可显式指定 `freetype` 或 `skia`。所需的包缺了就报错退出，不会换渲染器，也没有 Pillow 文字路径。报告 `text_renderer` 记 `requested`、`used`、参数，以及旧格式导出日志的 `legacy_v1_text_attrs` 数量和 `legacy_v1_nodes` 名单（这些节点照常渲染，但只有一个样式片段、不知道效果总开关，stderr 也会警告）；逐条细节在 `dynamic_text_render_info`（所用字体文件和匹配方式、是否开 kern、画了哪些效果、因总开关或单项关闭而跳过的效果、没画的效果和近似项）。
+   - `--text-renderer auto`（默认）：装了 `uharfbuzz` + `freetype-py` 用 `freetype`（HarfBuzz 排版，FreeType 不做 hinting、直接填充轮廓，描边用圆角外扩的轮廓描边）；否则有 `skia-python` 用 `skia`（Skia 轮廓路径）；也可显式指定 `freetype` 或 `skia`。所需的包缺了就报错退出，不会换渲染器，也没有 Pillow 文字路径。报告 `text_renderer` 记 `requested`、`used`、参数，以及旧格式导出日志的 `legacy_v1_text_attrs` 数量和 `legacy_v1_nodes` 名单（这些节点照常渲染，但只有一个样式片段、不知道效果总开关，stderr 也会警告）；逐条细节在 `dynamic_text_render_info`（也包含 `static_text`：所用字体文件和匹配方式、是否开 kern、画了哪些效果、因总开关或单项关闭而跳过的效果、没画的效果和近似项）。
    - 参数解读：字形在文字空间（pt）排版后整体乘图层变换，字号和行距随之缩放；按样式片段取字体、字号、颜色和行距，不是整层一个字号；行距取该行最大值（自动行距 = `auto_leading_pct` × 字号，默认 1.2）；`effects_visible` 为 false 或效果 `enabled: false` 时不画；`kerning: manual` 且没有手动字距对时关闭 OpenType `kern`，`metrics` / `optical` 时打开（optical 只用字体字距对近似）；`tracking` 按 tracking/1000 em 加到每个字形；颜色叠加改填充色。
    - 1.4.0 的绘制规则（在 345 张 Photoshop 2026 金图上拟合并用验证集确认，见 10.6；默认值在 `text_render.DEFAULT_OPTIONS`）：
      - 混排行距：后一行字号更大时**不再额外下推**（`mixed_leading_k` 默认 0；1.3.x 是 0.86，在新建文字图层上被推翻）。
@@ -737,7 +737,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
      - 投影/外发光的扩展用 4 倍分辨率距离变换外扩；外发光模糊 σ = 大小 / 2.5，并读取外发光的「范围」（`inputRange`，新版 `export_slices.psjs` 导出为 `range`）。
      - 仿粗体：轮廓外扩 0.01 em，每个字形前进量加 0.03 em；仿斜体：水平错切 0.2。都只是近似（报告里记在 `approximations`），仿粗体仍有约 21 dB 的误差。
      - `--snap-glyph-origin`（默认开）在新数据上复核成立：关掉后中位数掉约 6 dB。
-   - 按图层自动选择（1.4.1 起，1.4.2 起是唯一模式，见 10.7）：段落 `leadingType` 为 `leadingAbove` 时混排行距系数取 0.86，否则取 0；图层变换不等比时不加抗锯齿 gamma。1.4.2 删除了 `--text-profile`（含 `ps2026` / `older-file`），再传会报错退出。布局里有「不同行字号不同」的文字时，`validate` 会在 stderr 提示并在报告 `text_renderer.mixed_size_line_nodes` 列出节点。`--mixed-leading-k` 仍可单独覆盖。`--text-legacy-rules` 按 1.3.x 规则画，只用于对比。`validate --psd`（或 layout 的 `source.file`）用于在描述符缺少 `leadingType` 时从 EngineData 读取。
+   - 按图层自动选择（1.4.1 起，1.4.2 起是唯一模式，见 10.7）：段落 `leadingType` 为 `leadingAbove` 时混排行距系数取 0.86，否则取 0；图层变换不等比时不加抗锯齿 gamma。1.4.2 删除了 `--text-profile`（含 `ps2026` / `older-file`），再传会报错退出。布局里有「不同行字号不同」的属性文字时，`validate` 会在 stderr 提示并在报告 `text_renderer.mixed_size_line_nodes` 列出节点。`--mixed-leading-k` 仍可单独覆盖。`--text-legacy-rules` 按 1.3.x 规则画，只用于对比。`validate --psd`（或 layout 的 `source.file`）用于在描述符缺少 `leadingType` 时从 EngineData 读取。
    - 1.4.3 的三条规则（见 10.8；默认值在 `text_render.DEFAULT_OPTIONS`，`--text-legacy-rules` 回到旧行为）：
      - 投影偏移：把已画好的图层覆盖率整体平移整像素，偏移 = 距离 × (−cos 角度, sin 角度) 四舍五入（半数远离 0，带 1e-6 容差），不再按亚像素重排字形（`shadow_offset_model`）。
      - 不应用字体的 OpenType `locl` 特性（`font_locl` 默认关）：Noto CJK 等字体在默认语言下会把 ASCII 数字换成等宽数字，Photoshop 用的是默认的比例数字。
@@ -751,6 +751,8 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 ## 10. 实测（Windows / Photoshop 2026）
 
 对象：一份多画板 UI PSB 的**副本**（未改、未保存、未关闭用户可能打开的原文档或其它未指定文档）。实测画板是一个 1080×2340 的列表界面，65 个可见元素。时间均为 Asia/Shanghai（UTC+8）。项目词表不进技能仓库，回归时用仓库外的 `--rules` 文件。
+
+1.4.8 起固定文案的分类规则已改：只带纯色填充和描边/投影的固定标签改为 `static_text`（只出属性），不再一律出图。下面 10.1–10.4 表里的类型计数（如 image 18 / nine_slice 21 / dynamic_text 22 / art_text 4）是此规则之前测的，这里不改写。按新规则，当时出图的标题、页签和导航文案多数会改判为 `static_text`。
 
 ### 10.1 第一轮（修前）
 
@@ -1051,3 +1053,15 @@ PSNR 按整张导出画布计算（括号内是合并图可见范围）。现状
 **未验证：** 换内容的参考仍是公式模拟，没有在 Photoshop 里真正换一张图再导出对照；最小二乘在颜色减淡 / 叠加等强依赖内容的模式下会差得多（那些本来就交用户）；目标引擎上只画两张 src-over 的实际效果。
 
 1.4.7：`--swap-content` 和 `representative_contents` 的 extras 在尺寸与画布不同、或占位内部含透明像素时，先裁到不透明核心（alpha ≥ 250 的包围盒），再取核心半径约 0.80 的居中近方形区域（去掉圆角透明），预乘 alpha 后用 LANCZOS 缩放到占位 alpha 包围盒，反预乘后贴回。此前把整张图（含透明四角的黑色 RGB）用非预乘 BICUBIC 拉到画布再写入占位内部，圆角黑边会漏进探针，换内容的 PSNR 会被低估；导出切片不受影响。上表「换另一真实头像」列的 dB 是旧探针算出的，这里不改写新数字。
+
+### 10.12 固定文案：引擎能画的出属性（1.4.8）
+
+此前「带效果的固定标签（页签名、导航名、标题）用 `art_text` 出图」。很多这类图层其实是普通可编辑文字，字体常规，效果只有描边或投影，引擎可以直接画；出成图既不能改多语言，还会给文字误加九宫边距。
+
+1.4.8 起：
+
+- `dynamic_text`：运行时可变文案（分数、名字、倒计时、名次），只出属性。
+- `static_text`：固定文案，且只有纯色填充和描边和/或投影；只出属性，描边/投影在 `text.layer_effects`（及 `text.stroke`），`validate` / `preview` 用与动态文字相同的 HarfBuzz+FreeType 渲染器画出（投影要画，隐藏效果不画，无 Pillow 回退）。
+- `art_text`：仅当存在引擎画不了的效果时出图——渐变填充或渐变叠加、斜面浮雕、变形或非仿射变换、图案叠加、绸缎、内发光、内阴影、外发光、颜色叠加、渐变/图案描边，以及已栅格化或非文字图层；未知效果同样出图。
+- 三种文字类型的 `nine_slice` 必须为 null。`infer` / `build-layout` 不再对文字做九宫分析；`validate` 对带九宫的文字记 `text_has_nine_slice`。
+

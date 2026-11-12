@@ -4,8 +4,9 @@
 
 Requires: psd-tools, Pillow, numpy, and scipy (or psd-tools[composite]) for
 preview compositing and nine-slice analysis. validate also needs uharfbuzz +
-freetype-py (or uharfbuzz + skia-python) whenever the layout has dynamic_text
-(text_render.py); without them it exits non-zero before drawing any text. Prefer a project virtualenv; do
+freetype-py (or uharfbuzz + skia-python) whenever the layout has
+attribute-only text (dynamic_text or static_text) (text_render.py); without them
+it exits non-zero before drawing any text. Prefer a project virtualenv; do
 not install packages into the system Python. Open large documents with
 ``PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))``
 (psd-tools 1.26+: ``ParseLimits.max_objects`` defaults to 1_000_000; ``None``
@@ -58,8 +59,59 @@ KIND_COLORS = {
     "image": (0, 170, 255),
     "nine_slice": (255, 160, 0),
     "dynamic_text": (80, 220, 80),
+    "static_text": (40, 200, 180),
     "art_text": (220, 80, 200),
 }
+
+# Attribute-only text: no PNG, engine (and validate/preview) renders from text attrs.
+ATTR_TEXT_KINDS = frozenset({"dynamic_text", "static_text"})
+# All text kinds: never receive nine_slice margins.
+TEXT_KINDS = frozenset({"dynamic_text", "static_text", "art_text"})
+
+# Effects an engine is expected to redraw for attribute-only text.
+# Conservative: only a plain-color Stroke and/or DropShadow (plus a solid fill).
+ATTR_TEXT_LAYER_EFFECTS = frozenset({"Stroke", "DropShadow"})
+# Layer effects that must be baked as art_text. Listed explicitly; unknown
+# types are also treated as unreplayable.
+UNREPLAYABLE_TEXT_EFFECTS = frozenset({
+    "GradientOverlay", "GradientFill",
+    "PatternOverlay", "PatternFill",
+    "Satin", "ChromeFX",
+    "BevelEmboss",
+    "InnerGlow",
+    "InnerShadow",
+    "OuterGlow",
+    "ColorOverlay", "SolidFill",
+})
+# Descriptor / psd-tools aliases -> canonical type names used above.
+TEXT_EFFECT_ALIASES = {
+    "GradientFill": "GradientOverlay",
+    "PatternFill": "PatternOverlay",
+    "ChromeFX": "Satin",
+    "SolidFill": "ColorOverlay",
+    "frameFX": "Stroke",
+    "dropShadow": "DropShadow",
+    "outerGlow": "OuterGlow",
+    "innerShadow": "InnerShadow",
+    "innerGlow": "InnerGlow",
+    "solidFill": "ColorOverlay",
+    "gradientFill": "GradientOverlay",
+    "patternFill": "PatternOverlay",
+    "chromeFX": "Satin",
+    "bevelEmboss": "BevelEmboss",
+}
+_SOLID_FILL_TYPES = frozenset({
+    "solid", "color", "colour", "solidcolor", "colorfill", "solidcolorfill",
+    "foregroundcolor", "foreground", "sc", "clr",
+})
+
+
+def is_attr_text(kind) -> bool:
+    return kind in ATTR_TEXT_KINDS
+
+
+def is_text_kind(kind) -> bool:
+    return kind in TEXT_KINDS
 
 
 def enum_val(v):
@@ -313,6 +365,71 @@ def estimate_effect_bounds(logical, effects):
 # Layer tree (visible-aware)
 # ---------------------------------------------------------------------------
 
+def _dict_get(obj, *keys):
+    if not isinstance(obj, dict):
+        return None
+    for k in keys:
+        if k in obj:
+            return obj[k]
+        if isinstance(k, str):
+            for alt in (k.lower(), k.upper(), k.encode("latin-1") if k.isascii() else None):
+                if alt is not None and alt in obj:
+                    return obj[alt]
+    return None
+
+
+def attach_text_style_hints(node, layer):
+    """Best-effort warp / fill / non-affine transform hints for classify_text. Never raises."""
+    try:
+        tf = getattr(layer, "transform", None)
+        if tf is not None and isinstance(tf, (list, tuple)) and len(tf) > 6:
+            node["text_transform_non_affine"] = True
+            node["transform"] = list(tf)
+        elif tf is not None and isinstance(tf, (list, tuple)) and len(tf) >= 6:
+            node["transform"] = {
+                "xx": float(tf[0]), "xy": float(tf[1]), "yx": float(tf[2]), "yy": float(tf[3]),
+                "tx": float(tf[4]), "ty": float(tf[5]),
+            }
+        engine = getattr(layer, "engine_dict", None)
+        warp = None
+        fill_type = None
+        if isinstance(engine, dict):
+            wobj = _dict_get(engine, "Warp", "warp")
+            if wobj is None:
+                # Some psd-tools builds nest DocumentResources / typetool extras alongside EngineDict.
+                wobj = _dict_get(engine.get("DocumentResources") if isinstance(engine.get("DocumentResources"), dict) else {},
+                                 "Warp", "warp")
+            if isinstance(wobj, dict):
+                warp = _dict_get(wobj, "DeformStyle", "deformStyle", "WarpStyle", "warpStyle", "warp")
+            elif wobj not in (None, ""):
+                warp = wobj
+            # Gradient / pattern fills on the type itself (not a layer effect).
+            style = None
+            sr = _dict_get(engine, "StyleRun", "StyleSheet")
+            if isinstance(sr, dict):
+                arr = _dict_get(sr, "RunArray", "StyleSheetData")
+                if isinstance(arr, list) and arr:
+                    style = arr[0] if not isinstance(arr[0], dict) else (arr[0].get("StyleSheetData") or arr[0])
+                elif isinstance(arr, dict):
+                    style = arr
+            if isinstance(style, dict):
+                fill_type = _dict_get(style, "FillType", "fillType", "FillMethod")
+                if _dict_get(style, "GradientFill", "Gradient", "gradient"):
+                    fill_type = fill_type or "gradient"
+                if _dict_get(style, "PatternFill", "Pattern", "pattern"):
+                    fill_type = fill_type or "pattern"
+        if warp not in (None, ""):
+            name = enum_val(warp) if not isinstance(warp, (str, int, float)) else str(warp)
+            if name and name.lower() not in {"0", "none", "warpnone", "warpstylenone"}:
+                # Integer 0 is typically warpNone.
+                if not (isinstance(warp, (int, float)) and int(warp) == 0):
+                    node["warp"] = name
+        if fill_type not in (None, ""):
+            node["text_fill_type"] = enum_val(fill_type) if not isinstance(fill_type, str) else fill_type
+    except Exception:
+        pass
+
+
 def collect_layer(layer, path, depth, index_in_parent, warnings):
     name = layer.name or ""
     kind = layer_kind(layer)
@@ -379,6 +496,7 @@ def collect_layer(layer, path, depth, index_in_parent, warnings):
             node["text"] = str(text) if text is not None else None
         except Exception as exc:
             warnings.append(f"text unreadable {node['path']}: {exc}")
+        attach_text_style_hints(node, layer)
     if is_group(layer):
         # Walk hidden groups too: the agent needs hidden state layers in the tree.
         for i, child in enumerate(layer):
@@ -626,10 +744,110 @@ def normalize_text(text: str) -> str:
     return re.sub(r"[\r\n]+", " ", text or "").strip()
 
 
+def _norm_fill_type(value) -> str:
+    s = str(value or "").strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+    return s
+
+
+def _canonical_effect_type(name) -> str:
+    raw = str(name or "").strip()
+    return TEXT_EFFECT_ALIASES.get(raw, TEXT_EFFECT_ALIASES.get(raw[:1].upper() + raw[1:], raw))
+
+
+def _enabled_text_effects(node):
+    """Enabled, visible layer effects as dicts with at least ``type``.
+
+    Hidden master switch (``effects_visible is False``) or per-effect
+    ``enabled is False`` entries are omitted (they are not drawn).
+    """
+    if node.get("effects_visible") is False:
+        return []
+    text = node.get("text")
+    if isinstance(text, dict) and text.get("effects_visible") is False:
+        return []
+    params = [e for e in (node.get("effect_params") or []) if isinstance(e, dict)]
+    if not params and isinstance(text, dict):
+        params = [e for e in (text.get("layer_effects") or []) if isinstance(e, dict)]
+    if params:
+        return [e for e in params if e.get("enabled") is not False]
+    names = list(node.get("effects") or [])
+    if not names and isinstance(text, dict):
+        names = list(text.get("effects") or [])
+    return [{"type": e} for e in names if e]
+
+
+def text_bake_reasons(node) -> list:
+    """Why a fixed text layer must be exported as art_text (PNG), or empty if the engine can draw it.
+
+    Conservative: only a solid-color fill plus Stroke and/or DropShadow stays attribute-only.
+    Unreplayable effects (listed in UNREPLAYABLE_TEXT_EFFECTS), unknown effects, a gradient
+    or pattern fill (text or stroke), warp, a non-affine transform, or a rasterized /
+    non-text layer are baked. Disabled or master-hidden effects are ignored.
+    """
+    reasons = []
+    kind_l = str(node.get("kind") or node.get("source_kind") or "").lower()
+    is_text = node.get("is_text")
+    if is_text is False or (is_text is None and kind_l and kind_l not in {"", "type", "text", "typetool", "type tool"}):
+        # Live Type layers stay editable; pixels / smart objects / shapes are baked.
+        if is_text is False or any(tok in kind_l for tok in ("pixel", "smart", "shape", "solid", "raster")):
+            reasons.append("rasterized_or_non_text")
+
+    warp = node.get("warp")
+    text = node.get("text")
+    if isinstance(text, dict):
+        warp = warp if warp not in (None, "") else text.get("warp")
+    if warp and str(warp).lower() not in {"", "none", "warpnone", "null"}:
+        reasons.append(f"warp:{warp}")
+
+    if node.get("text_transform_non_affine") or node.get("non_affine"):
+        reasons.append("non_affine_transform")
+    tf = node.get("transform")
+    if tf is None and isinstance(text, dict):
+        tf = text.get("transform")
+    if isinstance(tf, dict):
+        extra = ("xz", "yz", "zx", "zy", "zz", "perspective", "persp")
+        if any(tf.get(k) not in (None, 0, 0.0) for k in extra):
+            reasons.append("non_affine_transform")
+    elif isinstance(tf, (list, tuple)) and len(tf) > 6:
+        reasons.append("non_affine_transform")
+
+    fill = node.get("text_fill_type") or node.get("fill_type")
+    if not fill and isinstance(text, dict):
+        fill = text.get("text_fill_type") or text.get("fill_type")
+    if fill and _norm_fill_type(fill) not in _SOLID_FILL_TYPES:
+        reasons.append(f"text_fill:{fill}")
+
+    for e in _enabled_text_effects(node):
+        typ = _canonical_effect_type(e.get("type") or e.get("name"))
+        if not typ:
+            continue
+        if typ in UNREPLAYABLE_TEXT_EFFECTS or typ not in ATTR_TEXT_LAYER_EFFECTS:
+            reasons.append(typ)
+            continue
+        if typ == "Stroke":
+            ft = e.get("fill_type")
+            if ft and _norm_fill_type(ft) not in _SOLID_FILL_TYPES:
+                reasons.append(f"stroke_fill:{ft}")
+            bm = str(e.get("blend_mode") or "normal").lower()
+            if bm not in {"normal", "none", ""}:
+                reasons.append(f"Stroke_blend:{bm}")
+        elif typ == "DropShadow":
+            bm = str(e.get("blend_mode") or "multiply").lower()
+            if bm not in {"normal", "multiply", "none", ""}:
+                reasons.append(f"DropShadow_blend:{bm}")
+    # unique, keep order
+    seen, out = set(), []
+    for r in reasons:
+        if r in seen:
+            continue
+        seen.add(r)
+        out.append(r)
+    return out
+
+
 def has_heavy_effects(node) -> bool:
-    """Typographic / decorative layer effects that should be baked as art_text."""
-    keys = ("stroke", "frame", "gradient", "shadow", "glow", "bevel")
-    return any(any(k in (e or "").lower() for k in keys) for e in (node.get("effects") or []))
+    """True when a text layer has unreplayable effects and should be baked as art_text."""
+    return bool(text_bake_reasons(node))
 
 
 def is_fixed_label(text: str, rules: NamingRules) -> bool:
@@ -666,17 +884,17 @@ def is_value_text(text: str, rules: NamingRules) -> bool:
 
 
 def classify_text(node, rules: NamingRules) -> str:
-    text = node.get("text") or ""
-    name = (node.get("name") or "").lower()
-    if any(k and k in name for k in rules.art_text_name_keywords):
-        return "art_text"
+    """dynamic_text = runtime-variable content; static_text = fixed labels the engine can draw;
+    art_text = fixed labels that must be exported as a PNG.
+    """
+    raw = node.get("text")
+    text = raw.get("content") if isinstance(raw, dict) else (raw or "")
+    # Name keywords such as "title" only mark a layer as a fixed label; they do not force a PNG.
     if is_value_text(text, rules):
         return "dynamic_text"
-    if is_fixed_label(text, rules):
-        return "art_text" if has_heavy_effects(node) else "dynamic_text"
-    if has_heavy_effects(node) and normalize_text(text) and not re.search(r"\d", normalize_text(text)):
+    if text_bake_reasons(node):
         return "art_text"
-    return "dynamic_text"
+    return "static_text"
 
 
 def text_role(path: str, rules: NamingRules) -> str | None:
@@ -693,7 +911,7 @@ def apply_pair_consistency(entries, rules: NamingRules):
     """
     groups = {}
     for entry in entries:
-        if entry.get("kind") not in {"dynamic_text", "art_text"}:
+        if entry.get("kind") not in TEXT_KINDS:
             continue
         content = normalize_text((entry.get("text") or {}).get("content") or "")
         if not content or is_value_text(content, rules):
@@ -790,7 +1008,7 @@ def infer_type_purpose_state(node, module: str, rules: NamingRules):
     purpose = purpose or find_token(name + " " + path, rules.purpose_keywords)
     state = state or find_token(name + " " + path, rules.state_keywords) or ""
     item_n = list_item_index(node.get("path") or "", rules)
-    if node.get("is_text") or node.get("kind_export") in {"dynamic_text", "art_text"}:
+    if node.get("is_text") or node.get("kind_export") in TEXT_KINDS:
         purpose = text_purpose_from_content(node.get("text") or "", name, rules) or purpose
     if item_n:
         if typ in {None, "bg", "item"} and (purpose in {None, "item", "base", "list"} or typ == "bg"):
@@ -803,7 +1021,7 @@ def infer_type_purpose_state(node, module: str, rules: NamingRules):
             purpose = f"{purpose}_item{item_n}"
     if item_n and not state and any(k and k in path for k in rules.self_row_keywords):
         state = "self"
-    if node.get("is_text") or node.get("kind_export") in {"dynamic_text", "art_text"}:
+    if node.get("is_text") or node.get("kind_export") in TEXT_KINDS:
         typ = typ or "img"
         purpose = purpose or slugify(re.sub(r"[\d.]+", " ", name)) or "label"
         if purpose in {"bg", "btn", "icon", "frame", "tab", "item", "deco"}:
@@ -1012,8 +1230,11 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings, rules=None):
         text_attrs = None
         if node.get("is_text") and not clipped:
             kind = classify_text(node, rules)
+            content = node.get("text") or ""
+            if isinstance(content, dict):
+                content = content.get("content") or ""
             text_attrs = {
-                "content": node.get("text") or "",
+                "content": content,
                 "font": None,
                 "size": None,
                 "color": None,
@@ -1021,19 +1242,23 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings, rules=None):
                 "stroke": None,
                 "opacity": (node.get("opacity") / 255.0) if isinstance(node.get("opacity"), (int, float)) else None,
                 "effects": list(node.get("effects") or []),
+                "layer_effects": list(node.get("effect_params") or []),
+                "effects_visible": node.get("effects_visible", True),
             }
+            if node.get("warp"):
+                text_attrs["warp"] = node["warp"]
 
         module = infer_module(node.get("path") or "", module_hint, rules)
         typ, purpose, state = infer_type_purpose_state({**node, "kind_export": kind}, module, rules)
-        if kind in {"dynamic_text", "art_text"} and typ not in {"img"}:
+        if kind in TEXT_KINDS and typ not in {"img"}:
             typ = "img"
         name = unique_name([module, typ, purpose, state], used)
 
         nine = None
         image = None
-        if kind not in {"dynamic_text"}:
+        if not is_text_kind(kind):
             image = try_composite(node, warnings)
-            if image is not None and kind != "art_text":
+            if image is not None:
                 nine = detect_nine_slice(image)
                 if nine:
                     kind = "nine_slice"
@@ -1055,8 +1280,13 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings, rules=None):
             "blend_mode": node.get("blend_mode"),
             "notes": [],
         }
-        if kind == "dynamic_text":
-            entry["notes"].append("dynamic_text is not rasterized; Photoshop export writes attributes only.")
+        if is_attr_text(kind):
+            entry["notes"].append(f"{kind} is not rasterized; Photoshop export writes attributes only.")
+        if kind == "art_text":
+            reasons = text_bake_reasons(node)
+            if reasons:
+                entry["art_text_reasons"] = reasons
+                entry["notes"].append("baked as art_text: " + ", ".join(reasons))
         if node.get("effects"):
             entry["notes"].append("has layer effects; psd-tools logical_bounds exclude effects.")
         if clipped:
@@ -3736,9 +3966,9 @@ def assign_reuse(entries):
     groups = {}
     for e in entries:
         e["image_name"] = e["name"]
-        e["export_png"] = e.get("kind") != "dynamic_text"
+        e["export_png"] = not is_attr_text(e.get("kind"))
         shared = e.get("reuse_of")
-        if shared and e.get("kind") != "dynamic_text":
+        if shared and not is_attr_text(e.get("kind")):
             groups.setdefault(shared, []).append(e)
     for shared, members in groups.items():
         source = next((m for m in members if m["name"] == shared), None)
@@ -3817,11 +4047,12 @@ def find_silent_effect_loss(items, effect_groups):
 
     *items* are manifest entries or layout nodes. A part is fine when it selects the
     effect group itself (or one of its ancestors), or when it has effect_mode 'engine'
-    with a non-empty engine_effects list. dynamic_text is skipped (attributes only).
+    with a non-empty engine_effects list. Attribute-only text (dynamic_text /
+    static_text) is skipped.
     """
     problems = []
     for item in items or []:
-        if item.get("kind") == "dynamic_text":
+        if is_attr_text(item.get("kind")):
             continue
         ids = _int_ids(item.get("select_ids") or ([item.get("layer_id")] if item.get("layer_id") is not None else []))
         if not ids:
@@ -4163,10 +4394,10 @@ def cmd_build_layout(args):
         export_items[item.get("name")] = item
 
     def refine_nine(entry, png_path):
+        if is_text_kind(entry.get("kind")):
+            return None
         if not png_path.exists():
             return entry.get("nine_slice")
-        if entry["kind"] in {"dynamic_text"}:
-            return None
         try:
             image = Image.open(png_path)
         except Exception:
@@ -4195,20 +4426,21 @@ def cmd_build_layout(args):
                 vis = dict(logi)
         vis_ab = _shift(vis, ox, oy) if vis else None
         logi_ab = _shift(logi, ox, oy) if logi else None
-        png_name = None if entry["kind"] == "dynamic_text" else f"{entry.get('image_name') or name}.png"
+        png_name = None if is_attr_text(entry["kind"]) else f"{entry.get('image_name') or name}.png"
         png_path = slices_dir / png_name if png_name else None
-        nine = refine_nine(entry, png_path) if png_path else None
         kind = entry["kind"]
-        if nine and kind == "image":
-            kind = "nine_slice"
-        if not nine and kind == "nine_slice":
-            # Keep the reviewed kind if insets were confirmed, else downgrade.
-            if entry.get("nine_slice"):
-                nine = entry["nine_slice"]
-            else:
-                kind = "image"
+        nine = None if is_text_kind(kind) else (refine_nine(entry, png_path) if png_path else None)
+        if not is_text_kind(kind):
+            if nine and kind == "image":
+                kind = "nine_slice"
+            if not nine and kind == "nine_slice":
+                # Keep the reviewed kind if insets were confirmed, else downgrade.
+                if entry.get("nine_slice"):
+                    nine = entry["nine_slice"]
+                else:
+                    kind = "image"
         text = item.get("text") or entry.get("text")
-        if kind == "dynamic_text" and isinstance(text, dict):
+        if is_attr_text(kind) and isinstance(text, dict):
             text = text_render.complete_text_attrs(text)
         node = {
             "id": name,
@@ -4308,9 +4540,10 @@ def cmd_build_layout(args):
             "anchor is the center of logical_bounds; pivot is normalized (0.5, 0.5).",
             "Nodes with reuse_of share one image (image = <reuse_of>.png); each instance keeps its own bounds.",
             "Engine importers are out of scope for this schema.",
-            "dynamic_text text: size / size_px / leading_px are device pixels (layer transform applied); "
+            "dynamic_text / static_text text: size / size_px / leading_px are device pixels (layer transform applied); "
             "size_pt / leading / leading_pt are Photoshop text-space points. text_attrs_version 2 adds runs, "
-            "paragraphs, kerning, anti_alias, effects_visible and layer_effects (references/slicing.md).",
+            "paragraphs, kerning, anti_alias, effects_visible and layer_effects (references/slicing.md). "
+            "Stroke and DropShadow live in text.layer_effects (and the legacy text.stroke field).",
         ],
     }
     out = Path(args.out)
@@ -4423,7 +4656,9 @@ def hex_to_rgba(s, alpha=255):
 
 
 def draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin, text_opts=None):
-    """Approximate a dynamic_text node (see text_render.py). Not a PS typography emulator.
+    """Approximate an attribute-only text node (dynamic_text / static_text; see text_render.py).
+
+    Not a PS typography emulator. Uses HarfBuzz + FreeType (or Skia); never falls back to Pillow.
 
     *text_opts*: {"renderer": auto|freetype|skia, "mixed_leading_k", "snap_glyph_origin", ...}.
     Raises text_render.TextRendererUnavailable / TextRenderError; never switches renderer
@@ -4444,9 +4679,11 @@ def draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin, text_opts=N
     except text_render.TextRendererUnavailable:
         raise
     except Exception as exc:
-        raise text_render.TextRenderError(f"dynamic_text {node.get('name')!r}: {exc}") from exc
+        raise text_render.TextRenderError(f"{node.get('kind') or 'text'} {node.get('name')!r}: {exc}") from exc
     if im is None:
-        raise text_render.TextRenderError(f"dynamic_text {node.get('name')!r}: no glyphs rendered ({info.get('skipped')})")
+        raise text_render.TextRenderError(
+            f"{node.get('kind') or 'text'} {node.get('name')!r}: no glyphs rendered ({info.get('skipped')})"
+        )
     info = {"name": node["name"], "rendered": True, "xy": list(xy), **info}
     canvas = alpha_over(canvas, im, xy)
     return canvas, info
@@ -4568,7 +4805,7 @@ def recomposite(layout, slices_dir, canvas_size, render_text=False, fonts_dir=No
     doc_size = src.get("doc_size") or [None, None]
     art_origin = (art.get("bounds") or [0, 0])[0:2]
     for node in layout["nodes"]:
-        if node["kind"] == "dynamic_text":
+        if is_attr_text(node["kind"]):
             if render_text:
                 canvas, info = draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin, text_opts)
                 placed.append(info)
@@ -4623,7 +4860,7 @@ def text_has_mixed_size_lines(text):
 def text_region_mask(layout, cw, ch):
     mask = np.zeros((ch, cw), dtype=bool)
     for node in layout["nodes"]:
-        if node["kind"] != "dynamic_text":
+        if not is_attr_text(node.get("kind")):
             continue
         b = node.get("visible_bounds") or node.get("logical_bounds")
         if not b:
@@ -4975,7 +5212,7 @@ def reuse_region_checks(layout, ref, rec, mask, out_dir, tol_mae=4.0, tol_pct=1.
     ch, cw = ref.shape[0], ref.shape[1]
     mismatches, accepted, checked = [], [], []
     for node in layout.get("nodes") or []:
-        if not node.get("reuse_of") or node.get("kind") == "dynamic_text":
+        if not node.get("reuse_of") or is_attr_text(node.get("kind")):
             continue
         b = node.get("visible_bounds") or node.get("logical_bounds")
         if not b:
@@ -5071,7 +5308,7 @@ def write_exported_preview(layout, rec, ref, out_dir, title=None):
 
 
 def fill_layout_leading_types(layout, psd_path):
-    """Copy EngineData LeadingType onto dynamic_text nodes that lack leading_type (descriptor often omits it)."""
+    """Copy EngineData LeadingType onto attribute-only text nodes that lack leading_type (descriptor often omits it)."""
     if not psd_path or not Path(psd_path).is_file():
         return 0
     mapping = text_render.leading_types_from_psd(psd_path)
@@ -5079,7 +5316,7 @@ def fill_layout_leading_types(layout, psd_path):
         return 0
     n = 0
     for node in layout.get("nodes") or []:
-        if node.get("kind") != "dynamic_text":
+        if not is_attr_text(node.get("kind")):
             continue
         text = node.get("text")
         if not isinstance(text, dict):
@@ -5128,7 +5365,15 @@ def cmd_validate(args):
     empty = []
     missing = []
     for node in layout["nodes"]:
-        if node["kind"] == "dynamic_text":
+        if is_text_kind(node.get("kind")) and node.get("nine_slice"):
+            issues.append({
+                "type": "text_has_nine_slice",
+                "name": node.get("name"),
+                "kind": node.get("kind"),
+                "nine_slice": node.get("nine_slice"),
+                "hint": "text entries must not have nine_slice margins; set nine_slice to null.",
+            })
+        if is_attr_text(node.get("kind")):
             if not (node.get("text") or {}).get("content") and not (node.get("text") or {}).get("font"):
                 issues.append({"type": "missing_text_attrs", "name": node["name"]})
             continue
@@ -5167,7 +5412,7 @@ def cmd_validate(args):
         text_opts = dict(text_render.LEGACY_1_3_OPTIONS, **text_opts)
     default_layout = layout_with_nodes(layout, default_nodes(layout))
     has_text = any(
-        n.get("kind") == "dynamic_text" and str((n.get("text") or {}).get("content") or "").strip()
+        is_attr_text(n.get("kind")) and str((n.get("text") or {}).get("content") or "").strip()
         for n in default_layout["nodes"]
     )
     out_dir = Path(args.out_dir)
@@ -5203,10 +5448,10 @@ def cmd_validate(args):
     text_infos = [p for p in placed_text if "renderer" in p or p.get("skipped")]
     legacy_v1 = [
         n["name"] for n in default_layout["nodes"]
-        if n.get("kind") == "dynamic_text" and not text_render.is_v2(n.get("text") or {})
+        if is_attr_text(n.get("kind")) and not text_render.is_v2(n.get("text") or {})
     ]
     if legacy_v1:
-        warn(f"{len(legacy_v1)} dynamic_text node(s) use legacy v1 text attributes (single run, no effect "
+        warn(f"{len(legacy_v1)} attribute-only text node(s) use legacy v1 text attributes (single run, no effect "
              "visibility); re-export with the current export_slices.psjs")
 
     cw, ch = min(full.width, w), min(full.height, h)
@@ -5246,9 +5491,9 @@ def cmd_validate(args):
 
     rendered = sum(1 for p in placed_text if p.get("rendered"))
     mixed_nodes = [n["name"] for n in default_layout["nodes"]
-                   if n.get("kind") == "dynamic_text" and text_has_mixed_size_lines(n.get("text") or {})]
+                   if is_attr_text(n.get("kind")) and text_has_mixed_size_lines(n.get("text") or {})]
     if mixed_nodes:
-        warn("note: %d dynamic_text node(s) have lines of different font sizes (%s). "
+        warn("note: %d attribute-only text node(s) have lines of different font sizes (%s). "
              "The extra line drop follows each layer's leadingType (leadingAbove k=0.86, leadingBelow 0). "
              "See references/slicing.md 10.7."
              % (len(mixed_nodes), ", ".join(mixed_nodes[:5])))
@@ -5297,18 +5542,19 @@ def cmd_validate(args):
         ],
         "notes": [
             "Default-state recomposite only (parts currently shown in the PSD) is compared to the PS render.",
-            "diff_text_rendered: slices + an approximation of dynamic_text (text_renderer.used) vs the PS render. "
+            "diff_text_rendered: slices + an approximation of attribute-only text "
+            "(dynamic_text / static_text, text_renderer.used) vs the PS render. "
             "Preview text is approximate; judge slice accuracy by diff_text_masked.",
             "text_renderer: freetype = HarfBuzz + FreeType (no hinting), skia = HarfBuzz + Skia paths. "
             "There is no fallback: missing packages or an unrenderable text stop validate with an error.",
             "legacy_v1_text_attrs > 0: the export log predates text_attrs_version 2 (single run, no effect "
             "visibility); re-export with the current export_slices.psjs for a closer text preview.",
-            "diff_text_masked: slices only; dynamic_text boxes and unemulated engine-effect areas excluded from the metrics.",
+            "diff_text_masked: slices only; attribute-only text boxes (dynamic_text / static_text) and unemulated engine-effect areas excluded from the metrics.",
             "effect_mode 'engine': DropShadow / OuterGlow are approximated with Pillow (normal blend, Gaussian blur); "
             "other engine effects are listed in engine_effects_unemulated and masked.",
             "preview_exported_annotated.png is drawn on the recomposite of the exported PNGs; show it to the user as the final check.",
             "Photoshop's own text rasteriser, blend modes and effect algorithms are not reproduced; residual error "
-            "on dynamic_text is expected. For pixel-identical text, rasterise the text layers in Photoshop.",
+            "on dynamic_text / static_text is expected. For pixel-identical text, rasterise the text layers in Photoshop.",
             "visible_bounds use post-trim insets (before.left - after.left) so the PNG origin matches the tight opaque box.",
             "Alternate states are written to validate/states/<component>_<state>.png for visual check, not measured against the default render.",
         ],
@@ -5413,9 +5659,9 @@ def build_parser():
     s.add_argument("--slices-dir", required=True)
     s.add_argument("--full-render", required=True)
     s.add_argument("--out-dir", required=True)
-    s.add_argument("--fonts-dir", default=None, help="Directory of TTF/OTF files used to approximate dynamic_text")
+    s.add_argument("--fonts-dir", default=None, help="Directory of TTF/OTF files used to approximate attribute-only text")
     s.add_argument("--text-renderer", choices=list(text_render.RENDERERS), default="auto",
-                   help="dynamic_text preview renderer: auto (freetype, else skia), freetype, skia. "
+                   help="attribute-only text preview renderer: auto (freetype, else skia), freetype, skia. "
                         "Missing packages are an error, not a fallback")
     s.add_argument("--mixed-leading-k", type=float, default=None,
                    help="Override the extra drop of a following line as a fraction of its font-size change "
@@ -5425,7 +5671,7 @@ def build_parser():
                    help="Optional PSD/PSB used only to read EngineData LeadingType when the layout omits leading_type. "
                         "Defaults to layout.source.file when that path exists")
     s.add_argument("--text-legacy-rules", action="store_true", default=False,
-                   help="Draw dynamic_text with the 1.3.x rules (no anti-alias rules, legacy stroke / spread, "
+                   help="Draw attribute-only text with the 1.3.x rules (no anti-alias rules, legacy stroke / spread, "
                         "no faux bold / italic, mixed_leading_k 0.86) for comparison")
     s.add_argument("--snap-glyph-origin", dest="snap_glyph_origin", action="store_true", default=None,
                    help="Round glyph pen positions to whole pixels (default on)")
