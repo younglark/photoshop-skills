@@ -142,6 +142,7 @@ function effectsFromDesc(desc) {
       } else if (base === "outerGlow" || base === "innerGlow") {
         item.size = val(e.blur);
         item[base === "outerGlow" ? "spread" : "choke"] = val(e.chokeMatte);
+        if (e.inputRange != null) item.range = val(e.inputRange);
       }
       out.push(item);
     }

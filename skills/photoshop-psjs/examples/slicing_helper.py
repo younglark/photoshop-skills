@@ -3109,6 +3109,23 @@ def recomposite(layout, slices_dir, canvas_size, render_text=False, fonts_dir=No
     return canvas, placed
 
 
+def text_has_mixed_size_lines(text):
+    """True when a multi-line text has runs of different sizes on different lines (mixed_leading_k applies)."""
+    content = str(text.get("content") or "").replace("\n", "\r")
+    runs = text.get("runs") or []
+    if "\r" not in content or len(runs) < 2:
+        return False
+    sizes, pos = [], 0
+    for line in content.split("\r"):
+        end = pos + len(line)
+        sz = [r.get("size_px") or r.get("size_pt") for r in runs if r.get("from", 0) < max(end, pos + 1) and r.get("to", 0) > pos]
+        sz = [x for x in sz if x]
+        if sz:
+            sizes.append(round(max(sz), 2))
+        pos = end + 1
+    return len(set(sizes)) > 1
+
+
 def text_region_mask(layout, cw, ch):
     mask = np.zeros((ch, cw), dtype=bool)
     for node in layout["nodes"]:
@@ -3607,6 +3624,10 @@ def cmd_validate(args):
         "snap_glyph_origin": getattr(args, "snap_glyph_origin", None),
     }
     text_opts = {k: v for k, v in text_opts.items() if v is not None}
+    profile = getattr(args, "text_profile", None) or "ps2026"
+    text_opts = dict(text_render.TEXT_PROFILES[profile], **text_opts)
+    if getattr(args, "text_legacy_rules", False):
+        text_opts = dict(text_render.LEGACY_1_3_OPTIONS, **text_opts)
     default_layout = layout_with_nodes(layout, default_nodes(layout))
     has_text = any(
         n.get("kind") == "dynamic_text" and str((n.get("text") or {}).get("content") or "").strip()
@@ -3687,6 +3708,15 @@ def cmd_validate(args):
     exported_preview = write_exported_preview(default_layout, rec_text, full.crop((0, 0, cw, ch)), out_dir)
 
     rendered = sum(1 for p in placed_text if p.get("rendered"))
+    mixed_nodes = [n["name"] for n in default_layout["nodes"]
+                   if n.get("kind") == "dynamic_text" and text_has_mixed_size_lines(n.get("text") or {})]
+    if mixed_nodes:
+        warn("note: %d dynamic_text node(s) have lines of different font sizes (%s); mixed_leading_k=%s. "
+             "New Photoshop 2026 text layers match 0; text layers in one older file matched 0.86. "
+             "If these nodes are among the worst elements, compare --text-profile older-file "
+             "(references/slicing.md 10.6)."
+             % (len(mixed_nodes), ", ".join(mixed_nodes[:5]),
+                dict(text_render.DEFAULT_OPTIONS, **text_opts).get("mixed_leading_k")))
     report = {
         "artboard": art,
         "full_render": str(args.full_render),
@@ -3702,6 +3732,8 @@ def cmd_validate(args):
             "options": {k: v for k, v in dict(text_render.DEFAULT_OPTIONS, **text_opts).items() if k != "renderer"},
             "legacy_v1_text_attrs": len(legacy_v1),
             "legacy_v1_nodes": legacy_v1,
+            "profile": getattr(args, "text_profile", None) or "ps2026",
+            "mixed_size_line_nodes": mixed_nodes,
         },
         "dynamic_text_rendered": rendered,
         "dynamic_text_render_info": [
@@ -3817,7 +3849,14 @@ def build_parser():
                    help="dynamic_text preview renderer: auto (freetype, else skia), freetype, skia. "
                         "Missing packages are an error, not a fallback")
     s.add_argument("--mixed-leading-k", type=float, default=None,
-                   help="Extra drop of a following line, as a fraction of its font-size increase (empirical, default 0.86)")
+                   help="Extra drop of a following line, as a fraction of its font-size increase (default 0 since 1.4.0; 1.3.x used 0.86)")
+    s.add_argument("--text-profile", choices=list(text_render.TEXT_PROFILES), default="ps2026",
+                   help="ps2026: text laid out and rasterised by Photoshop 2026 as new layers (default, measured on "
+                        "345 gold images). older-file: text layers that behaved like an older file on one measured board "
+                        "(mixed_leading_k 0.86, no anti-alias gamma; cause not confirmed)")
+    s.add_argument("--text-legacy-rules", action="store_true", default=False,
+                   help="Draw dynamic_text with the 1.3.x rules (no anti-alias rules, legacy stroke / spread, "
+                        "no faux bold / italic, mixed_leading_k 0.86) for comparison")
     s.add_argument("--snap-glyph-origin", dest="snap_glyph_origin", action="store_true", default=None,
                    help="Round glyph pen positions to whole pixels (default on)")
     s.add_argument("--no-snap-glyph-origin", dest="snap_glyph_origin", action="store_false",

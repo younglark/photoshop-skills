@@ -82,8 +82,8 @@ python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画�
 python3 -m venv .venv
 # Windows：.venv\Scripts\activate    POSIX：source .venv/bin/activate
 pip install "psd-tools[composite]" pillow numpy
-# 必装（布局里有 dynamic_text 时 validate 需要）：HarfBuzz 排版 + FreeType 填充轮廓
-pip install uharfbuzz freetype-py
+# 必装（布局里有 dynamic_text 时 validate 需要）：HarfBuzz 排版 + FreeType 填充轮廓；scipy 用于描边/扩展
+pip install uharfbuzz freetype-py scipy
 # 只在 --text-renderer skia 时需要
 pip install uharfbuzz skia-python
 # 之后一律用该环境的解释器调用助手，例如：
@@ -597,9 +597,16 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 6. **动态文字预览**（[examples/text_render.py](../examples/text_render.py)）：只是近似，不是 Photoshop 的文字引擎，也不是目标引擎的渲染。要像素一致的文字，让 Photoshop 栅格化文字图层（或临时显示后导出带字整图）做底图；要和上线一致，用目标引擎按同一份布局 JSON 出图。
 
    - `--text-renderer auto`（默认）：装了 `uharfbuzz` + `freetype-py` 用 `freetype`（HarfBuzz 排版，FreeType 不做 hinting、直接填充轮廓，描边用圆角外扩的轮廓描边）；否则有 `skia-python` 用 `skia`（Skia 轮廓路径）；也可显式指定 `freetype` 或 `skia`。所需的包缺了就报错退出，不会换渲染器，也没有 Pillow 文字路径。报告 `text_renderer` 记 `requested`、`used`、参数，以及旧格式导出日志的 `legacy_v1_text_attrs` 数量和 `legacy_v1_nodes` 名单（这些节点照常渲染，但只有一个样式片段、不知道效果总开关，stderr 也会警告）；逐条细节在 `dynamic_text_render_info`（所用字体文件和匹配方式、是否开 kern、画了哪些效果、因总开关或单项关闭而跳过的效果、没画的效果和近似项）。
-   - 参数解读：字形在文字空间（pt）排版后整体乘图层变换，字号和行距随之缩放；按样式片段取字体、字号、颜色和行距，不是整层一个字号；行距取该行最大值（自动行距 = `auto_leading_pct` × 字号，默认 1.2）；`effects_visible` 为 false 或效果 `enabled: false` 时不画；`kerning: manual` 且没有手动字距对时关闭 OpenType `kern`，`metrics` / `optical` 时打开（optical 只用字体字距对近似）；`tracking` 按 tracking/1000 em 加到每个字形；描边按圆角外扩轮廓，投影按距离、角度、大小、扩展画在下面，外发光同理；颜色叠加改填充色。
-   - **经验值，未广泛验证**：`--mixed-leading-k`（默认 0.86）——后一行最大字号比上一行大时，PS 会把这一行再往下推，约为字号增量 × k。只在少量两行混排样本上拟合，不是 PS 公开规则；换字体或排版对不上时先调这个值。`--snap-glyph-origin`（默认开，`--no-snap-glyph-origin` 关闭）——把每个字形的笔位取整到整像素再光栅化；在实测样本上明显更接近 PS（见 10.5），但同样只是观察，不是文档化行为。
-   - 不支持、会记入 `approximations` 的：变形文字、段落文字自动换行、仿粗体/仿斜体、字符水平/垂直缩放、渐变描边、非正常混合模式、颜色叠加以外的内部效果。找不到某条文字的字体、或某个字形加载失败时，`validate` 报错退出（`error.type: text_render_failed`，消息里带节点名），不跳过、不换字体也不换渲染器。`--fonts-dir` 指向设计所用字体（Windows 用户安装的字体通常在 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`）。
+   - 参数解读：字形在文字空间（pt）排版后整体乘图层变换，字号和行距随之缩放；按样式片段取字体、字号、颜色和行距，不是整层一个字号；行距取该行最大值（自动行距 = `auto_leading_pct` × 字号，默认 1.2）；`effects_visible` 为 false 或效果 `enabled: false` 时不画；`kerning: manual` 且没有手动字距对时关闭 OpenType `kern`，`metrics` / `optical` 时打开（optical 只用字体字距对近似）；`tracking` 按 tracking/1000 em 加到每个字形；颜色叠加改填充色。
+   - 1.4.0 的绘制规则（在 345 张 Photoshop 2026 金图上拟合并用验证集确认，见 10.6；默认值在 `text_render.DEFAULT_OPTIONS`）：
+     - 混排行距：后一行字号更大时**不再额外下推**（`mixed_leading_k` 默认 0；1.3.x 是 0.86，在新建文字图层上被推翻）。
+     - 抗锯齿：`antiAliasPlatformGray` 覆盖率做 gamma 1.4；`Strong` gamma 1.2 + 外扩 0.1 px、只在 x 方向取整笔位；`Smooth` 只在 x 方向取整；`PlatformLCD` gamma 1.2（样本少）。`Sharp` / `Crisp` / `None` 不加规则。
+     - 描边：在 4 倍分辨率上用距离变换算描边区（需要 scipy），填充与描边按面积分开合成（内部/居中描边从填充里扣掉重叠部分），所以填充不透明度只作用于填充：填充不透明度 0 时只剩描边环。
+     - 投影/外发光的扩展用 4 倍分辨率距离变换外扩；外发光模糊 σ = 大小 / 2.5，并读取外发光的「范围」（`inputRange`，新版 `export_slices.psjs` 导出为 `range`）。
+     - 仿粗体：轮廓外扩 0.01 em，每个字形前进量加 0.03 em；仿斜体：水平错切 0.2。都只是近似（报告里记在 `approximations`），仿粗体仍有约 21 dB 的误差。
+     - `--snap-glyph-origin`（默认开）在新数据上复核成立：关掉后中位数掉约 6 dB。
+   - `--text-profile`：`ps2026`（默认，即上面的规则）；`older-file` 把 `mixed_leading_k` 设为 0.86 并关掉抗锯齿 gamma，其它规则不变——在一份较早的设计文件上，它的文字图层按这套参数才对得上（原因未确认，见 10.6，只有一块画板的证据）。布局里有「不同行字号不同」的文字时，`validate` 会在 stderr 提示并在报告 `text_renderer.mixed_size_line_nodes` 列出节点；这些节点排在最差元素里时，用 `--text-profile older-file` 对比一次。`--mixed-leading-k` 仍可单独覆盖。`--text-legacy-rules` 按 1.3.x 规则画，只用于对比。
+   - 不支持、会记入 `approximations` 的：变形文字、段落文字自动换行（按点文字排在框顶，约 11–12 dB）、字符水平/垂直缩放、渐变描边、非正常混合模式、颜色叠加以外的内部效果。找不到某条文字的字体、或某个字形加载失败时，`validate` 报错退出（`error.type: text_render_failed`，消息里带节点名），不跳过、不换字体也不换渲染器。用到描边、投影或外发光的扩展时需要 scipy，缺了同样报错（`text_renderer_unavailable`，安装命令 `pip install scipy`）。`--fonts-dir` 指向设计所用字体（Windows 用户安装的字体通常在 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`）。
 
 `Image.paste(..., mask=)` 不是正确的 Porter-Duff over。预览文字复现不了 PS 自己的光栅化、混合模式和效果算法，带文字的指标残差集中在文字本身属于预期。
 
@@ -712,9 +719,64 @@ Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、�
 要点：
 
 - 误差主要来自参数读错，而不是光栅化算法：行距没乘变换（45 px 被当成 33.5 px）、两行混排只用一个字号、被总开关隐藏的描边照画。
-- 混排行距系数 0.86 是在这 5 条两行样本上拟合的；取 0.75 或 1.0 时逐条 PSNR 掉到约 37 dB。
+- 混排行距系数 0.86 是在这 5 条两行样本上拟合的；取 0.75 或 1.0 时逐条 PSNR 掉到约 37 dB。1.4.0 在新建的文字图层上推翻了它（默认改为 0），这块画板仍需 0.86，见 10.6。
 - 本样本的手动字距为 `manual` 且没有字距对；打开 `kern` 反而掉约 2 dB。
 - v2 文字属性取自同一批图层描述符：用 `text_render.text_attrs_from_descriptor()` 解析，与新版 `export_slices.psjs` 的 `parseText()` 在全部 19 条上逐字段一致（Node 下对照）。这一轮没有重跑 Photoshop 导出。
 - 遮罩后的 47.29 dB 不变，说明改动只影响文字预览，不影响切图校验。
 - **未验证**：中文与 CJK 标点挤压、段落文字、变形文字、其它抗锯齿方式、仿粗体、渐变描边、macOS 上的 Photoshop 光栅化。笔位取整和混排行距系数都只在这一份样本上成立。
 
+
+### 10.6 文字参数矩阵：Photoshop 金图 vs 规则渲染（1.4.0）
+
+方法：在 Windows / Photoshop 2026 上，脚本只在自己新建的临时文档（72 ppi，pt = px）里逐条建点文字图层，按参数设好后导出 PNG 和图层描述符做金图；描述符用 `export_slices.psjs` 的 `parseText()` 解析（JS 与 Python 解析在全部条目上一致），再用本助手的 HarfBuzz + FreeType 渲染比较。字体为 3 款拉丁 + 3 款中文开源字体（含粗体），按用户安装，渲染用同一批字体文件。指标只算有墨水的像素（金图或渲染 alpha > 8），叠在 50% 灰上：PSNR、MAE、alpha 误差、ΔE、IoU，另记 ±3 px 最佳平移、外框差和重心差。只报分布，不设阈值。
+
+矩阵：单因素（字体、字号 12–96、缩放 0.5–2、字距、行距、多行、对齐、段落文字、仿粗体/仿斜体、6 种抗锯齿、手动/度量/视觉字距、描边位置与粗细、投影、外发光、颜色叠加、不透明度、同行混排、跨行混排），再加组合（字号×描边、字号×投影、描边×投影、抗锯齿×字号、中文×描边、字号×描边×投影、缩放×效果）。按维度以固定种子 2:1 分训练 / 验证（181 / 84）。规则只在训练集上拟合，然后在验证集和训练后新生成的 48 条（val2，新内容）上一次性确认；之后为排查一个冲突又加了 6 + 8 + 18 条只用于确认的跨行混排样本（固定行距、带缩放变换、Optyca 排版引擎）。共 345 条。
+
+结果（墨水 PSNR 中位数，1.3.1 → 1.4.0）：
+
+| 集合 | 条数 | 1.3.1 | 1.4.0 | 变好 / 变差（>0.1 dB） |
+|------|------|-------|-------|------------------------|
+| 训练 | 181 | 25.7 | 29.1 | 161 / 0 |
+| 验证 | 84 | 25.5 | 28.8 | 73 / 0 |
+| val2（训练后新生成） | 48 | 21.5 | 26.5 | 43 / 1 |
+| 跨行混排确认（val3–5） | 32 | 12.5–12.9 | 28.3–31.4 | 32 / 0 |
+| 全部 | 345 | 24.2 | 28.3 | 309 / 1（无一条变差超过 0.5 dB） |
+
+训练与验证的提升相近（+3.4 / +3.3 dB），没有条目标为疑似过拟合。全部条目的 MAE 中位数 9.2 → 4.3，ΔE 8.3 → 3.9，IoU 0.907 → 0.950。
+
+各规则在验证集上的消融（开 vs 关，只算受影响条目）：
+
+| 规则 | 验证集平均变化 | 说明 |
+|------|----------------|------|
+| 混排行距 k = 0 | +6.2 dB | 受影响 4/4 变好；val3–5 的 32 条也全部变好 |
+| 描边：4× 距离变换 + 分开合成 | +4.8 dB | 81% 变好，最差 −0.9 dB |
+| 扩展：4× 距离变换 | +0.8 dB | |
+| 外发光：范围 + σ = 大小 / 2.5 | +11.4 dB | |
+| 仿粗体 | +8.5 dB | 仍约 21 dB |
+| 仿斜体 | +10.6 dB | 只有 val2 的 3 条 |
+| PlatformGray gamma 1.4 | +2.4 dB | 110 条，95% 变好 |
+| Strong / Smooth | +4.6 / +4.1 dB | 各 3 条 |
+| PlatformLCD gamma 1.2 | +0.4 dB | 3 条，样本少 |
+
+未采用（验证集上不成立）：投影偏移取整到整像素（+0.3 dB，只有 57% 变好）、投影 σ = 大小 / 2.5（38% 变好）、`antiAliasNone` 阈值化（−0.6 dB）。
+
+复核：
+- 笔位取整：关掉后中位数 29.1 / 28.8 / 26.5 → 23.1 / 23.2 / 23.6 dB，规则成立。
+- `mixed_leading_k = 0.86`：在新建文字图层上被推翻（跨行混排 26.6 / 29.7 / 32.6 → 12.1 / 26.7 / 12.8 dB）。「只对固定行距生效」「只在有缩放变换时生效」「只在 Optyca 排版引擎下生效」三个假设也都被推翻：这些结构在新建图层上全部是 k = 0 对齐（外框差 0 px）。
+
+和 10.5 那块画板的冲突：在 10.5 的列表界面画板上重跑整板 `validate`，文字框内 PSNR 为 1.3.1 规则 38.0 dB、1.4.0 默认 19.9 dB、`--mixed-leading-k 0.86` 34.7 dB、`--text-profile older-file` 39.6 dB。逐项消融显示那块画板的文字图层需要 k = 0.86，且 PlatformGray **不加** gamma（加了掉约 4.9 dB），其余 1.4.0 规则（描边、扩展等）照样有益。用同字体族、同字号、同行距、同缩放、同排版引擎在新建图层上复刻，结果仍是 k = 0 对齐，所以差别来自那份文件里文字图层本身（推测是较早版本保存的文字数据或像素），原因未确认。因此默认按新建图层的规则，`older-file` 只是一块画板上的提示。
+
+没对齐或只部分对齐的（误差为墨水 PSNR 中位数）：
+
+| 项目 | 误差 | 可能原因 | 建议 |
+|------|------|----------|------|
+| 段落文字（文本框） | 约 11–12 dB | 不做自动换行，按点文字排在框顶 | 实现换行前烘焙成图 |
+| 视觉字距（optical） | 约 12–13 dB | PS 自有算法，外框宽 5–7 px | 烘焙，或设计改用度量字距 |
+| 衬线中文字体里的拉丁字符 | 约 14–23 dB | 前进量逐字累积偏差 1–2 px，原因未定位 | 接受或烘焙 |
+| 仿粗体 | 约 21 dB | 只是外扩近似 | 改用真粗体字重，或接受 |
+| `antiAliasNone` | 约 19–23 dB | 没有通过验证的规则 | 烘焙 |
+| 12–16 px 小字号 | 约 20–24 dB | PS 平台光栅化 / hinting | 接受 |
+| 小字号硬投影（大小 0） | 约 16–21 dB | 未定位 | 接受 |
+| 缩放 0.5 × 效果 | 约 20 dB | 未定位 | 接受 |
+
+**未验证**：变形文字、段落换行、渐变描边、字符水平/垂直缩放、内阴影等内部效果、macOS 上的 Photoshop、PlatformLCD 与 None 的大样本、`older-file` 在其它文件上是否成立。

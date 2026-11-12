@@ -19,34 +19,45 @@ redrawn with another renderer.
 
 Install into the project virtualenv:
 
-    pip install uharfbuzz freetype-py          # freetype renderer (auto prefers it)
-    pip install uharfbuzz skia-python          # only for --text-renderer skia
+    pip install uharfbuzz freetype-py scipy    # freetype renderer (auto prefers it)
+    pip install uharfbuzz skia-python scipy    # only for --text-renderer skia
 
-Parameter reading (the large error source, not the rasterizer):
+scipy is needed for strokes and shadow / glow spread (distance transform); a
+text with such an effect raises ``TextRendererUnavailable`` when it is missing.
+
+Parameter reading and drawing rules (checked against Photoshop gold images, see
+references/slicing.md section 10.6; empirical, not documented Photoshop behaviour):
 
   1. Glyphs are laid out in text space (points) and mapped through the text
      layer's transform, so font size and leading are scaled by the matrix.
   2. Font, size, color and leading come from each style run, not the first run.
-  3. When a later line uses a larger size than the previous one, Photoshop pushes
-     it further down. ``mixed_leading_k`` (default 0.86 x size increase) is an
-     empirical fit on a handful of two-line samples; it is not a documented
-     Photoshop rule.
+  3. Line advance is the largest leading on the line (auto leading = 120 % of the
+     run size). ``mixed_leading_k`` (default 0 since 1.4.0) adds k x the size
+     increase when a line is larger than the previous one; 1.3.x used 0.86, which
+     did not hold on new samples.
   4. Layer effects are drawn only when the layer's effects are visible and the
      effect itself is enabled.
   5. ``kerning: manual`` with no manual pairs disables the OpenType kern
-     feature; tracking is applied as tracking/1000 em per glyph.
-  6. Strokes are a round-join outset of the glyph outline; drop shadows /
-     outer glows follow their size / spread / distance / angle.
-  7. ``snap_glyph_origin`` (default on) rounds each glyph's pen position to a
-     whole device pixel before rasterising. On the one sample set measured
-     (Latin point text, one font family, up to two lines) this matched
-     Photoshop far better than sub-pixel positioning; it is an observation, not
-     a documented Photoshop rule. Turn it off with --no-snap-glyph-origin.
+     feature; tracking is applied as tracking/1000 em per glyph. Optical kerning
+     is Photoshop's own algorithm and is approximated with the font's kern pairs.
+  6. ``snap_glyph_origin`` (default on) rounds each glyph's pen position to a
+     whole device pixel before rasterising; ``aa_rules`` can limit snapping to x
+     for an anti-alias mode (Smooth, Strong).
+  7. ``aa_rules``: per anti-alias mode coverage gamma / embolden (Platform Gray
+     gamma 1.4, LCD 1.2, Strong gamma 1.2 + 0.1 px embolden). Sharp and Crisp
+     use plain coverage; None has no validated rule.
+  8. Strokes, shadow / glow spread work on the rasterised alpha with a 4x
+     distance transform (``stroke_model`` / ``spread_model`` = hires, needs
+     scipy); stroke and fill are composited as one layer content
+     (``stroke_composite`` = disjoint), so fill opacity leaves the stroke intact.
+  9. Outer glow: blur sigma = size x (1 - spread) / 2.5, contour range from the
+     effect (default 50 %). Drop shadow: sigma = size x (1 - spread) / 2.
+ 10. Faux bold = outline embolden 0.01 x size plus 0.03 x size extra advance;
+     faux italic = 0.2 shear.
 
-Everything not covered (warped text, paragraph wrapping, faux bold / italic,
-horizontal / vertical scale, gradient strokes, blend modes other than normal,
-inner effects except Color Overlay) is listed per text in the render info so
-the report never hides it.
+Everything not covered (warped text, paragraph wrapping, horizontal / vertical
+scale, gradient strokes, blend modes other than normal, inner effects except
+Color Overlay) is listed per text in the render info so the report never hides it.
 """
 from __future__ import annotations
 
@@ -97,6 +108,7 @@ except Exception:  # pragma: no cover
 RENDERERS = ("auto", "freetype", "skia")
 INSTALL_FREETYPE = "pip install uharfbuzz freetype-py"
 INSTALL_SKIA = "pip install uharfbuzz skia-python"
+INSTALL_SCIPY = "pip install scipy"
 
 
 class TextRendererUnavailable(RuntimeError):
@@ -111,10 +123,53 @@ class TextRenderError(RuntimeError):
     """One dynamic_text could not be rendered (e.g. its font was not found)."""
 DEFAULT_OPTIONS = {
     "renderer": "auto",
-    "mixed_leading_k": 0.86,
+    # 1.4.0: 0. The 1.3.x value 0.86 was fitted on five two-line samples and did not hold on
+    # 38 new two-line Photoshop samples (auto and fixed leading); see references/slicing.md 10.6.
+    "mixed_leading_k": 0.0,
     "auto_leading_pct": 1.2,
     "snap_glyph_origin": True,
     "shadow_sigma_div": 2.0,
+    # Per anti-alias mode: coverage gamma (cov ** (1/gamma)), outline embolden in px, and which
+    # pen-position axes snap to whole pixels. Modes not listed use plain FreeType coverage
+    # (antiAliasSharp / antiAliasCrisp matched as is; antiAliasNone has no validated rule).
+    "aa_rules": {
+        "antiAliasPlatformGray": {"gamma": 1.4},
+        "antiAliasPlatformLCD": {"gamma": 1.2},
+        "antiAliasStrong": {"gamma": 1.2, "embolden": 0.1, "snap": "x"},
+        "antiAliasSmooth": {"snap": "x"},
+    },
+    "stroke_model": "hires",      # hires: distance transform of the rasterised alpha (4x); legacy: 1.3.x
+    "stroke_composite": "disjoint",  # disjoint: stroke and fill share one layer content; over: 1.3.x
+    "spread_model": "hires",      # shadow / glow spread as a 4x distance-transform dilation; legacy: 1.3.x
+    "glow_sigma_div": 2.5,        # outer glow blur sigma = size * (1 - spread) / glow_sigma_div
+    "glow_range": 0.5,            # outer glow contour range when the effect has none (Photoshop default 50 %)
+    "faux_bold_k": 0.01,          # faux bold: outline embolden radius = k * font size (px); 0 = not drawn
+    "faux_bold_adv_k": 0.03,      # faux bold: extra advance per glyph = k * font size
+    "faux_italic_shear": 0.2,     # faux italic: x shear; 0 = not drawn
+}
+
+# Text profiles (validate --text-profile). "ps2026": text layers that Photoshop 2026 lays out and rasterises
+# as new layers (all 345 gold images of references/slicing.md 10.6). "older-file": text layers in a file that
+# behaved differently on the one board measured (cause not confirmed; likely saved by an older Photoshop /
+# text engine): line drops matched mixed_leading_k 0.86 and PlatformGray edges matched no gamma, while the
+# effect rules still helped. One board only: treat as a hint, not a rule.
+TEXT_PROFILES = {
+    "ps2026": {},
+    "older-file": {"mixed_leading_k": 0.86, "aa_rules": {}},
+}
+
+# The 1.3.x drawing rules, for comparison runs (validate --text-legacy-rules).
+LEGACY_1_3_OPTIONS = {
+    "mixed_leading_k": 0.86,
+    "aa_rules": {},
+    "stroke_model": "legacy",
+    "stroke_composite": "over",
+    "spread_model": "legacy",
+    "glow_sigma_div": None,
+    "glow_range": None,
+    "faux_bold_k": 0.0,
+    "faux_bold_adv_k": 0.0,
+    "faux_italic_shear": 0.0,
 }
 
 # Photoshop layerEffects keys -> engine_effects type names used elsewhere in the skill.
@@ -556,6 +611,7 @@ def layout_glyphs(spec, shaper_for, fonts_dir=None, resolve_font=None):
         x = 0.0
         lg = []
         for s, r in segs:
+            fb_adv = float(opts.get("faux_bold_adv_k") or 0.0) * r["size_pt"] if r.get("faux_bold") else 0.0
             path, how = (resolve_font or find_font_file)(r["font"], fonts_dir)
             if path is None:
                 raise TextRenderError(
@@ -567,8 +623,9 @@ def layout_glyphs(spec, shaper_for, fonts_dir=None, resolve_font=None):
             size = r["size_pt"]
             for gid, adv, xo, yo in shaper.shape(s, size, spec["kern"]):
                 lg.append({"font_path": path, "size_pt": size, "gid": gid, "x": x + xo,
-                           "y": base - yo - r["baseline_shift_pt"], "color": r["color"], "line": li})
-                x += adv + r["tracking"] / 1000.0 * size
+                           "y": base - yo - r["baseline_shift_pt"], "color": r["color"], "line": li,
+                           "fb": bool(r.get("faux_bold")), "fi": bool(r.get("faux_italic")), "adv": adv})
+                x += adv + r["tracking"] / 1000.0 * size + fb_adv
         width = x
         align = para["align"]
         dx = -width / 2.0 if "center" in align else (-width if "right" in align else 0.0)
@@ -630,9 +687,27 @@ def _blit_union(cov, arr, x0, y0):
 def _origin(spec, g, off, snap):
     X, Y = to_device(spec, g["x"], g["y"])
     X, Y = X + off[0], Y + off[1]
+    if snap is True:
+        snap = (True, True)
     if snap:
-        X, Y = float(round(X)), float(round(Y))
+        if snap[0]:
+            X = float(round(X))
+        if snap[1]:
+            Y = float(round(Y))
     return X, Y
+
+
+def aa_rule(spec):
+    rules = spec["options"].get("aa_rules") or {}
+    return rules.get(str(spec.get("anti_alias") or "")) or {}
+
+
+def snap_mode(spec):
+    base = bool(spec["options"].get("snap_glyph_origin"))
+    m = aa_rule(spec).get("snap")
+    if m is None:
+        return (base, base)
+    return ("x" in m, "y" in m)
 
 
 class FreeTypeRaster:
@@ -641,7 +716,7 @@ class FreeTypeRaster:
 
     def __init__(self, spec):
         self.spec = spec
-        self.snap = bool(spec["options"].get("snap_glyph_origin"))
+        self.snap = snap_mode(spec)
 
     @classmethod
     def face(cls, path):
@@ -658,8 +733,12 @@ class FreeTypeRaster:
         face = self.face(g["font_path"])
         face.set_char_size(int(round(g["size_pt"] * 64)))
         # FreeType is y-up: x' = xx*x + yx*y_down -> (xx, -yx; -xy, yy)
-        mat = _ft.Matrix(int(round(xx * 0x10000)), int(round(-yx * 0x10000)),
-                         int(round(-xy * 0x10000)), int(round(yy * 0x10000)))
+        a, b, c, d = xx, -yx, -xy, yy
+        sh = float(self.spec["options"].get("faux_italic_shear") or 0.0) if g.get("fi") else 0.0
+        if sh:
+            b, d = a * sh + b, c * sh + d  # M * [[1, sh], [0, 1]] (FreeType y-up)
+        mat = _ft.Matrix(int(round(a * 0x10000)), int(round(b * 0x10000)),
+                         int(round(c * 0x10000)), int(round(d * 0x10000)))
         vec = _ft.Vector(int(round((X - ix) * 64)), int(round(-(Y - iy) * 64)))
         face.set_transform(mat, vec)
         face.load_glyph(g["gid"], flags)
@@ -671,38 +750,50 @@ class FreeTypeRaster:
             return None
         return np.array(bm.buffer, dtype=np.float64).reshape(bm.rows, bm.pitch)[:, :bm.width] / 255.0
 
-    def fill(self, glyphs, box, off=(0.0, 0.0)):
-        """Per color: list of (rgb, coverage)."""
+    def _radius(self, g, extra):
+        k = float(self.spec["options"].get("faux_bold_k") or 0.0) if g.get("fb") else 0.0
+        sy = matrix_scale(self.spec["matrix"])[1]
+        return extra + k * g["size_pt"] * sy
+
+    def fill(self, glyphs, box, off=(0.0, 0.0), extra=0.0):
+        """Per color: list of (rgb, coverage). Glyphs with a positive radius are emboldened (stroke + fill)."""
         layers = {}
         order = []
         for g in glyphs:
-            face, ix, iy = self._load(g, box, off, _ft.FT_LOAD_NO_HINTING | _ft.FT_LOAD_RENDER)
-            arr = self._bitmap_array(face.glyph.bitmap)
-            if arr is None:
-                continue
+            rad = self._radius(g, extra)
             key = tuple(g["color"])
             if key not in layers:
                 layers[key] = box.zeros()
                 order.append(key)
+            if rad > 0:
+                self._stroke_one(layers[key], g, box, off, rad, fill=True)
+                continue
+            face, ix, iy = self._load(g, box, off, _ft.FT_LOAD_NO_HINTING | _ft.FT_LOAD_RENDER)
+            arr = self._bitmap_array(face.glyph.bitmap)
+            if arr is None:
+                continue
             _blit_union(layers[key], arr, ix + face.glyph.bitmap_left, iy - face.glyph.bitmap_top)
         return [(k, layers[k]) for k in order]
 
     def stroke(self, glyphs, box, radius, off=(0.0, 0.0)):
-        """Round-join stroke-and-fill coverage (outline grown by *radius* px)."""
+        """Round-join stroke-and-fill coverage (outline grown by *radius* px, plus any faux-bold embolden)."""
         cov = box.zeros()
+        for g in glyphs:
+            self._stroke_one(cov, g, box, off, radius + self._radius(g, 0.0), fill=True)
+        return cov
+
+    def _stroke_one(self, cov, g, box, off, radius, fill=True):
         stroker = _ft.Stroker()
         stroker.set(int(round(radius * 64)), _ft.FT_STROKER_LINECAP_ROUND, _ft.FT_STROKER_LINEJOIN_ROUND, 0)
-        for g in glyphs:
-            face, ix, iy = self._load(g, box, off, _ft.FT_LOAD_NO_HINTING | _ft.FT_LOAD_NO_BITMAP)
-            for do_stroke in (True, False):
-                glyph = face.glyph.get_glyph()
-                if do_stroke:
-                    glyph.stroke(stroker, True)
-                bg = glyph.to_bitmap(_ft.FT_RENDER_MODE_NORMAL, _ft.Vector(0, 0), True)
-                arr = self._bitmap_array(bg.bitmap)
-                if arr is not None:
-                    _blit_union(cov, arr, ix + bg.left, iy - bg.top)
-        return cov
+        face, ix, iy = self._load(g, box, off, _ft.FT_LOAD_NO_HINTING | _ft.FT_LOAD_NO_BITMAP)
+        for do_stroke in ((True, False) if fill else (True,)):
+            glyph = face.glyph.get_glyph()
+            if do_stroke:
+                glyph.stroke(stroker, True)
+            bg = glyph.to_bitmap(_ft.FT_RENDER_MODE_NORMAL, _ft.Vector(0, 0), True)
+            arr = self._bitmap_array(bg.bitmap)
+            if arr is not None:
+                _blit_union(cov, arr, ix + bg.left, iy - bg.top)
 
 
 class SkiaRaster:
@@ -711,7 +802,7 @@ class SkiaRaster:
 
     def __init__(self, spec):
         self.spec = spec
-        self.snap = bool(spec["options"].get("snap_glyph_origin"))
+        self.snap = snap_mode(spec)
         self.sk = _skia()
 
     def _typeface(self, path):
@@ -733,7 +824,9 @@ class SkiaRaster:
             if gp is None:
                 continue
             X, Y = _origin(self.spec, g, off, self.snap)
-            m = sk.Matrix.MakeAll(xx, yx, X - box.x0, xy, yy, Y - box.y0, 0, 0, 1)
+            sh = float(self.spec["options"].get("faux_italic_shear") or 0.0) if g.get("fi") else 0.0
+            # text space is y-down here: shear x by -sh * y so glyph tops lean right
+            m = sk.Matrix.MakeAll(xx, yx - sh * xx, X - box.x0, xy, yy - sh * xy, Y - box.y0, 0, 0, 1)
             gp.transform(m)
             out.addPath(gp)
         return out
@@ -745,7 +838,11 @@ class SkiaRaster:
         surf.getCanvas().drawPath(path, paint)
         return surf.makeImageSnapshot().toarray()[..., 3].astype(np.float64) / 255.0
 
-    def fill(self, glyphs, box, off=(0.0, 0.0)):
+    def _radius(self, g, extra):
+        k = float(self.spec["options"].get("faux_bold_k") or 0.0) if g.get("fb") else 0.0
+        return extra + k * g["size_pt"] * matrix_scale(self.spec["matrix"])[1]
+
+    def fill(self, glyphs, box, off=(0.0, 0.0), extra=0.0):
         sk = self.sk
         by, order = {}, []
         for g in glyphs:
@@ -754,8 +851,22 @@ class SkiaRaster:
                 by[key] = []
                 order.append(key)
             by[key].append(g)
-        paint = sk.Paint(AntiAlias=True, Color=sk.ColorWHITE)
-        return [(k, self._draw(self._path(by[k], box, off), box, paint)) for k in order]
+        out = []
+        for k in order:
+            cov = np.zeros((box.h, box.w))
+            radii = {}
+            for g in by[k]:
+                radii.setdefault(round(self._radius(g, extra), 4), []).append(g)
+            for rad, gs in radii.items():
+                if rad > 0:
+                    paint = sk.Paint(AntiAlias=True, Color=sk.ColorWHITE, Style=sk.Paint.kStrokeAndFill_Style,
+                                     StrokeWidth=2 * rad, StrokeJoin=sk.Paint.kRound_Join)
+                else:
+                    paint = sk.Paint(AntiAlias=True, Color=sk.ColorWHITE)
+                a = self._draw(self._path(gs, box, off), box, paint)
+                cov = cov + a - cov * a
+            out.append((k, cov))
+        return out
 
     def stroke(self, glyphs, box, radius, off=(0.0, 0.0)):
         sk = self.sk
@@ -848,20 +959,37 @@ def render_spec(spec, renderer, fonts_dir=None):
         info["approximations"].append(f"warp {spec['warp']} not rendered")
     if spec.get("shape") == "box":
         info["approximations"].append("paragraph (box) text: no wrapping; laid out as point text from its anchor")
-    for r in spec["runs"]:
-        if r["faux_bold"] or r["faux_italic"]:
-            info["approximations"].append("faux bold / italic not rendered")
-            break
+    opts0 = spec["options"]
+    if any(r["faux_bold"] for r in spec["runs"]):
+        info["approximations"].append("faux bold drawn as outline embolden + wider advance (empirical)"
+                                      if float(opts0.get("faux_bold_k") or 0) > 0 else "faux bold not rendered")
+    if any(r["faux_italic"] for r in spec["runs"]):
+        info["approximations"].append("faux italic drawn as a shear (empirical)"
+                                      if float(opts0.get("faux_italic_shear") or 0) > 0 else "faux italic not rendered")
     for r in spec["runs"]:
         if abs((r["horizontal_scale"] or 100) - 100) > 0.01 or abs((r["vertical_scale"] or 100) - 100) > 0.01:
             info["approximations"].append("horizontal / vertical character scale not rendered")
             break
     if not glyphs:
         return None, (0, 0), dict(info, skipped="no glyphs")
-    box = estimate_box(spec, glyphs, effect_outset(spec))
+    box = estimate_box(spec, glyphs, effect_outset(spec) + 2)
     shape = (box.h, box.w)
-    fills = raster.fill(glyphs, box)
+    opts = spec["options"]
+    rule = aa_rule(spec)
+    emb = float(rule.get("embolden") or 0.0)
+
+    def post(cov):
+        if rule.get("threshold") is not None:
+            return (cov >= float(rule["threshold"])).astype(np.float64)
+        g = rule.get("gamma")
+        if g and abs(float(g) - 1.0) > 1e-9:
+            return np.clip(cov, 0, 1) ** (1.0 / float(g))
+        return cov
+
+    fills = [(k, post(c)) for k, c in raster.fill(glyphs, box, extra=emb)]
     fill_union = _union([c for _, c in fills], shape)
+    if rule:
+        info["aa_rule"] = {"mode": spec.get("anti_alias"), **rule}
 
     A = np.zeros(shape)
     C = np.zeros(shape + (3,))
@@ -872,7 +1000,9 @@ def render_spec(spec, renderer, fonts_dir=None):
             info["effects_unrendered"].append(e["type"])
         elif (e.get("blend_mode") or e.get("mode") or "normal") not in ("normal", None):
             info["approximations"].append(f"{e['type']} blend mode {e.get('blend_mode') or e.get('mode')} drawn as normal")
-    sigma_div = float(spec["options"].get("shadow_sigma_div") or 2.0)
+    sigma_div = float(opts.get("shadow_sigma_div") or 2.0)
+    glow_div = float(opts.get("glow_sigma_div") or sigma_div)
+    hires_spread = opts.get("spread_model") == "hires"
     # 1. outer effects under the fill
     for e in effs:
         t = e["type"]
@@ -882,11 +1012,18 @@ def render_spec(spec, renderer, fonts_dir=None):
         spread = max(0.0, min(100.0, _f(e.get("spread"), 0.0) or 0.0)) / 100.0
         if t == "DropShadow":
             off = _shadow_offset(e)
-            base = _union([c for _, c in raster.fill(glyphs, box, off)], shape)
+            base = _union([post(c) for _, c in raster.fill(glyphs, box, off, extra=emb)], shape)
         else:
             base = fill_union
-        a = _dilate(base, size * spread)
-        a = _blur(a, size * (1.0 - spread) / sigma_div)
+        if hires_spread:
+            a = _grow_hires(base, size * spread)
+        else:
+            a = _dilate(base, size * spread)
+        a = _blur(a, size * (1.0 - spread) / (sigma_div if t == "DropShadow" else glow_div))
+        if t == "OuterGlow" and opts.get("glow_range"):
+            rng = _f(e.get("range"), None)
+            rng = (rng / 100.0 if rng and rng > 1 else rng) or float(opts["glow_range"])
+            a = np.clip(a / max(rng, 1e-3), 0, 1)
         a = np.clip(a, 0, 1) * _unit_opacity(e.get("opacity"), 0.75)
         A, C = _over(A, C, a, hex_rgb(e.get("color") or ("#000000" if t == "DropShadow" else "#ffffff")))
         info["effects_drawn"].append(t)
@@ -895,42 +1032,122 @@ def render_spec(spec, renderer, fonts_dir=None):
         fill_type = str(e.get("fill_type") or "solidcolor").lower()
         if "solid" not in fill_type:
             info["approximations"].append(f"stroke fill {fill_type} drawn as solid color")
-    # 2. outside strokes under the fill
-    for e in strokes:
-        if e.get("position", "outside") != "outside":
-            continue
-        a = raster.stroke(glyphs, box, _f(e.get("size"), 0.0) or 0.0) * _unit_opacity(e.get("opacity"), 1.0)
-        A, C = _over(A, C, a, hex_rgb(e.get("color") or "#000000"))
-        info["effects_drawn"].append("Stroke")
-    # 3. fill (fill opacity applies to fill + color overlay only)
     fo = spec["fill_opacity"]
-    for rgb, cov in fills:
+    model = opts.get("stroke_model") or "legacy"
+
+    def fill_rgb(rgb):
         rgb = np.asarray(rgb, dtype=np.float64)
         for e in overlay:
             op = _unit_opacity(e.get("opacity"), 1.0)
             rgb = rgb * (1 - op) + np.asarray(hex_rgb(e.get("color") or "#000000")) * op
-        A, C = _over(A, C, cov * fo, rgb)
-    if overlay:
-        info["effects_drawn"].append("ColorOverlay")
-    # 4. center / inside strokes over the fill
-    for e in strokes:
-        pos = e.get("position", "outside")
-        if pos == "outside":
-            continue
-        size = _f(e.get("size"), 0.0) or 0.0
-        if pos == "center":
-            # band straddling the outline: grown by size/2 minus shrunk by size/2
-            ring = raster.stroke(glyphs, box, size / 2.0)
-            a = np.clip(ring - _erode(fill_union, size / 2.0), 0, 1)
-        else:
-            a = np.clip(fill_union - _erode(fill_union, size), 0, 1)
-            info["approximations"].append("inside stroke approximated by erosion")
-        a = a * _unit_opacity(e.get("opacity"), 1.0)
-        A, C = _over(A, C, a, hex_rgb(e.get("color") or "#000000"))
-        info["effects_drawn"].append("Stroke")
+        return rgb
+
+    if opts.get("stroke_composite") == "disjoint":
+        # one "layer content": outside ring, inside / center band and the remaining fill are disjoint areas
+        num = np.zeros(shape + (3,))
+        T = np.zeros(shape)
+        removed = np.zeros(shape)
+        for e in strokes:
+            size = _f(e.get("size"), 0.0) or 0.0
+            pos = e.get("position", "outside")
+            sop = _unit_opacity(e.get("opacity"), 1.0)
+            m = _stroke_mask(model, pos, size, raster, glyphs, box, fill_union, emb)
+            if pos == "outside":
+                area = np.clip(m - fill_union, 0, 1)
+            else:
+                area = m
+                removed = np.maximum(removed, np.minimum(m, fill_union))
+            col = np.asarray(hex_rgb(e.get("color") or "#000000"))
+            num += (area * sop)[..., None] * col[None, None, :]
+            T += area * sop
+            info["effects_drawn"].append("Stroke")
+        keep = np.where(fill_union > 1e-9, np.clip(fill_union - removed, 0, 1) / np.maximum(fill_union, 1e-9), 0.0)
+        for rgb, cov in fills:
+            fa = cov * keep
+            num += (fa * fo)[..., None] * fill_rgb(rgb)[None, None, :]
+            T += fa * fo
+        T = np.clip(T, 0, 1)
+        col = np.where(T[..., None] > 1e-9, num / np.maximum(T[..., None], 1e-9), 0.0)
+        A, C = _over(A, C, T, col)
+        if overlay:
+            info["effects_drawn"].append("ColorOverlay")
+    else:
+        # 2. outside strokes under the fill
+        for e in strokes:
+            if e.get("position", "outside") != "outside":
+                continue
+            m = _stroke_mask(model, "outside", _f(e.get("size"), 0.0) or 0.0, raster, glyphs, box, fill_union, emb)
+            a = m * _unit_opacity(e.get("opacity"), 1.0)
+            A, C = _over(A, C, a, hex_rgb(e.get("color") or "#000000"))
+            info["effects_drawn"].append("Stroke")
+        # 3. fill
+        for rgb, cov in fills:
+            A, C = _over(A, C, cov * fo, fill_rgb(rgb))
+        if overlay:
+            info["effects_drawn"].append("ColorOverlay")
+        # 4. center / inside strokes over the fill
+        for e in strokes:
+            pos = e.get("position", "outside")
+            if pos == "outside":
+                continue
+            size = _f(e.get("size"), 0.0) or 0.0
+            a = _stroke_mask(model, pos, size, raster, glyphs, box, fill_union, emb)
+            if model == "legacy" and pos == "inside":
+                info["approximations"].append("inside stroke approximated by erosion")
+            a = a * _unit_opacity(e.get("opacity"), 1.0)
+            A, C = _over(A, C, a, hex_rgb(e.get("color") or "#000000"))
+            info["effects_drawn"].append("Stroke")
     A = A * spec["opacity"]
     rgba = np.dstack([np.clip(C, 0, 255), np.clip(A * 255.0, 0, 255)]).round().astype(np.uint8)
     return Image.fromarray(rgba, "RGBA"), (box.x0, box.y0), info
+
+
+_HI = 4
+
+
+def _need_ndi(what):
+    if _ndi is None:
+        raise TextRendererUnavailable(f"{what} needs scipy (scipy.ndimage distance transform)", INSTALL_SCIPY)
+
+
+def _hires(cov):
+    _need_ndi("hires stroke / spread model")
+    im = Image.fromarray((np.clip(cov, 0, 1) * 65535).astype(np.uint16).astype(np.int32), "I")
+    big = im.resize((cov.shape[1] * _HI, cov.shape[0] * _HI), Image.BILINEAR)
+    return np.asarray(big, dtype=np.float64) / 65535.0 >= 0.5
+
+
+def _down(mask):
+    h, w = mask.shape[0] // _HI, mask.shape[1] // _HI
+    return mask.reshape(h, _HI, w, _HI).mean(axis=(1, 3))
+
+
+def _grow_hires(cov, r):
+    if r <= 0:
+        return cov
+    hi = _hires(cov)
+    d = _ndi.distance_transform_edt(~hi) / _HI
+    return np.maximum(cov, _down(d <= r))
+
+
+def _stroke_mask(model, pos, size, raster, glyphs, box, fill_union, emb=0.0):
+    """Absolute coverage of a stroke of *size* px at *pos* (outside: stroke + fill area)."""
+    if model == "legacy":
+        if pos == "outside":
+            return raster.stroke(glyphs, box, size)
+        if pos == "center":
+            ring = raster.stroke(glyphs, box, size / 2.0)
+            return np.clip(ring - _erode(fill_union, size / 2.0), 0, 1)
+        return np.clip(fill_union - _erode(fill_union, size), 0, 1)
+    # hires: distance transform of the rasterised alpha (what a pixel layer style sees)
+    hi = _hires(fill_union)
+    dout = _ndi.distance_transform_edt(~hi) / _HI
+    din = _ndi.distance_transform_edt(hi) / _HI
+    if pos == "outside":
+        return np.maximum(fill_union, _down(dout <= size))
+    if pos == "center":
+        return _down(np.where(hi, din <= size / 2.0, dout <= size / 2.0))
+    return np.minimum(fill_union, _down(hi & (din <= size)))
 
 
 def _erode(a, r):
@@ -1011,6 +1228,8 @@ def effects_from_descriptor(desc):
             elif base in ("outerGlow", "innerGlow"):
                 item["size"] = _f(e.get("blur"), 0.0)
                 item["spread" if base == "outerGlow" else "choke"] = _f(e.get("chokeMatte"), 0.0)
+                if e.get("inputRange") is not None:
+                    item["range"] = _f(e.get("inputRange"))
             out.append(item)
     return visible, out
 

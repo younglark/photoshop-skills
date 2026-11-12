@@ -351,7 +351,7 @@ class ValidateReport(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _validate(self, attrs, renderer="auto"):
+    def _validate(self, attrs, renderer="auto", profile="ps2026"):
         layout = {
             "schema": h.SCHEMA_LAYOUT,
             "source": {"doc_size": [200, 80], "artboard": {"name": "board", "bounds": [0, 0, 200, 80],
@@ -372,7 +372,8 @@ class ValidateReport(unittest.TestCase):
             rc = h.cmd_validate(SimpleNamespace(layout=str(lpath), slices_dir=str(self.slices), full_render=str(rpath),
                                                 out_dir=str(out), fonts_dir=str(self.fonts), group_effects=None,
                                                 reuse_tol_mae=4.0, reuse_tol_pct=1.0, text_renderer=renderer,
-                                                mixed_leading_k=None, snap_glyph_origin=None))
+                                                mixed_leading_k=None, snap_glyph_origin=None, text_legacy_rules=False,
+                                                text_profile=profile))
         report = json.loads((out / "validate_report.json").read_text(encoding="utf-8"))
         return rc, report, out, err.getvalue()
 
@@ -411,7 +412,12 @@ class ValidateReport(unittest.TestCase):
         tr = report["text_renderer"]
         self.assertEqual((tr["requested"], tr["used"]), ("auto", "freetype"))
         self.assertNotIn("fallback_reason", tr)
-        self.assertAlmostEqual(tr["options"]["mixed_leading_k"], 0.86)
+        self.assertAlmostEqual(tr["options"]["mixed_leading_k"], 0.0)
+        self.assertEqual(tr["options"]["aa_rules"]["antiAliasPlatformGray"], {"gamma": 1.4})
+        self.assertEqual(tr["profile"], "ps2026")
+        _rc, report2, _o, _e = self._validate(T.text_attrs_from_descriptor(_desc(two_runs=False)), profile="older-file")
+        opts2 = report2["text_renderer"]["options"]
+        self.assertEqual((opts2["mixed_leading_k"], opts2["aa_rules"], opts2["stroke_model"]), (0.86, {}, "hires"))
         self.assertEqual(tr["legacy_v1_text_attrs"], 0)
         info = report["dynamic_text_render_info"][0]
         self.assertEqual((info["name"], info["renderer"]), ("main_text_label", "freetype"))
@@ -428,6 +434,134 @@ class ValidateReport(unittest.TestCase):
         self.assertEqual(report["text_renderer"]["legacy_v1_text_attrs"], 1)
         self.assertEqual(report["text_renderer"]["legacy_v1_nodes"], ["main_text_label"])
         self.assertIn("legacy v1", err)
+
+
+class Rules14(unittest.TestCase):
+    """1.4.0 rules checked against Photoshop gold images (references/slicing.md 10.6)."""
+
+    def test_default_mixed_leading_is_zero_and_legacy_keeps_086(self):
+        self.assertEqual(T.DEFAULT_OPTIONS["mixed_leading_k"], 0.0)
+        self.assertEqual(T.LEGACY_1_3_OPTIONS["mixed_leading_k"], 0.86)
+        prev = [{"size_pt": 30.0, "auto_leading": True, "leading_pt": None}]
+        cur = [{"size_pt": 42.0, "auto_leading": True, "leading_pt": None}]
+        self.assertAlmostEqual(T.line_advance(prev, cur, dict(T.DEFAULT_OPTIONS)), 42.0 * 1.2)
+        self.assertAlmostEqual(T.line_advance(prev, cur, dict(T.DEFAULT_OPTIONS, **T.LEGACY_1_3_OPTIONS)),
+                               42.0 * 1.2 + 0.86 * 12.0)
+
+    def test_outer_glow_range_is_exported(self):
+        desc = _desc(two_runs=False)
+        desc["layerEffects"]["outerGlow"] = {"enabled": True, "present": True, "blur": _u(6, "pixelsUnit"),
+                                             "chokeMatte": _u(0, "percentUnit"), "inputRange": _u(50, "percentUnit"),
+                                             "opacity": _u(75, "percentUnit"), "color": {"red": 255, "grain": 230, "blue": 128}}
+        attrs = T.text_attrs_from_descriptor(desc)
+        glow = [e for e in attrs["layer_effects"] if e["type"] == "OuterGlow"][0]
+        self.assertEqual((glow["size"], glow["range"]), (6.0, 50.0))
+
+    def test_aa_rule_and_snap_axes(self):
+        spec = T.text_spec(dict(T.text_attrs_from_descriptor(_desc(two_runs=False))), doc_size=(1000, 400))
+        self.assertEqual(spec["anti_alias"], "antiAliasPlatformGray")
+        self.assertEqual(T.aa_rule(spec), {"gamma": 1.4})
+        self.assertEqual(T.snap_mode(spec), (True, True))
+        spec["anti_alias"] = "antiAliasSmooth"
+        self.assertEqual(T.snap_mode(spec), (True, False))
+        spec["anti_alias"] = "antiAliasSharp"
+        self.assertEqual(T.aa_rule(spec), {})
+
+
+class MixedLines(unittest.TestCase):
+    def test_detects_mixed_size_lines(self):
+        runs = [{"from": 0, "to": 6, "size_px": 40}, {"from": 6, "to": 9, "size_px": 56}]
+        self.assertTrue(h.text_has_mixed_size_lines({"content": "Level\r280", "runs": runs}))
+        self.assertFalse(h.text_has_mixed_size_lines({"content": "Level 280", "runs": runs}))
+        same = [{"from": 0, "to": 3, "size_px": 40}, {"from": 3, "to": 9, "size_px": 40}]
+        self.assertFalse(h.text_has_mixed_size_lines({"content": "Level\r280", "runs": same}))
+
+
+@unittest.skipIf(find_test_font() is None or T._hb is None or T._ft is None, "uharfbuzz / freetype-py or a TTF missing")
+class Rules14Rendering(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fonts = self.tmp / "fonts"
+        self.fonts.mkdir()
+        shutil.copy(find_test_font(), self.fonts / "Sample-Font.ttf")
+        T._FONT_INDEX.clear()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _render(self, desc, renderer="freetype", **opts):
+        attrs = T.text_attrs_from_descriptor(desc)
+        return T.render_text(attrs, renderer=renderer, fonts_dir=str(self.fonts), doc_size=(1000, 400), options=opts)
+
+    @staticmethod
+    def _alpha(im):
+        return np.asarray(im)[..., 3].astype(float)
+
+    def test_platform_gray_gamma_darkens_partial_pixels(self):
+        desc = _desc(two_runs=False, fx_visible=False)
+        im_rule, _xy, info = self._render(desc)
+        im_plain, _xy2, _i = self._render(desc, aa_rules={})
+        self.assertEqual(info["aa_rule"]["gamma"], 1.4)
+        self.assertGreater(self._alpha(im_rule).sum(), self._alpha(im_plain).sum() * 1.02)
+
+    def _faux(self, key):
+        desc = _desc(two_runs=False, fx_visible=False)
+        desc["textKey"]["textStyleRange"][0]["textStyle"][key] = True
+        return desc
+
+    def test_faux_bold_is_drawn_and_can_be_turned_off(self):
+        plain, _xy, _i = self._render(_desc(two_runs=False, fx_visible=False))
+        bold, _xy2, info = self._render(self._faux("syntheticBold"))
+        off, _xy3, info_off = self._render(self._faux("syntheticBold"), faux_bold_k=0.0, faux_bold_adv_k=0.0)
+        self.assertGreater(self._alpha(bold).sum(), self._alpha(plain).sum() * 1.05)
+        cols = lambda im: np.where(self._alpha(im).max(axis=0) > 0)[0]
+        self.assertGreater(cols(bold)[-1] - cols(bold)[0], cols(plain)[-1] - cols(plain)[0])
+        self.assertTrue(any("embolden" in a for a in info["approximations"]))
+        self.assertIn("faux bold not rendered", info_off["approximations"])
+        self.assertAlmostEqual(self._alpha(off).sum(), self._alpha(plain).sum(), delta=1.0)
+
+    def test_faux_italic_is_a_shear(self):
+        plain, _xy, _i = self._render(_desc(two_runs=False, fx_visible=False))
+        ital, _xy2, info = self._render(self._faux("syntheticItalic"))
+        self.assertTrue(any("shear" in a for a in info["approximations"]))
+        self.assertFalse(np.array_equal(np.asarray(plain), np.asarray(ital)))
+
+    def test_fill_opacity_keeps_the_outside_stroke(self):
+        desc = _desc(two_runs=False)
+        desc["fillOpacity"] = 0
+        disjoint, _xy, _i = self._render(desc)
+        over, _xy2, _i2 = self._render(desc, stroke_composite="over")
+        # Photoshop: fill opacity 0 leaves only the stroke ring; the 1.3 'over' composite kept the glyph body
+        self.assertLess(self._alpha(disjoint).sum(), self._alpha(over).sum() * 0.9)
+        self.assertGreater(self._alpha(disjoint).max(), 200)
+
+    def test_hires_stroke_needs_scipy(self):
+        saved = T._ndi
+        T._ndi = None
+        try:
+            with self.assertRaises(T.TextRendererUnavailable) as cm:
+                self._render(_desc(two_runs=False))
+            self.assertIn("pip install scipy", str(cm.exception))
+            im, _xy, _i = self._render(_desc(two_runs=False, fx_visible=False))  # no effect: no scipy needed
+            self.assertIsNotNone(im)
+        finally:
+            T._ndi = saved
+
+    def test_legacy_rules_still_render(self):
+        for renderer in ("freetype",) + (("skia",) if T._skia() is not None else ()):
+            for fill_opacity in (100, 0):
+                desc = _desc(two_runs=False)
+                desc["textKey"]["textStyleRange"][0]["textStyle"]["syntheticBold"] = True
+                desc["fillOpacity"] = fill_opacity
+                im, _xy, info = self._render(desc, renderer=renderer, **T.LEGACY_1_3_OPTIONS)
+                self.assertEqual(info["effects_drawn"], ["Stroke"])
+                self.assertGreater(self._alpha(im).max(), 200)
+
+    @unittest.skipIf(T._skia() is None, "skia-python not installed")
+    def test_skia_draws_faux_bold(self):
+        plain, _xy, _i = self._render(_desc(two_runs=False, fx_visible=False), renderer="skia")
+        bold, _xy2, _i2 = self._render(self._faux("syntheticBold"), renderer="skia")
+        self.assertGreater(self._alpha(bold).sum(), self._alpha(plain).sum() * 1.05)
 
 
 if __name__ == "__main__":
