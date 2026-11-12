@@ -25,6 +25,11 @@
 // 1.4.15: a slice whose layer was hidden at open and is covered by an unanswered blocking decision is not rendered
 // (item.skipped_pending_decision, log.skipped_pending_decision); every rendered PNG records exported_at, so
 // validate can tell a PNG made before the user's answer (exported_before_decision).
+// 1.4.16: a slice shows only what the document shows. When an ancestor group's layer / vector mask or the layer's
+// clipping base (not selected with it) hides part of the layer, the temporary copy is cropped to that area before
+// trim (item.mask_clip: clipped, cropped, clip_bounds, layer_bounds, sources; item.mask_clipped). The crop is the
+// mask's bounding box; validate (slice_exceeds_visible_area) checks the pixels. A user's unmasked_asset answer
+// (unmasked) keeps the whole layer.
 
 const { app, core, action } = require("photoshop");
 const fs = require("uxp").storage.localFileSystem;
@@ -33,7 +38,7 @@ const fs = require("uxp").storage.localFileSystem;
 const CONFIG_URL = "file:/D:/work/ps-job/export_config.json";
 // -----------------------------------------------------------------------
 
-const EXPORTER_RELEASE = "1.4.15";
+const EXPORTER_RELEASE = "1.4.16";
 let ROOT_URL, SOURCE_URL, SOURCE_PATH_HINT, MANIFEST_NAME, LOG_NAME, SLICES_DIR_NAME, FULL_RENDER_NAME, EXPORTER_URL;
 
 async function loadConfig() {
@@ -485,7 +490,8 @@ function snapshotLayers(doc) {
 // Layers the user chose to leave out: a reuse_decisions entry with layer_ids whose decision is an exclusion,
 // decided_by "user" AND recorded by `confirm --decision` in the lock's decision_log. Anything else is kept.
 const EXCLUDE_TYPES = new Set(["layer_inclusion", "exclude_visible_layer"]);
-const TRUTH_TYPES = new Set(["layer_inclusion", "exclude_visible_layer", "hidden_layer_state"]);
+const TRUTH_TYPES = new Set(["layer_inclusion", "exclude_visible_layer", "hidden_layer_state", "unmasked_asset"]);
+const UNMASKED_VALUES = new Set(["unmasked", "export_unmasked", "full", "full_layer", "whole_layer", "unclipped", "yes"]);
 const EXCLUDE_VALUES = new Set(["exclude", "excluded", "hide", "hidden", "omit", "not_exported", "no_export",
   "skip", "drop", "old_draft", "leftover", "remove"]);
 const PENDING_VALUES = new Set(["", "pending", "wait_for_user", "none", "null"]);
@@ -501,6 +507,7 @@ function isBlockingDecision(d) {
 function userDecisionState(manifest, decisionLog) {
   const excluded = [];
   const pending = [];
+  const unmasked = new Set();
   for (const d of manifest.reuse_decisions || []) {
     if (!d || typeof d !== "object") continue;
     const val = normDecision(d.decision);
@@ -512,10 +519,98 @@ function userDecisionState(manifest, decisionLog) {
       if (isBlockingDecision(d)) pending.push({ id: d.id, type: d.type || null, layer_ids: d.layer_ids || null });
       continue;
     }
+    if (d.type === "unmasked_asset" && UNMASKED_VALUES.has(val)) {
+      for (const id of d.layer_ids || []) unmasked.add(Number(id));
+      continue;
+    }
     if (!(EXCLUDE_TYPES.has(d.type) || isBlockingDecision(d)) || !EXCLUDE_VALUES.has(val)) continue;
     for (const id of d.layer_ids || []) excluded.push({ id: id, decision_id: d.id });
   }
-  return { excluded: excluded, pending: pending };
+  return { excluded: excluded, pending: pending, unmasked: unmasked };
+}
+
+function rectIntersect(a, b) {
+  if (!a) return b ? Object.assign({}, b) : null;
+  if (!b) return Object.assign({}, a);
+  return { left: Math.max(a.left, b.left), top: Math.max(a.top, b.top),
+           right: Math.min(a.right, b.right), bottom: Math.min(a.bottom, b.bottom) };
+}
+
+function rectUnion(a, b) {
+  if (!a) return b ? Object.assign({}, b) : null;
+  if (!b) return Object.assign({}, a);
+  return { left: Math.min(a.left, b.left), top: Math.min(a.top, b.top),
+           right: Math.max(a.right, b.right), bottom: Math.max(a.bottom, b.bottom) };
+}
+
+function rectEmpty(r) { return !r || r.right <= r.left || r.bottom <= r.top; }
+
+function maskFlags(desc) {
+  return {
+    user_mask: !!(desc && desc.hasUserMask) && desc.userMaskEnabled !== false,
+    vector_mask: !!(desc && desc.hasVectorMask) && desc.vectorMaskEnabled !== false
+  };
+}
+
+// The area of the selected layers the document shows: each layer's own bounds clipped by the bounds of every
+// ancestor group that has an enabled layer / vector mask (Photoshop's group `bounds` already apply its mask), and by
+// its clipping base when the base is not selected too. The layer's own mask travels with "new document from layer",
+// so it is only recorded (role self). Returns { clipped, clip_bounds, layer_bounds, sources, mask_layer_ids }.
+async function maskClipFor(src, selectIds) {
+  const sources = [];
+  const maskIds = [];
+  let union = null;
+  let layerUnion = null;
+  let clipped = false;
+  for (const id of selectIds) {
+    const own = (await bp([{ _obj: "get", _target: [{ _ref: "layer", _id: id }] }]))[0] || {};
+    const ownBounds = unitRect(own.bounds);
+    layerUnion = rectUnion(layerUnion, ownBounds);
+    const ownFlags = maskFlags(own);
+    if (ownFlags.user_mask || ownFlags.vector_mask) {
+      sources.push({ id: id, name: own.name || "", role: "self", user_mask: ownFlags.user_mask,
+                     vector_mask: ownFlags.vector_mask, bounds: ownBounds, bounds_no_mask: unitRect(own.boundsNoMask) });
+    }
+    let r = ownBounds;
+    const chain = [];
+    collectAncestorChain(src, id, chain);
+    for (const anc of chain) {
+      if (!anc || selectIds.indexOf(anc.id) >= 0) continue;
+      const ad = (await bp([{ _obj: "get", _target: [{ _ref: "layer", _id: anc.id }] }]))[0] || {};
+      const f = maskFlags(ad);
+      if (!f.user_mask && !f.vector_mask) continue;
+      const ab = unitRect(ad.bounds);
+      sources.push({ id: anc.id, name: anc.name || "", role: "ancestor", user_mask: f.user_mask,
+                     vector_mask: f.vector_mask, bounds: ab, bounds_no_mask: unitRect(ad.boundsNoMask) });
+      if (ab) { r = rectIntersect(r, ab); if (maskIds.indexOf(anc.id) < 0) maskIds.push(anc.id); }
+    }
+    const dom = findLayer(src, id);
+    let isClipped = false;
+    try { isClipped = !!(dom && dom.isClippingMask); } catch (errC) {}
+    if (isClipped) {
+      let sibs = [];
+      try { sibs = (dom.parent ? dom.parent.layers : src.layers) || []; } catch (errP) { sibs = []; }
+      let k = sibs.findIndex((l) => l.id === id) + 1;
+      while (k > 0 && k < sibs.length) {
+        let c = false;
+        try { c = !!sibs[k].isClippingMask; } catch (errS) {}
+        if (!c) break;
+        k++;
+      }
+      const base = (k > 0 && k < sibs.length) ? sibs[k] : null;
+      if (base && selectIds.indexOf(base.id) < 0) {
+        let bb = null;
+        try { bb = unitRect(base.bounds); } catch (errB) {}
+        sources.push({ id: base.id, name: base.name || "", role: "clip_base", bounds: bb });
+        if (bb) { r = rectIntersect(r, bb); if (maskIds.indexOf(base.id) < 0) maskIds.push(base.id); }
+      }
+    }
+    if (r && ownBounds && (r.left > ownBounds.left || r.top > ownBounds.top || r.right < ownBounds.right
+        || r.bottom < ownBounds.bottom)) clipped = true;
+    if (!rectEmpty(r)) union = rectUnion(union, r);
+  }
+  return { clipped: clipped, clip_bounds: clipped ? union : null, layer_bounds: layerUnion,
+           sources: sources, mask_layer_ids: maskIds, cropped: false };
 }
 
 function restoreHiddenChain(src, restored) {
@@ -836,6 +931,13 @@ try {
             continue;
           }
 
+          // 1.4.16: what masks / a clipping base leave visible (before the temporary document is made).
+          let maskClip = null;
+          try { maskClip = await maskClipFor(src, selectIds); }
+          catch (errM) { item.mask_clip_error = String((errM && errM.message) || errM); }
+          const unmaskedByUser = !!maskClip && (selectIds.concat(maskClip.mask_layer_ids))
+            .some((id) => decisionState.unmasked.has(Number(id)));
+          if (maskClip && (maskClip.clipped || maskClip.sources.length)) item.mask_clip = maskClip;
           // Select base + any visible clipped layers, then new document from the target.
           // effect_mode "engine": select_ids are the children of an effect group; the new
           // document has no parent group, so the group's effects are intentionally not baked.
@@ -889,8 +991,41 @@ try {
           }
           item.tmp_before_size = [tmp.width, tmp.height];
           item.tmp_aligned_with_source = (tmp.width === src.width && tmp.height === src.height);
-          const beforeTrim = packDomBounds(tmp.layers[0] && tmp.layers[0].bounds);
+          let beforeTrim = packDomBounds(tmp.layers[0] && tmp.layers[0].bounds);
           item.layer_bounds_before_trim = beforeTrim;
+          let cropOrigin = { left: 0, top: 0 };
+          if (maskClip && maskClip.clipped) {
+            item.mask_clipped = true;
+            item.layer_bounds = beforeTrim;
+            const c = rectIntersect(maskClip.clip_bounds, beforeTrim);
+            if (unmaskedByUser) {
+              maskClip.skipped = "user_decision_unmasked";
+            } else if (!item.tmp_aligned_with_source || !beforeTrim) {
+              maskClip.skipped = "tmp_not_aligned_with_source";
+            } else if (rectEmpty(c)) {
+              maskClip.skipped = "nothing_visible";
+            } else if (c.left > beforeTrim.left || c.top > beforeTrim.top || c.right < beforeTrim.right
+                       || c.bottom < beforeTrim.bottom) {
+              const L = Math.floor(c.left), T = Math.floor(c.top), R = Math.ceil(c.right), B = Math.ceil(c.bottom);
+              await bp([{
+                _obj: "crop",
+                to: {
+                  _obj: "rectangle",
+                  left: { _unit: "pixelsUnit", _value: L },
+                  top: { _unit: "pixelsUnit", _value: T },
+                  right: { _unit: "pixelsUnit", _value: R },
+                  bottom: { _unit: "pixelsUnit", _value: B }
+                },
+                angle: 0,
+                delete: true
+              }]);
+              maskClip.cropped = true;
+              maskClip.crop_rect = { left: L, top: T, right: R, bottom: B };
+              cropOrigin = { left: L, top: T };
+              beforeTrim = packDomBounds(tmp.layers[0] && tmp.layers[0].bounds);
+              item.layer_bounds_after_mask_crop = beforeTrim;
+            }
+          }
           await bp([{
             _obj: "trim",
             trimBasedOn: { _enum: "trimBasedOn", _value: "transparency" },
@@ -905,8 +1040,8 @@ try {
           // Tight visible origin in source space = before.left - after.left.
           // Do NOT use the pre-trim origin as the PNG's top-left.
           if (item.tmp_aligned_with_source && beforeTrim && afterTrim) {
-            const left = beforeTrim.left - afterTrim.left;
-            const top = beforeTrim.top - afterTrim.top;
+            const left = cropOrigin.left + beforeTrim.left - afterTrim.left;
+            const top = cropOrigin.top + beforeTrim.top - afterTrim.top;
             item.visible_bounds_reported = item.visible_bounds;
             item.visible_bounds = {
               left: left,

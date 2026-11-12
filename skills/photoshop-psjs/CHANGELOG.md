@@ -2,6 +2,17 @@
 
 维护者向的版本记录。现行切图规则只在 [references/slicing.md](references/slicing.md)；历史实测（原第 10 节 10.1–10.17，之后的接着编号）在 [references/slicing-history.md](references/slicing-history.md)。入口是 [SKILL.md](SKILL.md)。
 
+## 1.4.16
+
+一次素材拼板盲测暴露的问题，都落到机械检查上（`validate` 的 `issues`，`ok:false`），审核门闩也提前拦一道：
+
+- **切图只画文档看得见的部分。** `export_slices.psjs`：所选层的祖先组带启用的图层 / 矢量蒙版，或所选层剪贴到没一起选中的底上时，按组的 `bounds`（含蒙版）/ 底的边界裁出可见矩形，临时文档先裁再 trim；条目记 `mask_clipped`、`layer_bounds`、`mask_clip`（`clipped`、`cropped`、`crop_rect`、`clip_bounds`、`sources`、`mask_layer_ids`、`skipped`）。新决定类型 `unmasked_asset`（阻塞性）：用户答 `unmasked` 时导出完整层。`validate` 新增 `slice_exceeds_visible_area`：按导出器的 `mask_clip` 记录，或按像素（切片自己的不透明像素与 PS 整图逐通道 ≤ 16 吻合的列 / 行范围，范围外又不吻合的至少 64 px 且 ≥ 5%）报，带 `visible_box`、`overflow_px`；用户答 `unmasked` 的移到 `slice_exceeds_visible_area_user_accepted`。`prepare` 的图层树记 `mask`，`flatten` 列 `mask_clipped_entries`。
+- **可见层不落空。** `visible_layer_unassigned` 的每层带 `reason`（`no_decision` 附 `suggested_decision` 骨架；`user_answer_keeps_layer_needs_entry` 单独一条）；被未答决定覆盖的层只报 `pending_user_decision`。审核门闩：`flatten` / `preview` 按图层树列 `visible_layers_without_entry_or_decision`，`confirm` 在列表非空时不锁定，退出码 5。
+- **衬底不再拉低整图分数，也不被放过。** `validate` 在没有切片、颜色均匀的区域按那个颜色垫底再算：`psnr_full`（官方，不变）与 `psnr_full_over_backdrop`、`diff_text_*_over_backdrop`、`backdrop`（颜色、原因、大面积未切层及其状态），写 `recomposite_over_backdrop.png`，最终预览图垫在衬底上。没有决定的衬底层照样报 `visible_layer_unassigned`。
+- **Windows 字体路径。** 配置的字体路径原样保留（不再经 `Path()` 改写分隔符）；新增 `same_file_path`，`test_configured_font_is_used` 按规范化后的路径比较。
+
+导出器真的改了，作业目录要重新按字节复制 1.4.16 的 `examples/export_slices.psjs`。蒙版裁切还没在 Photoshop 上实测。
+
 ## 1.4.15
 
 一次新画板盲测（弹窗）暴露的交付问题，都改成机械检查（`validate` 的 `issues`，`ok:false`）：

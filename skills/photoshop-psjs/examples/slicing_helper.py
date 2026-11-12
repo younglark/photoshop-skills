@@ -56,7 +56,7 @@ except ImportError:
     ParseLimits = None
 
 SCHEMA_MANIFEST = "psjs-slice-manifest/v2"
-SKILL_VERSION = "1.4.15"
+SKILL_VERSION = "1.4.16"
 SCHEMA_LAYOUT = "psjs-layout/v2"
 SCHEMA_MANIFEST_V1 = "psjs-slice-manifest/v1"
 SCHEMA_LAYOUT_V1 = "psjs-layout/v1"
@@ -436,6 +436,112 @@ def attach_text_style_hints(node, layer):
         pass
 
 
+def layer_mask_info(layer):
+    """{bbox, enabled, clips_outside, vector} for a layer / group with a pixel or vector mask, else None.
+    clips_outside: pixels outside bbox are hidden (pixel mask background 0, or a vector mask)."""
+    out = None
+    try:
+        has = layer.has_mask() if callable(getattr(layer, "has_mask", None)) else False
+        m = getattr(layer, "mask", None) if has else None
+        if m is not None:
+            bb = [int(v) for v in (m.left, m.top, m.right, m.bottom)]
+            out = {"bbox": bb, "enabled": not bool(getattr(m, "disabled", False)),
+                   "clips_outside": int(getattr(m, "background_color", 0) or 0) == 0, "vector": False}
+    except Exception:
+        out = None
+    try:
+        hv = layer.has_vector_mask() if callable(getattr(layer, "has_vector_mask", None)) else False
+        vm = getattr(layer, "vector_mask", None) if hv else None
+        # A shape layer's vector mask is its own shape (already its bbox); only other layers / groups are clipped.
+        if vm is not None and out is None and "shape" not in layer_kind(layer).lower():
+            bb = getattr(vm, "bbox", None)  # relative to the document (0..1)
+            psd = getattr(layer, "_psd", None)
+            W, H = getattr(psd, "width", None), getattr(psd, "height", None)
+            if bb and len(bb) == 4 and W and H:
+                bb = [int(math.floor(bb[0] * W)), int(math.floor(bb[1] * H)),
+                      int(math.ceil(bb[2] * W)), int(math.ceil(bb[3] * H))]
+                out = {"bbox": bb, "enabled": not bool(getattr(vm, "disabled", False)),
+                       "clips_outside": not bool(getattr(vm, "inverted", False)), "vector": True}
+    except Exception:
+        pass
+    return out
+
+
+def _tree_parents(tree):
+    """layer_id -> (node, [ancestor nodes, nearest first]) for a prepare layer tree."""
+    out = {}
+    roots = tree if isinstance(tree, list) else ([tree] if isinstance(tree, dict) else [])
+
+    def walk(node, chain):
+        if node.get("layer_id") is not None:
+            out[_lid(node["layer_id"])] = (node, list(reversed(chain)))
+        for c in node.get("children") or []:
+            walk(c, chain + [node])
+    for r in roots:
+        if isinstance(r, dict):
+            walk(r, [])
+    return out
+
+
+def _clip_rect(a, b):
+    if a is None:
+        return list(b)
+    return [max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])]
+
+
+def mask_visible_bbox(tree_index, lid):
+    """(visible bbox after the enabled, clipping masks of the layer's ancestors and its own mask, [mask layer ids])
+    or (None, []) when no mask clips it."""
+    rec = tree_index.get(_lid(lid))
+    if not rec:
+        return None, []
+    node, ancestors = rec
+    box, ids = None, []
+    for n in [node] + ancestors:
+        m = n.get("mask") or {}
+        if m.get("enabled") and m.get("clips_outside") and m.get("bbox"):
+            box = _clip_rect(box, m["bbox"])
+            ids.append(n.get("layer_id"))
+    return box, ids
+
+
+def mask_clipped_entries(entries, tree, tol=1):
+    """Entries whose layers' box reaches past the area their masks (own or ancestors') leave visible: exported as
+    whole layers they would draw pixels the document does not show (validate slice_exceeds_visible_area)."""
+    idx = _tree_parents(tree) if tree else {}
+    if not idx:
+        return []
+    out = []
+    for e in entries or []:
+        if is_attr_text(e.get("kind")) or e.get("export_png") is False:
+            continue
+        ids = [i for i in (e.get("select_ids") or [e.get("layer_id")]) if i is not None]
+        boxes, vis, mids = [], None, []
+        for i in ids:
+            rec = idx.get(_lid(i))
+            if not rec or not rec[0].get("bbox"):
+                continue
+            b = rec[0]["bbox"]
+            if b[2] <= b[0] or b[3] <= b[1]:
+                continue
+            boxes.append(b)
+            v, m = mask_visible_bbox(idx, i)
+            if v is not None:
+                vis = v if vis is None else [min(vis[0], v[0]), min(vis[1], v[1]), max(vis[2], v[2]), max(vis[3], v[3])]
+                mids.extend(x for x in m if x not in mids)
+            else:
+                vis = b if vis is None else [min(vis[0], b[0]), min(vis[1], b[1]), max(vis[2], b[2]), max(vis[3], b[3])]
+        if not boxes or not mids or vis is None:
+            continue
+        box = [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
+        over = {"left": vis[0] - box[0], "top": vis[1] - box[1], "right": box[2] - vis[2], "bottom": box[3] - vis[3]}
+        if max(over.values()) > tol:
+            out.append({"name": e.get("name"), "layer_ids": ids, "layer_bbox": box,
+                        "visible_bbox": [max(vis[0], box[0]), max(vis[1], box[1]), min(vis[2], box[2]), min(vis[3], box[3])],
+                        "overflow_px": {k: max(0, v) for k, v in over.items()}, "mask_layer_ids": mids})
+    return out
+
+
 def collect_layer(layer, path, depth, index_in_parent, warnings):
     name = layer.name or ""
     kind = layer_kind(layer)
@@ -489,6 +595,9 @@ def collect_layer(layer, path, depth, index_in_parent, warnings):
                 node["effect_params"] = params
     except Exception:
         pass
+    mask = layer_mask_info(layer)
+    if mask:
+        node["mask"] = mask
     try:
         so = getattr(layer, "smart_object", None) if "smart" in kind_l else None
         if so is not None:
@@ -1508,6 +1617,17 @@ def _font_dirs():
     return out
 
 
+def same_file_path(a, b, flavor=None):
+    """True when two paths name the same file: separators, case (on Windows) and ``..`` normalised.
+    ``flavor`` is ``os.path`` (default), ``ntpath`` or ``posixpath`` (tests pass ntpath to check Windows rules)."""
+    import os
+    mod = flavor or os.path
+    if a is None or b is None:
+        return a is b
+    norm = lambda p: mod.normcase(mod.normpath(str(p)))
+    return norm(a) == norm(b)
+
+
 def resolve_label_font(configured=None, force=False):
     """Find a CJK-capable label font once; returns LABEL_FONT {path, cjk, configured, warning}."""
     import os
@@ -1518,13 +1638,14 @@ def resolve_label_font(configured=None, force=False):
     cands = []
     if configured:
         if Path(configured).is_file():
-            cands.append(Path(configured))
+            cands.append(str(configured))
         else:
             LABEL_FONT["warning"] = f"label font {configured!r} not found; searching system fonts"
-    cands.extend(Path(p) for p in CJK_LABEL_FONTS)
+    cands.extend(str(p) for p in CJK_LABEL_FONTS)
     for p in cands:
-        if p.is_file() and _font_has_cjk(p):
-            LABEL_FONT.update(path=str(p), cjk=True)
+        # Keep the path string as given (str(Path(...)) turns / into \ on Windows).
+        if Path(p).is_file() and _font_has_cjk(p):
+            LABEL_FONT.update(path=p, cjk=True)
             return LABEL_FONT
     for d in _font_dirs():
         for pat in CJK_LABEL_GLOBS:
@@ -2750,7 +2871,7 @@ def manifest_lock_state(manifest_path):
 # the truth (what the full render / export shows) block validate until the user's own answer is recorded with
 # `confirm --decision ID=VALUE`, which also appends it to the lock's decision_log. A confirm note ("checklist
 # confirmed") locks the manifest but answers no question; a decided_by written by hand is not in the log.
-TRUTH_DECISION_TYPES = {"layer_inclusion", "exclude_visible_layer", "hidden_layer_state"}
+TRUTH_DECISION_TYPES = {"layer_inclusion", "exclude_visible_layer", "hidden_layer_state", "unmasked_asset"}
 EXCLUDE_DECISION_TYPES = {"layer_inclusion", "exclude_visible_layer"}
 EXCLUDE_DECISIONS = {"exclude", "excluded", "hide", "hidden", "omit", "not_exported", "no_export", "skip", "drop",
                      "old_draft", "leftover", "remove"}
@@ -2873,8 +2994,14 @@ VISIBLE_HIDDEN_HINT = (
 )
 VISIBLE_UNASSIGNED_HINT = (
     "visible pixel layers inside the artboard are covered by no entry (layer_id / select_ids, or a selected "
-    "ancestor group). Add them to an entry, or ask the user with a layer_inclusion decision whether they belong "
-    "to the current design."
+    "ancestor group) and by no reuse_decisions entry. Either add them to an entry, or write a blocking "
+    "layer_inclusion decision (layer_ids, question, options include / exclude, default include; suggested_decision "
+    "below is a starting point) into the checklist before the user reviews it, and record the user's answer with "
+    "`confirm --decision ID=VALUE`. A mention in notes, review_checklist.md or the final report asks nobody."
+)
+VISIBLE_KEPT_HINT = (
+    "the user answered keep / include for these visible layers, so they belong to the design: add them to an entry "
+    "(proposal, re-confirm), export again."
 )
 PIXEL_LAYER_KINDS = {"pixel", "normal", "text", "smartobject", "solidcolor", "solidfill", "gradientfill",
                      "patternfill", "shape", "layer", "video", "3d"}
@@ -2961,7 +3088,9 @@ def export_truth_issues(layout, shipped=None):
         if n.get("layer_id") is not None:
             covered.add(n["layer_id"])
         covered.update(i for i in (n.get("select_ids") or []) if i is not None)
-    loose = []
+    decisions = layout.get("reuse_decisions") or []
+    log = (layout.get("manifest_lock") or {}).get("decision_log") or []
+    loose, kept = [], []
     for l in layers:
         if not isinstance(l, dict) or l.get("group") or not l.get("effective_visible", l.get("visible")):
             continue
@@ -2980,11 +3109,111 @@ def export_truth_issues(layout, shipped=None):
             continue
         if under(lid, covered) or under(lid, excluded):
             continue
-        loose.append({"id": lid, "name": l.get("name"), "kind": l.get("kind"), "bounds": r})
+        rec = {"id": lid, "name": l.get("name"), "kind": l.get("kind"), "bounds": r}
+        cover = [d for d in decisions if isinstance(d, dict) and decision_is_blocking(d)
+                 and any(_lid(a) in {_lid(i) for i in (d.get("layer_ids") or [])} for a in [lid, *ancestors(lid)])]
+        if not cover:
+            loose.append(dict(rec, reason="no_decision"))
+        elif all(decision_answer_state(d, log) is None for d in cover):
+            # answered, and not an exclusion (excluded layers were skipped above): it belongs to the design
+            kept.append(dict(rec, reason="user_answer_keeps_layer_needs_entry", decision_ids=[d.get("id") for d in cover]))
+        # covered by an unanswered blocking decision: pending_user_decision reports it
     if loose:
         issues.append({"type": "visible_layer_unassigned", "count": len(loose), "layers": loose[:50],
+                       "suggested_decision": suggested_inclusion_decision(loose),
                        "message": VISIBLE_UNASSIGNED_HINT})
+    if kept:
+        issues.append({"type": "visible_layer_unassigned", "count": len(kept), "layers": kept[:50],
+                       "message": VISIBLE_KEPT_HINT})
     return issues
+
+
+def suggested_inclusion_decision(layers):
+    """A layer_inclusion skeleton for visible layers no entry covers (the agent rewrites the question)."""
+    ids = [l.get("id") for l in layers if l.get("id") is not None]
+    names = [str(l.get("name") or l.get("id")) for l in layers][:5]
+    return {"id": "inc_" + "_".join(str(i) for i in ids[:3]) + ("_etc" if len(ids) > 3 else ""),
+            "type": "layer_inclusion", "layer_ids": ids,
+            "question": "%s（打开时可见、没有切图条目）是当前设计要导出的内容，还是只作底衬/旧稿、不导出？"
+                        % "、".join(names),
+            "options": ["include", "exclude"], "default": "include", "decision": None}
+
+
+# 1.4.16 review gate: the same "visible layer without entry or decision" check on the prepare layer tree, before
+# the user reviews the checklist (flatten / preview list it, confirm refuses to lock while any remain).
+TREE_PIXEL_KINDS = {"pixel", "type", "text", "smartobject", "shape", "solidcolorfill", "gradientfill", "patternfill",
+                    "fill", "solidcolor", "solidfill"}
+UNASSIGNED_GATE_HINT = (
+    "visible pixel layers of the artboard have no entry and no reuse_decisions entry. Before the user reviews the "
+    "checklist, add each to an entry or write a blocking layer_inclusion decision (see suggested_decision), show it "
+    "with the review, then confirm. A notes-only mention does not count."
+)
+
+
+def tree_unassigned_visible_layers(tree, entries, decisions):
+    """Leaves of the prepare layer tree that are visible (with all ancestors), pixel-like, non-empty, inside the
+    artboard, not covered by an entry (layer_id / select_ids or a selected ancestor) and not listed in any blocking
+    reuse_decisions entry (answered or not). Empty when there is no tree."""
+    roots = tree if isinstance(tree, list) else ([tree] if isinstance(tree, dict) else [])
+    covered = set()
+    for e in entries or []:
+        if e.get("layer_id") is not None:
+            covered.add(_lid(e["layer_id"]))
+        covered.update(_lid(i) for i in (e.get("select_ids") or []) if i is not None)
+    decided = set()
+    for d in decisions or []:
+        if isinstance(d, dict) and decision_is_blocking(d):
+            decided.update(_lid(i) for i in (d.get("layer_ids") or []))
+    out = []
+
+    def walk(node, chain, art_box):
+        lid = _lid(node.get("layer_id"))
+        if node.get("visible") is False:
+            return
+        if node.get("is_artboard"):
+            art_box = node.get("bbox") or art_box
+        here = chain + [lid]
+        kids = node.get("children") or []
+        if node.get("is_group") or kids:
+            for c in kids:
+                walk(c, here, art_box)
+            return
+        kind = re.sub(r"[^a-z0-9]", "", str(node.get("kind") or "pixel").lower())
+        if kind not in TREE_PIXEL_KINDS or node.get("is_adjustment"):
+            return
+        op = node.get("opacity")
+        if op is not None and float(op) <= 0:
+            return
+        b = node.get("bbox")
+        if not b or b[2] <= b[0] or b[3] <= b[1]:
+            return
+        if art_box and (b[2] <= art_box[0] or b[0] >= art_box[2] or b[3] <= art_box[1] or b[1] >= art_box[3]):
+            return
+        if any(i in covered for i in here) or any(i in decided for i in here):
+            return
+        out.append({"id": lid, "name": node.get("name"), "kind": node.get("kind"), "path": node.get("path"),
+                    "bbox": b})
+
+    for r in roots:
+        if isinstance(r, dict):
+            walk(r, [], None)
+    return out
+
+
+def review_gate_unassigned(manifest, manifest_path=None, entries=None):
+    """{layers, suggested_decision, message} for the review gate, or None when nothing is unassigned / no tree."""
+    tree = load_layer_tree(manifest, manifest_path)
+    if not tree:
+        return None
+    if entries is None:
+        entries = manifest.get("entries") or []
+        if not entries and manifest.get("components"):
+            entries = flatten_components(json.loads(json.dumps(manifest)))
+    loose = tree_unassigned_visible_layers(tree, entries, manifest.get("reuse_decisions") or [])
+    if not loose:
+        return None
+    return {"count": len(loose), "layers": loose[:50], "suggested_decision": suggested_inclusion_decision(loose),
+            "message": UNASSIGNED_GATE_HINT}
 
 
 # 1.4.13: an uncertain_hidden note (on a component, a state or a part, or the manifest's top-level checklist list)
@@ -3369,6 +3598,12 @@ def cmd_confirm(args):
     status = manifest.get("status")
     if status not in (None, "pending_review", "confirmed"):
         raise SystemExit(f"manifest.status is {status!r}; only pending_review / confirmed can be confirmed")
+    gate = review_gate_unassigned(manifest, path)
+    if gate:
+        print(json.dumps({"ok": False, "error": "visible_layer_without_entry_or_decision", **gate},
+                         ensure_ascii=False, indent=2))
+        print("error: visible layers have no entry and no decision; manifest not locked", file=sys.stderr, flush=True)
+        return 5
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     manifest["status"] = "confirmed"
     manifest["confirmed_at"] = stamp
@@ -5276,8 +5511,18 @@ def cmd_flatten(args):
         "effect_issues": effect_issues,
         "avatar_split_issues": avatar_issues,
         "frame_split_issues": frame_issues,
+        "visible_layers_without_entry_or_decision": review_gate_unassigned(manifest, path, entries),
+        "mask_clipped_entries": mask_clipped_entries(entries, tree_for_checks),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    gate = summary["visible_layers_without_entry_or_decision"]
+    if gate:
+        warn(f"{gate['count']} visible layer(s) have no entry and no decision "
+             f"({', '.join(str(l['id']) for l in gate['layers'][:8])}); add entries or a layer_inclusion decision "
+             "before review — confirm will refuse to lock")
+    for problem in summary["mask_clipped_entries"]:
+        warn(f"mask: {problem['name']} draws outside its visible area {problem['visible_bbox']} "
+             f"(masks of {problem['mask_layer_ids']}); the exporter crops to it unless the user chose the unmasked asset")
     for problem in summary["uncertain_hidden_without_decision"]:
         warn(f"uncertain_hidden without a hidden_layer_state decision: layers {problem['layer_ids']} "
              f"({problem.get('component_id')}); validate will report it")
@@ -5438,6 +5683,11 @@ def cmd_preview(args):
     print(f"wrote {out}")
     if lf.get("warning"):
         print(json.dumps({"label_font": lf}, ensure_ascii=False))
+    gate = review_gate_unassigned(manifest, Path(args.manifest), manifest["entries"])
+    if gate:
+        print(json.dumps({"visible_layers_without_entry_or_decision": gate}, ensure_ascii=False, indent=2))
+        warn(f"{gate['count']} visible layer(s) have no entry and no decision; add entries or a layer_inclusion "
+             "decision to the checklist before the user reviews it (confirm refuses to lock until then)")
     return 0
 
 
@@ -5731,6 +5981,14 @@ def cmd_build_layout(args):
                  "validate will report nine_slice_margins_missing")
         if item.get("exported_at"):
             node["exported_at"] = item["exported_at"]
+        mc = item.get("mask_clip")
+        if isinstance(mc, dict) and (mc.get("clip_bounds") or mc.get("sources")):
+            # 1.4.16: the exporter's record of masks that clip this layer (document coords -> artboard coords)
+            node["mask_clip"] = dict(mc, clip_bounds=_shift(_rect_to_dict(mc.get("clip_bounds")), ox, oy)
+                                     if mc.get("clip_bounds") else None,
+                                     layer_bounds=_shift(_rect_to_dict(mc.get("layer_bounds")), ox, oy)
+                                     if mc.get("layer_bounds") else None)
+            node["mask_clipped"] = bool(mc.get("clipped"))
         if item.get("skipped_pending_decision"):
             node["export_skipped"] = "pending_decision"
             node["skipped_pending_decision"] = item["skipped_pending_decision"]
@@ -6682,6 +6940,221 @@ def _covered_above(nodes, idx, box, slices_dir):
     return cov
 
 
+# 1.4.16: a slice must not draw what the document hides. A layer clipped by an ancestor group's mask (or its own
+# mask, or its clipping base) exported as the whole layer shows pixels the full render does not.
+VISIBLE_AREA_MIN_PX = 64
+VISIBLE_AREA_TOL = 16          # same per-channel tolerance as pct_px_diff_gt16
+UNMASKED_DECISIONS = {"unmasked", "export_unmasked", "full", "full_layer", "whole_layer", "unclipped", "yes"}
+SLICE_EXCEEDS_HINT = (
+    "this PNG draws opaque pixels where the Photoshop render shows something else: the layer is clipped by a mask "
+    "(an ancestor group's layer / vector mask, its own mask or a clipping base) and was exported whole. Export what "
+    "the document shows (the current export_slices.psjs crops to the mask-clipped area). If the user wants the full "
+    "unmasked asset, that is a question: write an unmasked_asset decision (layer_ids, question, options "
+    "unmasked / visible_only, default visible_only) and record the answer with `confirm --decision`."
+)
+
+
+def _unmasked_by_user(node, decisions, log):
+    ids = {_lid(i) for i in ([node.get("layer_id")] + list(node.get("select_ids") or [])) if i is not None}
+    ids |= {_lid(i) for i in ((node.get("mask_clip") or {}).get("mask_layer_ids") or [])}
+    for d in decisions or []:
+        if not isinstance(d, dict) or d.get("type") != "unmasked_asset":
+            continue
+        if not ids & {_lid(i) for i in (d.get("layer_ids") or [])}:
+            continue
+        if decision_answer_state(d, log) is None and _norm_decision(d.get("decision")) in UNMASKED_DECISIONS:
+            return d
+    return None
+
+
+def _span(flags):
+    nz = np.nonzero(flags)[0]
+    return (int(nz[0]), int(nz[-1]) + 1) if nz.size else None
+
+
+# 1.4.16: where no slice draws, the recomposite is transparent; the PS render shows whatever was not sliced (an
+# artboard background, a document-wide fill the user excluded or that waits for a decision). Comparing RGB there
+# measures the backdrop, not the slices. validate reports the official numbers unchanged and, when that unsliced
+# region is one uniform colour, the same metrics with the recomposite laid over that colour.
+BACKDROP_UNIFORM_TOL = 2         # per channel, around the median colour
+BACKDROP_UNIFORM_SHARE = 0.99    # share of unsliced pixels within the tolerance
+
+
+def backdrop_for_metrics(layout, ref, rec_alpha, excluded=None, ignore=None):
+    """{used, color, reason, unsliced_px, unsliced_pct, uniform_pct, layers} describing the backdrop. ``ignore``:
+    pixels left out of the uniformity test (attribute-text boxes, unemulated effects)."""
+    unsliced = rec_alpha == 0
+    if ignore is not None:
+        unsliced = unsliced & ~ignore
+    n = int(unsliced.sum())
+    total = int(unsliced.size) or 1
+    rec = {"used": False, "color": None, "unsliced_px": n, "unsliced_pct": round(100.0 * n / total, 3),
+           "uniform_pct": None, "layers": backdrop_layers(layout, excluded)}
+    if n == 0:
+        return dict(rec, reason="no_unsliced_region")
+    px = ref[unsliced]
+    if ref.shape[-1] == 4 and int(np.median(px[:, 3])) == 0:
+        return dict(rec, reason="reference_transparent_there")
+    rgb = px[:, :3].astype(np.int16)
+    med = np.median(rgb, axis=0).round().astype(np.int16)
+    share = float((np.abs(rgb - med).max(axis=1) <= BACKDROP_UNIFORM_TOL).mean())
+    rec["uniform_pct"] = round(100.0 * share, 3)
+    if share < BACKDROP_UNIFORM_SHARE:
+        return dict(rec, reason="unsliced_region_not_uniform")
+    return dict(rec, used=True, color="#%02x%02x%02x" % tuple(int(v) for v in med), reason="uniform_unsliced_region")
+
+
+def backdrop_layers(layout, excluded=None):
+    """Visible-at-open pixel layers that no node covers and that span at least half the artboard: the likely
+    backdrop, with their status (excluded_by_user / pending_decision / no_decision)."""
+    exp = (layout or {}).get("export") or {}
+    layers = [l for l in (exp.get("layers_at_open") or []) if isinstance(l, dict)]
+    if not layers:
+        return []
+    art = (layout.get("source") or {}).get("artboard") or {}
+    ab = _rect_to_dict(art.get("bounds")) if art.get("bounds") else None
+    if not ab:
+        return []
+    area = max(1, (ab["right"] - ab["left"]) * (ab["bottom"] - ab["top"]))
+    covered = set()
+    for nd in layout.get("nodes") or []:
+        if nd.get("layer_id") is not None:
+            covered.add(_lid(nd["layer_id"]))
+        covered.update(_lid(i) for i in (nd.get("select_ids") or []) if i is not None)
+    excluded = excluded if excluded is not None else approved_exclusions(layout.get("reuse_decisions") or [],
+                                                                          layout.get("manifest_lock"))
+    decisions = layout.get("reuse_decisions") or []
+    out = []
+    for l in layers:
+        if l.get("group") or not l.get("effective_visible", l.get("visible")) or _lid(l.get("id")) in covered:
+            continue
+        r = _layer_rect(l.get("bounds"))
+        if r is None:
+            continue
+        iw = min(r["right"], ab["right"]) - max(r["left"], ab["left"])
+        ih = min(r["bottom"], ab["bottom"]) - max(r["top"], ab["top"])
+        if iw <= 0 or ih <= 0 or iw * ih * 2 < area:
+            continue
+        lid = l.get("id")
+        if lid in excluded or _lid(lid) in {_lid(k) for k in excluded}:
+            status = "excluded_by_user"
+        elif _decisions_covering(decisions, _lid(lid)):
+            status = "pending_decision"
+        else:
+            status = "no_decision"
+        out.append({"id": lid, "name": l.get("name"), "kind": l.get("kind"), "status": status})
+    return out
+
+
+def _matched_box(keep, match):
+    """(x span, y span) of the area where the slice matches the render: columns with at least half their checked
+    pixels matching, then rows (within those columns) likewise; and the same rows-first. The box holding more
+    matching pixels wins, so a narrow visible strip in either direction is found."""
+    def one(axis_first):
+        k, m = (keep, match) if axis_first == 0 else (keep.T, match.T)
+        kc = k.sum(axis=0)
+        a = _span((kc > 0) & (m.sum(axis=0) * 2 >= np.maximum(kc, 1)))
+        if not a:
+            return None, None, 0
+        k2, m2 = k[:, a[0]:a[1]], m[:, a[0]:a[1]]
+        kr = k2.sum(axis=1)
+        b = _span((kr > 0) & (m2.sum(axis=1) * 2 >= np.maximum(kr, 1)))
+        if not b:
+            return None, None, 0
+        score = int(m[b[0]:b[1], a[0]:a[1]].sum())
+        return (a, b, score) if axis_first == 0 else (b, a, score)
+    xa, ya, sa = one(0)
+    xb, yb, sb = one(1)
+    return (xa, ya) if sa >= sb else (xb, yb)
+
+
+def visible_area_checks(layout, ref, mask, slices_dir):
+    """``slice_exceeds_visible_area``: per default-state image (normal blend, full opacity, drawn 1:1), the box
+    where its own opaque pixels (alpha 255, not under nodes above, outside text / unemulated-effect masks) match the
+    PS render (per channel <= 16) is measured by columns and rows (_matched_box). Opaque pixels outside that box
+    that do not match are drawn where the document shows something else. Reported when they are at least
+    VISIBLE_AREA_MIN_PX and 5 % of the checked pixels. The exporter's mask record (mask_clip) is used too: a slice
+    reaching past mask_clip.clip_bounds is reported without pixels.
+    Returns (issues, checked, user_accepted)."""
+    issues, checked, accepted = [], [], []
+    nodes = layout.get("nodes") or []
+    decisions = layout.get("reuse_decisions") or []
+    log = (layout.get("manifest_lock") or {}).get("decision_log") or []
+    ch, cw = ref.shape[0], ref.shape[1]
+    for idx, node in enumerate(nodes):
+        if is_attr_text(node.get("kind")) or not node.get("image") or node.get("export_skipped"):
+            continue
+        b = node.get("visible_bounds")
+        if not b:
+            continue
+        L, T = int(round(b["left"])), int(round(b["top"]))
+        R, B = int(round(b["right"])), int(round(b["bottom"]))
+        base = {"name": node.get("name"), "layer_id": node.get("layer_id"), "select_ids": node.get("select_ids"),
+                "slice_box": [L, T, R, B]}
+        mc = node.get("mask_clip") or {}
+        found = None
+        cb = mc.get("clip_bounds")
+        if cb and mc.get("clipped"):
+            over = {"left": cb["left"] - L, "top": cb["top"] - T, "right": R - cb["right"], "bottom": B - cb["bottom"]}
+            if max(over.values()) > 1:
+                found = dict(base, source="export_log_mask_clip", visible_box=[cb["left"], cb["top"], cb["right"], cb["bottom"]],
+                             overflow_px={k: max(0, int(v)) for k, v in over.items()},
+                             mask_layer_ids=mc.get("mask_layer_ids"))
+        if found is None and slices_dir:
+            if str(node.get("blend_mode") or "normal").lower() not in ("normal", "passthrough", "pass_through"):
+                continue
+            op = node.get("opacity")
+            if op is not None and float(op) not in (1.0, 100.0):
+                continue
+            path = Path(slices_dir) / node["image"]
+            if not path.is_file():
+                continue
+            img = np.asarray(Image.open(path).convert("RGBA"))
+            h, w = img.shape[0], img.shape[1]
+            if (R - L, B - T) != (w, h):
+                continue  # stretched (nine-slice) or resampled: not 1:1
+            l, t, r, bt = max(0, L), max(0, T), min(cw, R), min(ch, B)
+            if r <= l or bt <= t:
+                continue
+            keep = img[t - T:bt - T, l - L:r - L, 3] == 255
+            if mask is not None:
+                keep &= ~mask[t:bt, l:r]
+            keep &= ~_covered_above(nodes, idx, (l, t, r, bt), slices_dir)
+            n_keep = int(keep.sum())
+            if n_keep < VISIBLE_AREA_MIN_PX:
+                continue
+            diff = np.abs(img[t - T:bt - T, l - L:r - L, :3].astype(np.int16) - ref[t:bt, l:r, :3].astype(np.int16)).max(axis=-1)
+            match = keep & (diff <= VISIBLE_AREA_TOL)
+            xs, ys = _matched_box(keep, match)
+            inside = np.zeros_like(keep)
+            if xs and ys:
+                inside[ys[0]:ys[1], xs[0]:xs[1]] = True
+            out_bad = keep & ~inside & ~match
+            n_bad = int(out_bad.sum())
+            row = dict(base, px=n_keep, outside_unmatched_px=n_bad)
+            checked.append(row)
+            if n_bad < VISIBLE_AREA_MIN_PX or n_bad * 20 < n_keep:
+                continue
+            if xs and ys:
+                vbox = [l + xs[0], t + ys[0], l + xs[1], t + ys[1]]
+                over = {"left": vbox[0] - L, "top": vbox[1] - T, "right": R - vbox[2], "bottom": B - vbox[3]}
+            else:
+                vbox, over = None, {"left": R - L, "top": B - T, "right": R - L, "bottom": B - T}
+            found = dict(row, source="pixels_vs_full_render", visible_box=vbox,
+                         overflow_px={k: max(0, int(v)) for k, v in over.items()},
+                         outside_unmatched_pct=round(100.0 * n_bad / n_keep, 2))
+            if mc:
+                found["mask_clip"] = mc
+        if found is None:
+            continue
+        d = _unmasked_by_user(node, decisions, log)
+        if d is not None:
+            accepted.append(dict(found, decision_id=d.get("id")))
+            continue
+        issues.append(dict(found, type="slice_exceeds_visible_area", hint=SLICE_EXCEEDS_HINT))
+    return issues, checked, accepted
+
+
 def layer_bounds_issues(nodes):
     """``layer_bounds_mismatch`` for nodes whose layer measured somewhere else than their manifest box."""
     out = []
@@ -7129,12 +7602,25 @@ def cmd_validate(args):
     m_text_masked_regions = metrics(ref, rec_t, text_mask)
     m_masked = metrics(ref, rec_m, masked_all)
     m_no_text_all = metrics(ref, rec_m, None)
+    backdrop = backdrop_for_metrics(layout, ref, rec_m[..., 3], ignore=masked_all)
+    m_masked_bd = m_text_bd = None
+    rec_text_bd = None
+    if backdrop["used"]:
+        bd_rgba = hex_to_rgba(backdrop["color"])
+        bd_img = Image.new("RGBA", (cw, ch), bd_rgba)
+        rec_m_bd = np.asarray(Image.alpha_composite(bd_img, rec_masked.convert("RGBA").crop((0, 0, cw, ch))))
+        rec_text_bd = Image.alpha_composite(bd_img, rec_text.convert("RGBA").crop((0, 0, cw, ch)))
+        m_masked_bd = metrics(ref, rec_m_bd, masked_all)
+        m_text_bd = metrics(ref, np.asarray(rec_text_bd), None)
     worst10, _all = per_element_diffs(default_layout, ref, rec_t, cw, ch)
     worst10_masked, _ = per_element_diffs(default_layout, ref, rec_m, cw, ch)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     rec_text.save(out_dir / "recomposite.png")
     rec_masked.save(out_dir / "recomposite_text_masked.png")
+    if rec_text_bd is not None:
+        rec_text_bd.save(out_dir / "recomposite_over_backdrop.png")
+        backdrop["image"] = str(out_dir / "recomposite_over_backdrop.png")
     write_side_by_side(
         ref, rec_t, out_dir / "validate_side_by_side.jpg",
         ("Photoshop full render", f"Recomposite + {renderer_used or 'no'} text (approx.)", "|diff| x3"),
@@ -7159,7 +7645,10 @@ def cmd_validate(args):
     issues.extend(layer_bounds_issues(layout["nodes"]))
     placement_bad, placement_checked = placement_offset_checks(default_layout, ref, masked_all, slices_dir)
     issues.extend(placement_bad)
-    exported_preview = write_exported_preview(default_layout, rec_text, full.crop((0, 0, cw, ch)), out_dir)
+    area_bad, area_checked, area_ok = visible_area_checks(default_layout, ref, masked_all, slices_dir)
+    issues.extend(area_bad)
+    exported_preview = write_exported_preview(default_layout, rec_text_bd if rec_text_bd is not None else rec_text,
+                                              full.crop((0, 0, cw, ch)), out_dir)
 
     rendered = sum(1 for p in placed_text if p.get("rendered"))
     mixed_nodes = [n["name"] for n in default_layout["nodes"]
@@ -7197,6 +7686,11 @@ def cmd_validate(args):
         "diff_text_rendered_excluding_text_boxes": m_text_masked_regions,
         "diff_text_masked": m_masked,
         "diff_no_text_unmasked": m_no_text_all,
+        "psnr_full": (m_masked or {}).get("psnr_db"),
+        "psnr_full_over_backdrop": (m_masked_bd or {}).get("psnr_db") if m_masked_bd else None,
+        "diff_text_masked_over_backdrop": m_masked_bd,
+        "diff_text_rendered_over_backdrop": m_text_bd,
+        "backdrop": backdrop,
         "worst_10_elements_text_rendered": worst10,
         "worst_10_elements_text_masked": worst10_masked[:10],
         "effect_modes": dict(Counter(n.get("effect_mode") or "-" for n in default_layout["nodes"])),
@@ -7210,6 +7704,8 @@ def cmd_validate(args):
         "reuse_mismatch_accepted": reuse_ok,
         "split_checked": split_checked,
         "placement_checked": len(placement_checked),
+        "visible_area_checked": len(area_checked),
+        "slice_exceeds_visible_area_user_accepted": area_ok,
         "split_below_threshold_user_accepted": split_ok,
         "thresholds": thr,
         "manifest_lock": layout.get("manifest_lock"),
@@ -7259,6 +7755,16 @@ def cmd_validate(args):
             "while a lower one stays off. Cumulative groups are previewed as whole levels (level_N).",
             "label_font: font used for annotation labels; a warning means CJK labels may show as boxes (annotation "
             "only, not a validation result).",
+            "psnr_full = diff_text_masked.psnr_db (official, recomposite over transparency). psnr_full_over_backdrop: "
+            "the same with the recomposite laid over backdrop.color, the one colour the PS render shows where no "
+            "slice draws (backdrop.used only when that region is uniform). backdrop.layers lists the large unsliced "
+            "layers and whether the user excluded them; an unsliced layer without a decision still fails "
+            "(visible_layer_unassigned). preview_exported_* are drawn over the backdrop when it is used.",
+            "slice_exceeds_visible_area: a slice draws opaque pixels outside the area where it matches the PS render "
+            "(rows / columns with at least half its pixels matching), typically a layer clipped by a group mask "
+            "exported whole; or it reaches past the exporter's mask_clip.clip_bounds. visible_area_checked counts "
+            "the images measured; an unmasked_asset decision answered by the user moves it to "
+            "slice_exceeds_visible_area_user_accepted.",
         ],
         "issues": issues,
         "placed": len(placed_text),
@@ -7352,7 +7858,8 @@ def build_parser():
     s.add_argument("--label-font", default=None, help="CJK-capable font file for labels (else PSJS_LABEL_FONT, then system CJK fonts)")
     s.set_defaults(func=cmd_preview)
 
-    s = sub.add_parser("confirm", help="After the user confirms: set status confirmed and lock the manifest")
+    s = sub.add_parser("confirm", help="After the user confirms: set status confirmed and lock the manifest "
+                                       "(exit 5 without locking while visible layers have no entry and no decision)")
     s.add_argument("--manifest", required=True)
     s.add_argument("--note", default=None, help="Who confirmed / what (kept in the lock file)")
     s.add_argument("--relock", action="store_true", help="Re-lock after the user re-confirmed a changed manifest")

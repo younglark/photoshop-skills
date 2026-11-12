@@ -454,7 +454,8 @@ class TestLabelFont(unittest.TestCase):
     def test_configured_font_is_used(self):
         path = _cjk_font()
         info = h.resolve_label_font(path, force=True)
-        self.assertEqual((info["path"], info["cjk"], info["warning"]), (path, True, None))
+        self.assertTrue(h.same_file_path(info["path"], path), (info["path"], path))
+        self.assertEqual((info["cjk"], info["warning"]), (True, None))
         rep = h.label_font_report(["弹窗_五星好评", "popup_bg"])
         self.assertTrue(rep["labels_need_cjk"])
         self.assertNotIn("warning", rep)

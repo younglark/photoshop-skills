@@ -451,3 +451,15 @@ PSNR 按整张导出画布计算（括号内是合并图可见范围）。现状
 - 累积组：档位展开、默认档、自定成员顺序与亮 / 灭态名；预览按整档、不再单独预览某一格；未声明的组保持原样；显式 `activation` 漏掉低位报 `state_activation_incomplete`，写全不报。
 
 在这次盲测的产物上（离线）复跑：旧布局报 6 条 `nine_slice_changed_after_confirm` 和 1 条 `exported_before_decision`（禁用按钮底；第 4、5 格是复用实例，不报）；用 1.4.15 重建布局后九宫与清单一致；给星星组加上 `cumulative: true` 后，状态预览为 `level_0`…`level_5`（默认第 3 档除外），5 星档五格全亮。尚未在 Photoshop 上用 1.4.15 重跑盲测。
+
+### 10.19 组蒙版裁掉的顶栏被整张导出、衬底没进决定、整图分数失真（1.4.16）
+
+起因：1.4.15 在一个素材拼板画板上的盲测（89 层，15 个隐藏层，6 条九宫）。1.4.15 的护栏生效：未答的隐藏层没有出图，九宫与确认清单一致，标签是中文字体，导出器哈希一致。新暴露四处：
+1. 顶栏组带组蒙版，画板上只露出约 19 px 宽的竖条；条目选的是组里 4 个叶子层，「从图层新建」没有父组，蒙版没带过去，导出成整张 697×175 的横条。`validate` 不查。
+2. 覆盖整份文档的纯色填充层（素材板的灰色衬底）没有条目，模型只在说明里提了一句，没有写成决定；`validate` 报了 `visible_layer_unassigned`，但没有变成待用户回答的问题。
+3. 衬底没切，拼图在 85% 的画面上是透明的；官方整图 PSNR 只有 8.68 dB。把拼图垫在衬底色 #5C656C 上是 29.34 dB；再去掉顶栏框是 79.24 dB。
+4. `test_configured_font_is_used` 在 Windows 上失败：`str(Path("C:/Windows/Fonts/msyh.ttc"))` 变成反斜杠，与配置的字符串不相等（实际用的字体是对的）。
+
+回归用合成数据（`examples/test_slicing_helper_visible_area.py`，24 条）：竖条 / 横条可见区、全部可见、低于阈值的小溢出、上层节点盖住、只有导出器蒙版记录、用户答 `unmasked`（经 / 未经 `confirm --decision`）、图层树的组蒙版（启用 / 停用 / 框外可见）、导出器文本；端到端（`flatten` → `confirm` → `build-layout` → `validate`）：没有决定的衬底仍 `ok:false` 但 `psnr_full_over_backdrop` 为 99、用户排除衬底后 `ok:true`、衬底决定未答只报 `pending_user_decision`、答 `include` 要补条目、蒙版记录与纯像素两条来源；衬底色均匀 / 不均匀 / 无未切区 / 文字区不参与；审核门闩的树检查、`flatten` / `preview` 列出、`confirm` 退出码 5 不锁定、补上决定后锁定；Windows 路径比较。
+
+在这次盲测的产物上（离线，导出器哈希按当时的作业副本）复跑：`slice_exceeds_visible_area` 报顶栏（可见框 517–536 × 211–372，右侧溢出 678 px，94% 的检查像素在可见框外且不吻合），另报两个页签各右侧 4 px（PS 整图里页签右缘是直边，导出图带圆角右缘，溢出处显示的是衬底）；`visible_layer_unassigned` 带 `reason: no_decision` 和 `suggested_decision`；`psnr_full` 8.68、`psnr_full_over_backdrop` 29.34（`backdrop.color` #5c656c，`layers` 是那个填充层，状态 `no_decision`）。在清单的图层树上跑审核门闩，正好列出那个填充层，`confirm` 会在交审前拦下。在前三轮盲测（商店、商店重跑、弹窗）的产物上复跑，`slice_exceeds_visible_area` 都没有报，那三块板没有未切区域，`backdrop.used` 为 false。导出器的蒙版裁切还没在 Photoshop 上跑过（`bounds` 含组蒙版这一点以 Photoshop 实际返回为准）；裁不到的像素由 `validate` 的像素检查兜底。
