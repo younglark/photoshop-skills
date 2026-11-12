@@ -2753,10 +2753,59 @@ def frame_pixels_from_merged(merged, content, frame_plain):
     return np.where(from_merged, m, f)
 
 
+def _fit_extra_content_to_placeholder(src, placeholder):
+    """Place an external content image onto the placeholder's alpha bbox without a dark fringe.
+
+    Crop ``src`` to its opaque core (alpha >= 250 bbox), take a centered inscribed
+    square-ish region (~0.80 of the core radius, so rounded transparent corners are
+    excluded), premultiply alpha, resize with LANCZOS to the placeholder's alpha bbox,
+    unpremultiply, set alpha 255, and paste onto a canvas aligned to that bbox. The
+    caller copies RGB only where the placeholder is opaque.
+    """
+    P = placeholder
+    H, W = P.shape[:2]
+    src = _as_rgba_f(src)
+    ys, xs = np.nonzero(src[..., 3] >= 250)
+    if ys.size == 0:
+        ys, xs = np.nonzero(src[..., 3] > 0)
+    if ys.size == 0:
+        return np.zeros((H, W, 4), dtype=float)
+    cy, cx = (ys.min() + ys.max()) / 2, (xs.min() + xs.max()) / 2
+    r = min(ys.max() - ys.min(), xs.max() - xs.min()) / 2 * 0.80
+    x0, y0, x1, y1 = int(cx - r), int(cy - r), int(cx + r), int(cy + r)
+    if x1 <= x0:
+        x1 = x0 + 1
+    if y1 <= y0:
+        y1 = y0 + 1
+    src_im = Image.fromarray(np.clip(np.round(src), 0, 255).astype("uint8"), "RGBA")
+    core = src_im.crop((x0, y0, x1, y1))
+    if core.size[0] == 0 or core.size[1] == 0:
+        return np.zeros((H, W, 4), dtype=float)
+    pa = P[..., 3] > 0
+    py, px = np.nonzero(pa)
+    if py.size == 0:
+        return np.zeros((H, W, 4), dtype=float)
+    bw, bh = int(px.max() - px.min() + 1), int(py.max() - py.min() + 1)
+    o = np.asarray(core).astype(float)
+    premul = np.dstack([o[..., :3] * o[..., 3:4] / 255.0, o[..., 3]])
+    pm = Image.fromarray(np.clip(np.round(premul), 0, 255).astype("uint8"), "RGBA")
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    pm = np.asarray(pm.resize((bw, bh), resampling)).astype(float)
+    rgb = np.where(pm[..., 3:4] > 0, pm[..., :3] * 255.0 / np.maximum(pm[..., 3:4], 1), 0)
+    canvas = np.zeros((H, W, 4), dtype=float)
+    y0p, x0p = int(py.min()), int(px.min())
+    canvas[y0p:y0p + bh, x0p:x0p + bw, :3] = np.clip(rgb, 0, 255)
+    canvas[y0p:y0p + bh, x0p:x0p + bw, 3] = 255
+    return canvas
+
+
 def representative_contents(placeholder, extras=None):
     """A bank of contents that share the placeholder's alpha: itself, inverted / darker / brighter,
-    solid colours, and ramps. ``extras`` is a list of images (or (name, image)) already in document space;
-    each is resized if needed and pasted into the placeholder footprint."""
+    solid colours, and ramps. ``extras`` is a list of images (or (name, image)). Each is fitted
+    into the placeholder footprint: if the shape differs, or a same-size image has transparent
+    pixels inside the footprint, the opaque core is cropped and resized (premultiplied LANCZOS)
+    onto the placeholder's alpha bbox; otherwise RGB is copied in place. Transparent corners of
+    the source are not stretched into the footprint."""
     P = _as_rgba_f(placeholder)
     H, W = P.shape[:2]
     alpha = P[..., 3:4]
@@ -2789,11 +2838,13 @@ def representative_contents(placeholder, extras=None):
     for i, item in enumerate(extras or []):
         name, src = item if isinstance(item, tuple) else (f"extra_{i}", item)
         src = _as_rgba_f(src)
-        if src.shape[:2] != (H, W):
-            src_im = Image.fromarray(np.clip(np.round(src), 0, 255).astype("uint8"), "RGBA")
-            src = np.asarray(src_im.resize((W, H), Image.Resampling.BICUBIC)).astype(float)
-        out = P.copy()
         interior = P[..., 3] > 0
+        # Size mismatch, or a same-size source with holes inside the footprint (rounded
+        # transparent corners, padding): crop the opaque core and scale it to the
+        # placeholder bbox. A same-size source that already fills the interior is copied.
+        if src.shape[:2] != (H, W) or np.any(interior & (src[..., 3] < 250)):
+            src = _fit_extra_content_to_placeholder(src, P)
+        out = P.copy()
         out[interior, :3] = src[interior, :3]
         items[name] = out
     return items

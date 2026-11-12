@@ -321,6 +321,45 @@ class TestTwoPartApprox(unittest.TestCase):
             self.assertGreaterEqual(rep["match"]["psnr"], 35)
             self.assertGreaterEqual(rep["swap_min_psnr"], 35)
 
+    def test_extra_avatar_rounded_corners_do_not_darken_interior(self):
+        """An external avatar with transparent rounded corners must not leak black RGB into the footprint."""
+        # Circular placeholder, typical of a masked avatar slot.
+        ph = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+        ImageDraw.Draw(ph).ellipse((16, 16, 63, 63), fill=(80, 90, 100, 255))
+        fill = (220, 180, 140, 255)
+        # Different size: a bright circle that does not fill its canvas. Transparent
+        # corners (and the padded margin) store RGB black — the common PNG layout
+        # that used to stain the placeholder rim when the whole image was stretched.
+        src_s = 128
+        avatar = Image.new("RGBA", (src_s, src_s), (0, 0, 0, 0))
+        ImageDraw.Draw(avatar).ellipse((16, 16, src_s - 17, src_s - 17), fill=fill)
+        out = h.representative_contents(ph, [("swap_round", avatar)])["swap_round"]
+        interior = np.asarray(ph)[..., 3] > 0
+        lum = 0.2126 * out[..., 0] + 0.7152 * out[..., 1] + 0.0722 * out[..., 2]
+        # 2-px morphological erosion to split a rim band from the disk core.
+        def erode(mask, n):
+            m = mask.copy()
+            for _ in range(n):
+                m = m & np.roll(m, 1, 0) & np.roll(m, -1, 0) & np.roll(m, 1, 1) & np.roll(m, -1, 1)
+            return m
+        core, rim = erode(interior, 6), interior & ~erode(interior, 2)
+        self.assertGreater(int(core.sum()), 50)
+        self.assertGreater(int(rim.sum()), 20)
+        core_med = float(np.median(lum[core]))
+        # The fill luminance is ~186; a leaked black rim would drop this toward 0.
+        self.assertGreaterEqual(core_med, 150)
+        self.assertGreaterEqual(float(lum[rim].min()), core_med - 15)
+        self.assertGreaterEqual(float(lum[interior].min()), 100)
+
+        # Same-size source whose transparent corners fall inside a larger placeholder.
+        same = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+        ImageDraw.Draw(same).ellipse((22, 22, 57, 57), fill=fill)
+        out2 = h.representative_contents(ph, [("swap_same", same)])["swap_same"]
+        lum2 = 0.2126 * out2[..., 0] + 0.7152 * out2[..., 1] + 0.0722 * out2[..., 2]
+        self.assertGreaterEqual(float(np.median(lum2[core])), 150)
+        self.assertGreaterEqual(float(lum2[rim].min()), float(np.median(lum2[core])) - 15)
+        self.assertGreaterEqual(float(lum2[interior].min()), 100)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

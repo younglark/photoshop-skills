@@ -5,7 +5,7 @@ license: MIT-0
 compatibility: "Requires Adobe Photoshop 2023 (v23.5+) or later with UXP scripting, on Windows or macOS. The optional slicing helper needs Python 3 with psd-tools, Pillow and numpy; its validate step also requires uharfbuzz + freetype-py (or uharfbuzz + skia-python), plus scipy for strokes and effect spread, when the layout has dynamic text."
 metadata:
   author: younglark
-  version: "1.4.6"
+  version: "1.4.7"
   homepage: https://github.com/younglark/photoshop-skills
 ---
 
