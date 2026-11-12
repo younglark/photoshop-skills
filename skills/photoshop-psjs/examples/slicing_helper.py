@@ -55,7 +55,7 @@ except ImportError:
     ParseLimits = None
 
 SCHEMA_MANIFEST = "psjs-slice-manifest/v2"
-SKILL_VERSION = "1.4.13"
+SKILL_VERSION = "1.4.14"
 SCHEMA_LAYOUT = "psjs-layout/v2"
 SCHEMA_MANIFEST_V1 = "psjs-slice-manifest/v1"
 SCHEMA_LAYOUT_V1 = "psjs-layout/v1"

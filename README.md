@@ -52,9 +52,11 @@ clawhub install photoshop-psjs
 skills/
   photoshop-psjs/
     SKILL.md                 # entry point: when to use, launch/poll recipes, safety rules
+    CHANGELOG.md             # version history (maintainer-facing)
     references/
       batchplay.md           # batchPlay descriptor recipes
       slicing.md             # agent slicing workflow, manifest schema, validation
+      slicing-history.md     # measured sessions and root-cause notes (not a second rulebook)
     examples/
       run_job.psjs           # minimal guarded job script template
       export_slices.psjs     # slice export template
@@ -77,20 +79,7 @@ skills/
 
 ## Changelog
 
-- **1.2.0** — Repeated elements are no longer always exported per instance. The agent decides reuse
-  from UI purpose, game-UI priors and evidence in `reuse_candidates.json` (pixel similarity,
-  smart-object id, name pattern, `ui_role_prior`); reused instances share one image (`reuse_of`)
-  but keep their own bounds. Instances that do not match the design are split; conflicts with
-  strong evidence go to the user as `reuse_decisions` with comparison images. Avatar pictures
-  are runtime placeholders kept separate from their frames. `validate` reports `reuse_mismatch`.
-
-- **1.1.0** — Group layer effects can be either baked into the slice (`effect_mode: "baked"`,
-  default) or drawn by the engine (`effect_mode: "engine"` + `engine_effects` parameters read
-  by psd-tools); the agent picks per part and the review preview shows the choice. `validate`
-  approximates engine drop shadows / outer glows, masks effects it cannot emulate, flags parts
-  that silently drop a group effect, and writes a final annotated preview rendered from the
-  exported PNGs (`validate/preview_exported_annotated.png`, plus a side-by-side with the PS render).
-- **1.0.0** — Standalone repository; first marketplace release.
+Version history for `photoshop-psjs` is in [`skills/photoshop-psjs/CHANGELOG.md`](skills/photoshop-psjs/CHANGELOG.md). Measured slicing sessions and root-cause notes are in [`skills/photoshop-psjs/references/slicing-history.md`](skills/photoshop-psjs/references/slicing-history.md).
 
 ## License
 

@@ -29,7 +29,7 @@ const fs = require("uxp").storage.localFileSystem;
 const CONFIG_URL = "file:/D:/work/ps-job/export_config.json";
 // -----------------------------------------------------------------------
 
-const EXPORTER_RELEASE = "1.4.13";
+const EXPORTER_RELEASE = "1.4.14";
 let ROOT_URL, SOURCE_URL, SOURCE_PATH_HINT, MANIFEST_NAME, LOG_NAME, SLICES_DIR_NAME, FULL_RENDER_NAME, EXPORTER_URL;
 
 async function loadConfig() {
