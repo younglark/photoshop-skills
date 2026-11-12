@@ -392,6 +392,68 @@ async function closeTemp(doc) {
   }
 }
 
+// Avatar/frame split inside the temporary export document (never in the source document):
+// Edit Contents opens the embedded smart object of the temporary copy, the listed inner layers
+// are hidden, the contents are saved back into that copy only, and the copy is exported as usual.
+// Checked on Photoshop 2026 (references/slicing.md): the source document stays unchanged.
+function walkLayers(container, out) {
+  for (const layer of container.layers || []) {
+    out.push(layer);
+    if (layer.layers && layer.layers.length) walkLayers(layer, out);
+  }
+  return out;
+}
+
+function matchInnerLayer(all, spec) {
+  if (spec == null) return null;
+  const id = (typeof spec === "object") ? spec.id : (typeof spec === "number" ? spec : null);
+  const name = (typeof spec === "object") ? spec.name : (typeof spec === "string" ? spec : null);
+  if (id != null) {
+    const byId = all.find((layer) => layer.id === id);
+    if (byId && (name == null || byId.name === name)) return byId;
+  }
+  if (name != null) {
+    const byName = all.filter((layer) => layer.name === name);
+    if (byName.length === 1) return byName[0];
+  }
+  return null;
+}
+
+async function applySmartObjectSplit(tmp, split, item) {
+  const hide = (split && split.hide_inner) || [];
+  if (!hide.length) throw new Error("split.hide_inner is empty");
+  const smart = walkLayers(tmp, []).filter((layer) => String(layer.kind).toLowerCase().indexOf("smart") >= 0);
+  if (smart.length !== 1) {
+    throw new Error("split: expected one smart object in the temporary document, found " + smart.length);
+  }
+  await bp([{ _obj: "select", _target: [{ _ref: "layer", _id: smart[0].id }], makeVisible: false }]);
+  const before = new Set(app.documents.map((d) => d.id));
+  await bp([{ _obj: "placedLayerEditContents" }]);
+  const added = app.documents.filter((d) => !before.has(d.id));
+  if (added.length !== 1) throw new Error("split: Edit Contents opened " + added.length + " documents");
+  const inner = added[0];
+  ours.add(inner.id);
+  const record = { contents: inner.name, hidden: [], not_found: [] };
+  try {
+    app.activeDocument = inner;
+    const all = walkLayers(inner, []);
+    for (const spec of hide) {
+      const layer = matchInnerLayer(all, spec);
+      if (!layer) { record.not_found.push(spec); continue; }
+      layer.visible = false;
+      record.hidden.push({ id: layer.id, name: layer.name });
+    }
+    if (record.not_found.length) {
+      throw new Error("split: inner layers not found: " + JSON.stringify(record.not_found));
+    }
+    await inner.save();
+  } finally {
+    await closeTemp(inner);
+    app.activeDocument = tmp;
+    item.split_applied = record;
+  }
+}
+
 try {
   await loadConfig();
   rootDir = await fs.getEntryWithUrl(ROOT_URL);
@@ -533,6 +595,11 @@ try {
             await executionContext.hostControl.registerAutoCloseDocument(tmp.id);
           } catch (err) {}
           for (const layer of tmp.layers) layer.visible = true;
+          if (entry.split) {
+            // split_method smart_object_contents: hide the other side inside this temporary copy.
+            await applySmartObjectSplit(tmp, entry.split, item);
+            item.split_method = entry.split_method || null;
+          }
           // Convert to 8-bit before measuring / trimming so near-zero 16-bit
           // alpha is quantized the same way as the exported PNG.
           await ensureEightBit(tmp);

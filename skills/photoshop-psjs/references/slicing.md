@@ -11,7 +11,7 @@
 3. **分清共用零件和随状态变化的零件。** 图标、始终存在的底等跨状态不变的，放进该组件的 `shared`，文件名不加状态后缀。槽/底的明暗、选中高亮、只在某一态出现的标签等，放进 `states.<state>.parts`。
 4. **区分状态变体和旧稿。** 主体/内容不变、只改明度、描边、发光、配色或缩放的，是状态变体，可以导出。同一槽位但换了内容或徽记的，当旧稿忽略。内容或母题对不上、吃不准时才写 `uncertain_hidden`，并附上两侧裁切图。
 5. **只给会随状态变化的零件记 missing。** 以同组里状态最完整的那一项为模板（例如某选中项有 base + highlight + label），每个缺少其中一件的兄弟项都要列出，**包括 highlight**。不要因为共用图标没有另一态就标 missing。单个特殊样式的列表行（例如 self 高亮行）只是这一行的一个实例：不要给其它行推断缺失的 self，也不要给这一行推断缺失的 normal，除非设计里每行都有成套变体。
-6. **判断重复元素是否复用（见下文「重复元素：复用还是分开」）。** 先按 UI 用途和常识（游戏 UI 先验）加上 `reuse_candidates.json` 的证据，从逻辑上判断是否该共用一张图；该复用就用 `reuse_of` 指向同一张共享图。再对照效果图：复用后与设计对不上，先怀疑分析错了，只把对不上的实例拆出去单独导出；逻辑证据很强却对不上，写进 `reuse_decisions` 交用户决定。头像图与头像框必须分开；PSD 里合在一起的，写进 `reuse_decisions` 请用户决定，不要合着导出。
+6. **判断重复元素是否复用（见下文「重复元素：复用还是分开」）。** 先按 UI 用途和常识（游戏 UI 先验）加上 `reuse_candidates.json` 的证据，从逻辑上判断是否该共用一张图；该复用就用 `reuse_of` 指向同一张共享图。再对照效果图：复用后与设计对不上，先怀疑分析错了，只把对不上的实例拆出去单独导出；逻辑证据很强却对不上，写进 `reuse_decisions` 交用户决定。头像图与头像框必须分开：PSD 里合在一起时，**先自己按下文「头像与框合在一起：先拆，拆不开再问」尝试拆开**，拆完用框 + 占位头像重新拼合并和效果图对比；对得上就按拆分导出，只有拆不开或拆后对不上才写 `reuse_decisions`（`type: split_avatar`）交用户。面板、弹窗、卡片、按钮底等 frame 类元素同理：**默认按视觉层次拆成可九宫 / 三宫 / 复用的部件**（见下文「frame 类元素：按视觉层次拆，九宫与装饰」），整张烘焙只在拆不开或拆后对不上时使用，并写 `bake_reason`。
 7. **写好审核清单后停下。** 跑 `flatten` + `preview`，`status` 保持 `pending_review`，等用户改 JSON 确认后再导出。
 8. **确认后一口气跑完，不要停在导出。** 导出 → `build-layout` → `validate` 是一个整体；`export_log.json` 写出不算完成，只有 `validate/validate_report.json` 写出并读过 `issues`（含 `group_effect_lost`）、遮罩 PSNR / ΔE 后才算完成。`validate` 的最后一步用**实际导出的 PNG** 拼出默认态并画上标注，写出 `validate/preview_exported_annotated.png` 与 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注）；把这两张图作为最终成果交给用户。第 7 步导出前的审核预览不变。若 `issues` 里有 `reuse_mismatch`，按第 6 步处理（拆出单独导出，或交用户决定）后重跑。每条长命令都设超时并把输出写进日志；某步超时或报错时，读日志、修正后重跑这一步，不要静默结束。
 
@@ -52,16 +52,51 @@
 **游戏 UI 常见先验**（默认判断，像素对照可以推翻，冲突交用户）：
 
 - 列表 / 排行 / 背包的行底：很可能是一张复用的模板，另有少量特殊变体（自己那一行、高亮行等）。
-- 头像框：很可能复用。**头像图本身是运行时动态内容**，要和框分开：单独一个 part，`role: avatar`、`placeholder: true`，导出 PSD 里的示意图作占位，绝不和框烘焙在一起。PSD 里头像和框在同一层或合并的智能对象里时，在 `reuse_decisions` 里标为需要拆分/决定（`type: split_avatar`），不要合着导出。
+- 头像框：很可能复用。**头像图本身是运行时动态内容**，必须和框分开：单独一个 part，`role: avatar`、`placeholder: true`，导出 PSD 里的示意图作占位，绝不和框烘焙在一起。PSD 里头像和框在同一层或同一个智能对象里时，agent 先按下文的手段拆；拆不开或拆后与效果图对不上，才写 `reuse_decisions`（`type: split_avatar`）交用户，此时默认值不能是合并导出。
+- 面板 / 弹窗 / 卡片 / 按钮底：通常是外框（可九宫）+ 标题栏条（横向三宫或并入外框）+ 内嵌底块（可九宫）+ 不可拉伸的装饰（纹理、半调圆点、光斑），按这些层次分别导出，装饰单独成图叠放，不落在九宫可拉伸区。
 - 道具/图标格、同款按钮、按名次的奖牌/徽章（少量固定集合）、货币图标、进度条的底和填充：典型的可复用资源。
 - 玩家名、分数、数字：`dynamic_text`。
 
 `reuse_candidates.json` 里每组带 `evidence.ui_role_prior`（`type: ui_role_prior`，按图层名/路径关键词猜的角色和先验：`likely_reuse`、`small_fixed_set`、`dynamic_placeholder`），以及 `avatar_merge_suspects`（疑似头像与框合并的层）。这些只是证据，由 agent 判断。
 
+### 头像与框合在一起：先拆，拆不开再问
+
+头像图是运行时内容，必须与框分开。`avatar_merge_suspects` 里的层（或 agent 自己看出来的合并层），按下面的顺序尝试，**从最可靠的开始**：
+
+1. **智能对象内部有独立图层（`split_method: smart_object_contents`）。** 跑 `split-avatar`（见下）：它用 psd-tools 打开内嵌的 PSB，按「被剪贴的位图层 + 剪贴底 = 头像，其余可见层 = 框」分类，写出 `hide_inner_for_avatar` / `hide_inner_for_frame`、对比图和建议的部件。导出时 `export_slices.psjs` 对带 `split` 的条目：在**临时导出文档**里对智能对象做「编辑内容」（`placedLayerEditContents`），隐藏 `split.hide_inner` 列出的内层，存回这个临时副本再导出，源文档不动。链接型或非 PSD 的智能对象读不到内层，换下一种方法。
+2. **文档里头像和框本来就是分开的层（`mask_or_clip_layers`）。** 头像是剪贴到形状上的位图、或带蒙版的层，框是另一层：头像层（连同剪贴底）和框层分别导出，不要选它们的父组一起导出。
+3. **框从同类未合并的实例复用（`frame_from_instance`）。** 别处（同画板或其它画板、规范页）有只含框的同款层时，框用它导出并写 `reuse_of`；头像区域用 `split-avatar --frame-instance 合并层id:框层id` 按像素差估出（`approximate: true`），占位头像可以导出合并层本身（叠在框下，运行时被替换），并记下估计的头像框 `avatar_rect_estimate`。
+4. **按像素 / 形状分析生成遮罩（`pixel_mask_estimate`）。** 只剩这一种时才用，结果必须标 `split_approximate: true`（或 `split_evidence.approximate: true`）。
+
+**拆完必须验证。** 用框 + 占位头像按绘制顺序重新拼合，与效果图（合并层的 Photoshop 导出或 `full_render.png` 的同一区域）对比：
+
+- 一致：直接按拆分导出。头像 part `role: avatar`、`placeholder: true`；框 part 可复用（`reuse_of`）。两者都写 `split_method`、`split`（智能对象时）和 `split_evidence`（对比结果、对比图路径、所用工具）。`validate` 最后还会按实际导出的 PNG 拼合再比一次。
+- 拆不开或拆后对不上：才写 `reuse_decisions`（`type: split_avatar`），附对比图（`compare_image`）、已尝试的方法与失败原因（`attempts: [{method, result, reason}]`），交用户决定。**默认值不能是 `accept_placeholder` 等合并导出**，用最好的拆分候选（如 `split_best_effort`）或 `wait_for_user`。
+
+`split-avatar` 的状态：`candidate`（拆分自洽，且 psd-tools 渲染与该层的 Photoshop 像素一致）；`candidate_unverified`（拆分结构成立，但框侧有混合模式 / 非正常混合的效果 / 填充 0 的效果层叠在头像上，或 psd-tools 复现不了内层效果；必须用 Photoshop 按拆分导出后和合并导出对比再决定）；`mismatch` / `no_separable_layers` / `not_embedded_psd`（换下一种方法）。psd-tools 只是离线证据，最终以 Photoshop 导出的拼合对比为准。
+
+`flatten` 与 `validate` 会检查（`avatar_split_issues` / `issues`）：`split_avatar_merged_default`（决定默认合并导出）、`split_avatar_not_attempted`（没有 `attempts` 或 `compare_image`）、`avatar_merged_unsplit`（疑似合并层被整张导出，既没拆也没有 split_avatar 决定；会顺着图层树找到导出其父组的条目）、`split_method_unknown`、`split_evidence_missing`、`split_avatar_not_placeholder`、`split_spec_missing`（智能对象拆分缺 `split.hide_inner`）、`split_approximate_unmarked`。
+
+### frame 类元素：按视觉层次拆，九宫与装饰
+
+面板、弹窗、卡片、按钮底等 frame 类元素，**默认先按视觉层次拆成可九宫 / 三宫 / 复用的部件**，不要整张烘焙：
+
+| 部件 | 典型图层 | 类型 |
+|------|----------|------|
+| 外框（边、底色、外发光/投影） | 覆盖整个外框范围的几层形状 | `nine_slice` |
+| 标题栏条 | 贴着顶部、横向占满的扁条 | 只横向拉伸时可并入外框；有纵向渐变、纵向拉伸会破坏渐变时，单独导出成**横向三宫**的头部条，外框主体另做九宫 |
+| 内嵌底块（圆角块、内容区） | 落在外框里面的圆角形状 | `nine_slice` |
+| 装饰（纹理、半调圆点、光斑、花纹） | 混合模式非正常的层、名字像图案的层 | `image`，**不拉伸**，按原位置（常为居中）叠放；绝不放进九宫可拉伸区 |
+
+做法按可靠性：**优先用 PSD 图层结构**（各层或各层组分别导出，`select_ids` 只选该部件的层）；图层结构不够时再做像素分析（像素级估算要标近似）。装饰层是非正常混合模式（如颜色加深）时，单独导出会丢掉它对底下的作用：要么在部件上写 `blend_mode` 交引擎按同样方式混合，要么把它与底下那一小块一起烘焙成不拉伸的装饰图；不要因此把整个面板烘成一张。拆完同样用各部件拼合与效果图对比。整张烘焙只在拆不开或拆后对不上时使用，在该 part 上写 `bake_reason`（一句话：试了什么、为什么不行）。
+
+助手证据：`prepare` 写出 `frame_split_candidates.json`（名字像 frame、尺寸 ≥ 160 px、至少 3 个可见层的组，以及按外框范围的启发式层角色：外框 ≥ 85 %、顶部扁条为标题栏、非正常混合或图案名为装饰、其余为内嵌块，并给出建议部件）。`flatten` 的 `frame_split_issues` 与 `validate` 的 `issues` 报：`frame_baked_whole`（frame 类、≥ 3 层、最短边 ≥ 160 px、没设九宫也没写 `bake_reason` 的整张 image，附层角色和建议部件），`decoration_in_stretch_zone`（九宫部件里的装饰层落在可拉伸带上）。这些是启发式，agent 对照裁切图确认。
+
 助手子命令：
 
 ```text
 python slicing_helper.py prepare --psd design.psb --out-dir out [--artboard <画板名或id>]
+python slicing_helper.py split-avatar --psd design.psb --candidates out/reuse_candidates.json --out-dir out/avatar_split [--layer-id <id>] [--frame-instance <合并层id>:<框层id>]
 python slicing_helper.py flatten --manifest out/manifest.json
 python slicing_helper.py preview --manifest out/manifest.json --out out/preview_annotated.png [--ref out/full_render.png]
 python slicing_helper.py build-layout --manifest out/manifest.json --export-log out/export_log.json --slices-dir out/slices --out out/layout.json
@@ -139,6 +174,8 @@ PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))
 | `group_effects.json` | 带图层效果的组：效果列表、`effect_params`（psd-tools 读出的参数；读不懂的效果保留原类名并标 `unknown`）、子层 id（`child_leaf_ids` / `child_ids`）、`ancestor_ids`、`baked` 用的 `select_ids`（组 id）、`engine` 用的 `engine_select_ids`（可见子层）、可选的组裁切路径。选导出目标和 `effect_mode` 时先看这份。 |
 | `reuse_candidates.json` | 重复元素的证据：每组的 `layer_ids`、`pixel_clusters`（像素一致的子集，预乘 RGBA 平均差 ≤ `tolerance_mad`）、逐实例差异、`evidence`（`ui_role_prior`、同智能对象 id、同名/同路径模式、同尺寸、同九宫格）和 `hint`（`reuse` / `split` / `needs_decision` / `dynamic_placeholder`）；逻辑相似但像素不同的组附 `reuse_compare/<组id>.png`（设计 \| 共享图 \| 差异）。另有 `avatar_merge_suspects`。只是证据，不替 agent 决定。 |
 | `nine_slice_candidates.json` | 像素启发式给出的九宫格候选（最长的均匀相邻行/列；两边边距都小于 `min_run` 则拒绝）。agent 决定采不采纳。 |
+| `frame_split_candidates.json` | frame 类组（面板、弹窗、卡片、按钮底）的层角色启发式和建议部件（外框 / 标题栏 / 内嵌块 / 装饰），见「frame 类元素」。 |
+| `split-avatar` 输出（另跑） | `<out>/split_candidates.json`：每个疑似合并层的尝试结果、内层分类、`hide_inner_*`、对比数据和 `suggested_parts`；`<out>/<layer_id>/` 下有 avatar / frame / recomposite / compare 图。 |
 | `materials.json` | 上述路径和数量统计。 |
 
 阅读顺序建议：先看整图，理解屏幕结构；再对照 `crops_sheet.jpg` / 单张裁切图看每个零件长什么样；用 `crops_index.json` 和 `group_effects.json` 把 id 对回 `tree.json` 的路径、可见性、文本和效果。不要只根据图层名做决定，名称经常不准。
@@ -177,7 +214,7 @@ PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))
    单个特殊样式的列表行（例如只有一行画了 self 高亮）只是**这一行的一个实例**，不是「每一行都该有 self / 这一行还缺 normal」。不要给其它行推断缺失的 self，也不要给这一行推断缺失的 normal，除非设计里每行都画出了成套状态变体。
 5. **导出目标要看效果在哪一层。** 图层效果（如投影、外发光、描边）经常加在代表该元素的**父组**上，内层叶子（智能对象、形状）自身没有效果。选 `layer_id` / `select_ids` 时，检查最近的父组（或代表该元素的组）：组有效果而叶子没有，按第 1 节前的「组效果：烘焙还是引擎绘制」选 `effect_mode`。`baked` 选组 id，可见框用组的含效果框；`engine` 选子层，并写 `engine_effects`。组 id 没有裁切图时同样如此。例如某个图标组 `<item>` 上有 DropShadow、内层叶子没有：`baked` 写该组 id；`engine` 写子层 id + `"effect_mode": "engine"` + 抄自 `effect_params` 的 `engine_effects`。不能只写子层而什么都不记。
 6. 底图、高亮、图标、文字始终是独立 `parts`。类型仍是 `image` | `nine_slice` | `dynamic_text` | `art_text`。可变文案（分数、名字、倒计时、1–2 位名次）用 `dynamic_text`（只出属性，不出图）；带效果的固定标签（页签名、导航名、标题）用 `art_text`（出图）。
-7. 重复元素按「重复元素：复用还是分开」处理：逻辑上该复用的导出一张、各实例用 `reuse_of` 引用；与设计对不上的拆开；有证据却对不上的交用户决定。头像图与头像框分开。全部 1x。
+7. 重复元素按「重复元素：复用还是分开」处理：逻辑上该复用的导出一张、各实例用 `reuse_of` 引用；与设计对不上的拆开；有证据却对不上的交用户决定。头像图与头像框分开（先自己拆，拆不开才问）；frame 类元素按视觉层次拆成九宫 / 三宫 / 装饰部件。全部 1x。
 
 ---
 
@@ -234,7 +271,26 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 ]
 ```
 
-`type` 为 `reuse` 或 `split_avatar`（头像与框合在一起，需拆分）。`decision` 为空时 `flatten` 会在 `pending_reuse_decisions` 里列出；未决定的按 `default` 导出。
+`type` 为 `reuse` 或 `split_avatar`。`split_avatar` 只在 agent 试过拆分、拆不开或拆后对不上时才写，必须带 `attempts`（每项 `method`、`result`、`reason`）和 `compare_image`，`default` 不能是 `accept_placeholder` 等合并导出：
+
+```json
+{
+  "id": "rd_avatar",
+  "type": "split_avatar",
+  "instances": ["<module>_img_avatar_item1"],
+  "attempts": [
+    { "method": "smart_object_contents", "result": "candidate_unverified", "reason": "框的内阴影（正片叠底）落在头像上，按拆分导出后与合并导出对比 25 dB" },
+    { "method": "frame_from_instance", "result": "not_available", "reason": "没有只含框的同款层" }
+  ],
+  "compare_image": "avatar_split/10001/compare.png",
+  "problem": "拆开后框的内阴影不再作用于头像",
+  "options": ["split_best_effort", "split_with_engine_overlay", "provide_split_frame_asset"],
+  "default": "split_best_effort",
+  "decision": null
+}
+```
+
+`decision` 为空时 `flatten` 会在 `pending_reuse_decisions` 里列出；未决定的按 `default` 导出。
 
 组件节点常用字段：
 
@@ -253,7 +309,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 | `children` | 子组件 |
 | `source_path` / `layer_id` | 仅供对照的源图层引用 |
 
-部件（`part`）常用字段：`name`（规范文件名）、`role`（`base`、`highlight`、`icon`、`text` 等）、`kind`、`layer_id`、`select_ids`、`hidden`、`nine_slice`、`text`、`logical_bounds`、`source_name`、`source_path`。重复元素复用时加 `reuse_of`（共享图名，不带实例序号）；用户确认接受差异时加 `reuse_accepted: true`。运行时内容的占位图（如头像）加 `placeholder: true`。父组带效果时再加：`effect_mode`（`"baked"` | `"engine"`）、`effect_reason`（一句话理由，审核时可见）、`engine_effects`（仅 `engine`，从 `effect_params` 抄）。
+部件（`part`）常用字段：`name`（规范文件名）、`role`（`base`、`highlight`、`icon`、`text` 等）、`kind`、`layer_id`、`select_ids`、`hidden`、`nine_slice`、`text`、`logical_bounds`、`source_name`、`source_path`。重复元素复用时加 `reuse_of`（共享图名，不带实例序号）；用户确认接受差异时加 `reuse_accepted: true`。运行时内容的占位图（如头像）加 `placeholder: true`。拆分出来的部件加 `split_method`（`smart_object_contents` | `mask_or_clip_layers` | `frame_from_instance` | `pixel_mask_estimate`）、`split_evidence`（对比结果和对比图），智能对象拆分再加 `split: { "hide_inner": [{ "id": 内层id, "name": 内层名 }] }`（导出时在临时副本里隐藏这些内层；先按 id、再按唯一的名字匹配，找不到就报错），像素估算加 `split_approximate: true`。frame 类元素仍整张烘焙时加 `bake_reason`。父组带效果时再加：`effect_mode`（`"baked"` | `"engine"`）、`effect_reason`（一句话理由，审核时可见）、`engine_effects`（仅 `engine`，从 `effect_params` 抄）。
 
 ```json
 {
@@ -828,3 +884,35 @@ Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、�
 - 345 张矩阵：25 条变好，0 条变差，其余不变。中位 28.26 → 29.21 dB，均值 28.29 → 28.68 dB。
 - 按分组：训练 29.14 → 29.45（13 条变好）；验证 28.78 不变（2 条变好）；val2 26.47 → 27.01（10 条变好）。
 - 列表画板（10.7）：文字框 37.39 dB、整板文字渲染 44.51 dB，不变。
+
+### 10.9 头像拆分与 frame 拆分（1.4.4）
+
+Photoshop 2026（Windows）上只在脚本新建的临时文档里实测，前后已打开文档列表都为空，原设计文件未打开。
+
+**智能对象内部访问（已实测）：**
+- 临时文档里把「头像底（形状）+ 剪贴到它上面的照片 + 外框」转成智能对象并缩放到 62.5 %。`smartObjectMore.transform` 给出四角坐标，`size` 给出内部文档尺寸。
+- 「编辑内容」（`placedLayerEditContents`）会把内嵌文档作为新文档打开，内层的名称、id、剪贴关系都在。对「由该层新建的文档」（导出用的临时副本）编辑内容、隐藏一侧再存回，只改这个副本，原文档逐像素不变。框 + 头像按拆分导出后重新拼合，与合并导出相比平均差 0.15（预乘 0–255），PSNR 43.6 dB。
+- 「转换为图层」（`placedLayerConvertToLayers`）**不保留**智能对象的缩放：内层按原尺寸展开。再手动缩放回去，与合并导出的最大差是 201，因此不采用。
+- psd-tools 读到的内层 id 与 Photoshop 编辑内容时的 id 一致，`split.hide_inner` 按 id 匹配成功。
+- 端到端（`prepare` → `split-avatar` → manifest → `flatten` → `export_slices.psjs` → `build-layout` → `validate`）在自建测试文件上跑通。`split-avatar` 判为 `candidate`：拆分自洽 39.2 dB，与该层像素 33.9 dB，重采样本身的误差下限约 36 dB。
+
+**真实设计稿（副本）上的头像（已实测）：**
+- 列表行与前三名卡片里的头像都是内嵌 PSB 智能对象，内部有独立的剪贴照片层，可以拆。
+- 但框侧的组内阴影（正片叠底）、线性加深且填充为 0 的描边层和内发光都叠在照片上。用 Photoshop 按拆分导出后再拼合，与合并导出只有 24.8 / 25.1 dB，差异集中在框的内缘。
+- `split-avatar` 因此判为 `candidate_unverified`，并列出这些层。按规则，这种情况写 `split_avatar` 决定交用户：附对比图和尝试记录，默认用最好的拆分。
+- 另有只含框的同款智能对象（不同颜色的框），可以用 `frame_from_instance`。
+
+**frame 拆分（离线核对图层结构）：**
+- 一个整张烘焙的弹窗外框（7 层，970×1042 px）被 `frame_baked_whole` 报出来。按层角色分成：
+  - 外框 3 层（其中 1 层线性加深）
+  - 标题栏 2 层
+  - 内嵌圆角块 1 层
+  - 中央装饰 1 层（颜色加深，418×418 px）
+- 这正是外框九宫（标题栏视渐变决定并入或做横向三宫）+ 内嵌块九宫 + 不拉伸的居中装饰。装饰是颜色加深模式，需要按上文写 `blend_mode` 或与底下一小块一起烘焙。
+- 这一份只核对了图层结构，没有在 Photoshop 里逐部件导出拼合，**未验证**像素一致性。
+
+**未验证：**
+- 链接型智能对象（读不到内层，只能换方法）。
+- 带透视 / 变形的智能对象（离线映射只做仿射，`non_affine_px` > 1 判为 mismatch）。
+- `frame_from_instance` 与 `pixel_mask_estimate` 在真实稿上的效果。
+- `validate` 在透明画布的测试文件上会把透明区的 RGB 差计入，PSNR 很低；正常不透明画板不受影响。

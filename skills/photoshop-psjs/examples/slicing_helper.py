@@ -1742,6 +1742,17 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
     write_crop_sheet(sheet_items, sheet_path)
     hidden_n = sum(1 for r in crop_records if not r["visible"])
     text_n = sum(1 for r in crop_records if r.get("is_text"))
+    frame_cands = frame_split_candidates(tree)
+    (dest / "frame_split_candidates.json").write_text(json.dumps({
+        "candidates": frame_cands,
+        "notes": [
+            "Frame-like groups (panel, popup, card, button base) with several visible layers. Default: export each "
+            "visual layer group as its own part (outer frame / title bar / inset panel nine-slice, decoration as a "
+            "non-stretchable image). Bake the whole frame only if the split fails; then set bake_reason.",
+            "layer_roles are a box heuristic (outer >= 85 % of the union, header = wide strip at the top, decoration = "
+            "non-normal blend or pattern-like name); check them against the crops.",
+        ],
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     materials = {
         "source": tree_doc["source"],
         "full_render_preview": str(render_path),
@@ -1752,7 +1763,9 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
         "nine_slice_candidates": str(dest / "nine_slice_candidates.json"),
         "group_effects": str(dest / "group_effects.json"),
         "reuse_candidates": str(dest / "reuse_candidates.json"),
+        "frame_split_candidates": str(dest / "frame_split_candidates.json"),
         "stats": {
+            "frame_split_candidates": len(frame_cands),
             "reuse_groups": reuse.get("count", 0),
             "crop_count": len(crop_records),
             "hidden_crops": hidden_n,
@@ -1774,6 +1787,8 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
             "reuse_candidates.json lists repeated elements with pixel similarity and logical evidence. "
             "The agent decides reuse (reuse_of); groups with evidence but pixel differences need a "
             "reuse_decisions entry for the user (see reuse_compare/).",
+            "avatar_merge_suspects (in reuse_candidates.json): avatar pictures merged with their frame. Run split-avatar "
+            "and split them before asking the user.",
         ],
     }
     (dest / "materials.json").write_text(json.dumps(materials, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1866,8 +1881,764 @@ def avatar_merge_suspects(records, base_dir=None):
                     "crop_center_opaque": center,
                 },
                 "problem": "Avatar picture may be merged with its frame. The avatar is runtime content and the frame is "
-                           "a reusable resource; check the crop and add a split decision instead of exporting them combined.",
+                           "a reusable resource: try to split first (split-avatar; references/slicing.md). Only when "
+                           "the split fails or does not match, add a split_avatar decision with attempts and compare_image.",
             })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Avatar / frame split (1.4.4). The avatar picture is runtime content and must be a
+# separate placeholder part. When the PSD merges it with its frame, the agent tries to
+# split first and only asks the user when every method fails or the split does not match.
+# ---------------------------------------------------------------------------
+
+# Ordered by reliability (references/slicing.md, "头像与框合在一起").
+SPLIT_METHODS = (
+    "smart_object_contents",   # inner layers of an embedded smart object, exported in Photoshop (Edit Contents on a temp copy)
+    "mask_or_clip_layers",     # avatar and frame are separate layers in the document (clipping / mask); export each
+    "frame_from_instance",     # frame taken from an unmerged instance of the same frame elsewhere (reuse_of)
+    "pixel_mask_estimate",     # mask estimated from pixels / shapes; always approximate
+)
+APPROXIMATE_SPLIT_METHODS = {"pixel_mask_estimate"}
+# A split_avatar decision may not default to exporting avatar and frame merged.
+MERGED_DEFAULTS = {"accept_placeholder", "merged", "export_merged", "keep_merged", "accept_merged", "combined"}
+RASTER_KINDS = {"pixel", "smartobject", "smart_object", "image"}
+
+
+def _blend_name(mode):
+    if mode is None:
+        return None
+    text = str(getattr(mode, "name", mode)).lower()
+    return text.replace("blendmode.", "")
+
+
+NORMAL_BLENDS = {None, "normal", "pass_through", "passthrough"}
+
+
+def frame_blend_risks(records, cls):
+    """Frame-side layers (or groups holding both sides) whose blending reaches the avatar pixels:
+    a non-normal blend mode, effects with a non-normal blend (inner shadow multiply...), fill 0 with
+    effects, or a group effect over both sides. A plain "frame over avatar" cannot reproduce them."""
+    if not cls.get("avatar") or not cls.get("frame"):
+        return []
+    by_id = {r["id"]: r for r in records}
+    av = {x["id"] for x in cls["avatar"]}
+    fr = {x["id"] for x in cls["frame"]}
+    av_boxes = [by_id[i]["bbox"] for i in av if by_id.get(i, {}).get("bbox")]
+
+    def overlaps(b):
+        return b and any(b[0] < a[2] and b[2] > a[0] and b[1] < a[3] and b[3] > a[1] for a in av_boxes)
+
+    risks = []
+    for r in records:
+        if not r["visible"]:
+            continue
+        if r["is_group"]:
+            inside = {x["id"] for x in records if r["id"] in x["parents"]}
+            if not (inside & av and inside & fr):
+                continue
+        elif r["id"] not in fr:
+            continue
+        odd_fx = [e for e in r.get("effects") or [] if e.get("blend_mode") not in NORMAL_BLENDS]
+        why = []
+        if not r["is_group"] and r.get("blend_mode") not in NORMAL_BLENDS:
+            why.append(f"blend {r['blend_mode']}")
+        if odd_fx:
+            why.append("effects " + ", ".join(f"{e['type']}({e['blend_mode']})" for e in odd_fx))
+        if r["is_group"] and r.get("effects"):
+            why.append("group effects over avatar and frame: " + ", ".join(e["type"] for e in r["effects"]))
+        if not r["is_group"] and r.get("fill_opacity") == 0 and r.get("effects"):
+            why.append("fill 0, effect-only overlay")
+        if why and overlaps(r.get("bbox")):
+            risks.append({"id": r["id"], "name": r["name"], "why": why})
+    return risks
+
+
+def _inner_layer_records(psd):
+    """Flat records for every layer of an (inner) PSDImage with parent chain and clip base."""
+    out = []
+
+    def walk(container, parents):
+        prev_base = None
+        for layer in container:
+            kind = str(getattr(layer, "kind", "")).lower()
+            try:
+                lid = int(layer.layer_id)
+            except Exception:
+                lid = None
+            clipping = bool(getattr(layer, "clipping", False))
+            fx = []
+            try:
+                for eff in (layer.effects or []):
+                    if getattr(eff, "enabled", True):
+                        fx.append({"type": eff.__class__.__name__, "blend_mode": _blend_name(getattr(eff, "blend_mode", None))})
+            except Exception:
+                pass
+            rec = {
+                "id": lid,
+                "name": layer.name,
+                "kind": kind,
+                "visible": bool(layer.visible),
+                "clipping": clipping,
+                "is_group": layer.is_group(),
+                "bbox": [int(v) for v in layer.bbox] if getattr(layer, "bbox", None) else None,
+                "parents": list(parents),
+                "clip_base": prev_base if clipping else None,
+                "blend_mode": _blend_name(getattr(layer, "blend_mode", None)),
+                "fill_opacity": getattr(layer, "fill_opacity", None) if hasattr(layer, "fill_opacity") else None,
+                "effects": fx,
+            }
+            out.append(rec)
+            if not clipping:
+                prev_base = lid
+            if layer.is_group():
+                walk(layer, parents + [lid])
+    walk(psd, [])
+    return out
+
+
+def classify_inner_layers(records):
+    """Split inner smart-object layers into avatar and frame leaves.
+
+    Avatar: a visible clipping stack (base + clipped layers) where a clipped layer is a raster
+    (pixel / smart object) - the usual "photo clipped into a shape" - or a visible raster leaf whose
+    name mentions an avatar but not a frame. Frame: every other visible leaf. Hidden layers
+    (and leaves under hidden groups) are ignored. Returns None for avatar when nothing qualifies.
+    """
+    by_id = {r["id"]: r for r in records}
+
+    def shown(r):
+        if not r["visible"]:
+            return False
+        return all(by_id.get(p, {}).get("visible", True) for p in r["parents"])
+
+    leaves = [r for r in records if not r["is_group"] and shown(r)]
+    avatar = set()
+    for r in leaves:
+        if r["clipping"] and r["kind"] in RASTER_KINDS and r["clip_base"] is not None:
+            avatar.add(r["id"])
+            avatar.add(r["clip_base"])
+    for r in leaves:
+        if r["clipping"] and r["clip_base"] in avatar:
+            avatar.add(r["id"])
+    if not avatar:
+        for r in leaves:
+            name = (r["name"] or "").lower()
+            if r["kind"] in RASTER_KINDS and any(k in name for k in AVATAR_KEYS) and not any(k in name for k in FRAME_KEYS):
+                avatar.add(r["id"])
+    avatar_leaves = [r for r in leaves if r["id"] in avatar]
+    frame_leaves = [r for r in leaves if r["id"] not in avatar]
+    return {
+        "avatar": [{"id": r["id"], "name": r["name"]} for r in avatar_leaves] or None,
+        "frame": [{"id": r["id"], "name": r["name"]} for r in frame_leaves] or None,
+    }
+
+
+def _affine_from_quad(w, h, quad):
+    """Affine map (a, b, c, d, e, f): x' = a x + b y + c, y' = d x + e y + f, from the inner
+    document rectangle to the first three corners of a smart object's transform box.
+    Returns (coeffs, max_corner_error_px) - a large error means a non-affine transform."""
+    x0, y0, x1, y1, x2, y2, x3, y3 = [float(v) for v in quad]
+    a, b, c = (x1 - x0) / w, (x3 - x0) / h, x0
+    d, e, f = (y1 - y0) / w, (y3 - y0) / h, y0
+    px, py = a * w + b * h + c, d * w + e * h + f
+    return (a, b, c, d, e, f), float(np.hypot(px - x2, py - y2))
+
+
+def map_inner_to_document(im, quad, doc_box):
+    """Place an inner-document RGBA image into document space (cropped to doc_box l,t,r,b)."""
+    w, h = im.size
+    (a, b, c, d, e, f), err = _affine_from_quad(w, h, quad)
+    det = a * e - b * d
+    if abs(det) < 1e-9:
+        raise ValueError("degenerate smart object transform")
+    l, t, r, btm = doc_box
+    # Inverse map for PIL: inner = M^-1 (doc - offset); doc pixel (u, v) is at (u + l, v + t).
+    ia, ib = e / det, -b / det
+    id_, ie = -d / det, a / det
+    cx, cy = l - c, t - f
+    coeffs = (ia, ib, ia * cx + ib * cy, id_, ie, id_ * cx + ie * cy)
+    pm = Image.fromarray(np.clip(premultiplied(im), 0, 255).astype(np.uint8), "RGBA")
+    if abs(b) < 1e-9 and abs(d) < 1e-9 and a > 0 and e > 0:
+        # Axis-aligned scale: filtered resize (antialiased when shrinking, like Photoshop's bicubic).
+        pad = int(max(w, h)) + 4
+        padded = Image.new("RGBA", (w + 2 * pad, h + 2 * pad), (0, 0, 0, 0))
+        padded.paste(pm, (pad, pad))
+        src_box = ((l - c) / a + pad, (t - f) / e + pad, (r - c) / a + pad, (btm - f) / e + pad)
+        out = padded.resize((r - l, btm - t), Image.BICUBIC, box=src_box)
+    else:
+        out = pm.transform((r - l, btm - t), Image.AFFINE, coeffs, resample=Image.BICUBIC)
+    arr = np.asarray(out).astype(np.float32)
+    alpha = arr[..., 3:4]
+    rgb = np.where(alpha > 0, arr[..., :3] * 255.0 / np.maximum(alpha, 1e-6), 0)
+    return Image.fromarray(np.clip(np.concatenate([rgb, alpha], -1), 0, 255).astype(np.uint8), "RGBA"), err
+
+
+def over(top, bottom):
+    """Porter-Duff src-over of two same-size RGBA images."""
+    t, b = premultiplied(top) / 255.0, premultiplied(bottom) / 255.0
+    o = t + b * (1.0 - t[..., 3:4])
+    a = o[..., 3:4]
+    rgb = np.where(a > 0, o[..., :3] / np.maximum(a, 1e-6), 0)
+    return Image.fromarray(np.clip(np.concatenate([rgb, a], -1) * 255.0 + 0.5, 0, 255).astype(np.uint8), "RGBA")
+
+
+def split_match(recomposite, design):
+    """MAD (premultiplied, 0-255), % pixels off by > 16 and PSNR of a recomposited split vs the design."""
+    a, b = premultiplied(recomposite), premultiplied(design)
+    mad, pct = crop_mad(a, b)
+    h, w = max(a.shape[0], b.shape[0]), max(a.shape[1], b.shape[1])
+    mse = float(((pad_to(a, w, h) - pad_to(b, w, h)) ** 2).mean())
+    psnr = 99.0 if mse <= 1e-9 else float(10 * np.log10(255.0 ** 2 / mse))
+    return {"mad": round(mad, 3), "pct_px_over_16": round(pct, 3), "psnr": round(psnr, 2)}
+
+
+SPLIT_MATCH_PSNR = 35.0  # recomposite (frame over placeholder avatar) vs design; below this the split "does not match"
+# Offline smart-object check: psd-tools + Pillow resampling alone costs a few dB against Photoshop's
+# stored raster (about 36 dB on a 0.625x probe), so the split itself is judged against the whole inner
+# document resampled the same way (split_consistency), and the layer pixels only need this floor.
+SPLIT_LAYER_FLOOR_PSNR = 30.0
+
+
+def estimate_avatar_mask(merged, frame, tol=24):
+    """Pixel estimate of the avatar region: where the merged image differs from the frame alone.
+
+    ``merged`` and ``frame`` are aligned same-size RGBA images (frame from an unmerged instance).
+    Returns (avatar RGBA cut from merged, recomposite frame-over-avatar, match). Approximate."""
+    m, f = premultiplied(merged), premultiplied(frame)
+    h, w = max(m.shape[0], f.shape[0]), max(m.shape[1], f.shape[1])
+    m, f = pad_to(m, w, h), pad_to(f, w, h)
+    diff = np.abs(m - f).max(axis=-1) > tol
+    src = np.asarray(merged.convert("RGBA"))
+    src = np.pad(src, ((0, h - src.shape[0]), (0, w - src.shape[1]), (0, 0)))
+    av = src.copy()
+    av[..., 3] = np.where(diff, src[..., 3], 0)
+    avatar = Image.fromarray(av, "RGBA")
+    fr = Image.fromarray(np.pad(np.asarray(frame.convert("RGBA")), ((0, h - frame.height), (0, w - frame.width), (0, 0))), "RGBA")
+    rec = over(fr, avatar)
+    return avatar, rec, split_match(rec, Image.fromarray(src, "RGBA"))
+
+
+def split_smart_object_layer(layer, out_dir, open_kw=None):
+    """Try the smart-object split for one document layer (psd-tools, offline).
+
+    Renders frame-only and avatar-only from the embedded document, maps them back with the
+    smart object transform, recomposites frame over avatar and compares with the layer's own
+    pixels (Photoshop's stored raster). psd-tools renders the inner layers, so pixels are an
+    approximation; the export itself is done by Photoshop (``split.hide_inner``)."""
+    out_dir = Path(out_dir)
+    lid = int(layer.layer_id)
+    rec = {"layer_id": lid, "name": layer.name, "method": "smart_object_contents", "status": None}
+    so = getattr(layer, "smart_object", None)
+    if so is None:
+        rec.update(status="not_smart_object", reason="layer is not a smart object")
+        return rec
+    rec["smart_object"] = {"kind": so.kind, "filetype": str(so.filetype), "filename": so.filename,
+                           "unique_id": str(so.unique_id or "")}
+    if so.kind != "data" or not so.is_psd():
+        rec.update(status="not_embedded_psd",
+                   reason="linked or non-PSD smart object: inner layers are not readable offline")
+        return rec
+    import io
+    if open_kw is None:
+        open_kw = {"parse_limits": ParseLimits(max_objects=None, max_total_bytes=None, max_read_bytes=None)} if ParseLimits is not None else {}
+    try:
+        with so.open() as fh:
+            inner = PSDImage.open(io.BytesIO(fh.read()), **open_kw)
+    except Exception as exc:
+        rec.update(status="error", reason=f"cannot open embedded document: {exc}")
+        return rec
+    records = _inner_layer_records(inner)
+    cls = classify_inner_layers(records)
+    rec["inner_size"] = list(inner.size)
+    rec["inner_layers"] = [{k: r[k] for k in ("id", "name", "kind", "visible", "clipping", "bbox", "parents")} for r in records]
+    rec["avatar_inner"], rec["frame_inner"] = cls["avatar"], cls["frame"]
+    if not cls["avatar"] or not cls["frame"]:
+        rec.update(status="no_separable_layers",
+                   reason="no clipped raster (photo) layer or no frame layer inside the smart object")
+        return rec
+    rec["frame_blend_risks"] = frame_blend_risks(records, cls)
+    rec["hide_inner_for_avatar"] = cls["frame"]
+    rec["hide_inner_for_frame"] = cls["avatar"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    av_ids = {x["id"] for x in cls["avatar"]}
+    fr_ids = {x["id"] for x in cls["frame"]}
+
+    def render(keep):
+        def filt(l):
+            if l.is_group():
+                return l.visible
+            return l.visible and int(l.layer_id) in keep
+        return inner.composite(layer_filter=filt, force=True).convert("RGBA")
+
+    try:
+        av_in, fr_in = render(av_ids), render(fr_ids)
+        all_in = render(av_ids | fr_ids)
+        quad = list(so.transform_box) if so.transform_box else [0, 0, inner.width, 0, inner.width, inner.height, 0, inner.height]
+        box = tuple(int(v) for v in layer.bbox)
+        av_doc, err = map_inner_to_document(av_in, quad, box)
+        fr_doc, _ = map_inner_to_document(fr_in, quad, box)
+        all_doc, _ = map_inner_to_document(all_in, quad, box)
+        design = layer.topil()
+        design = design.convert("RGBA") if design is not None else layer.composite().convert("RGBA")
+    except Exception as exc:
+        rec.update(status="error", reason=f"render failed: {exc}")
+        return rec
+    recomposite = over(fr_doc, av_doc)
+    rec["transform_box"] = quad
+    rec["non_affine_px"] = round(err, 2)
+    rec["match"] = split_match(recomposite, design)
+    rec["split_consistency"] = split_match(recomposite, all_doc)
+    rec["resample_floor"] = split_match(all_doc, design)
+    for name, im in (("avatar", av_doc), ("frame", fr_doc), ("recomposite", recomposite)):
+        im.save(out_dir / f"{name}.png")
+    sheet = write_compare_sheet([(f"{lid} {layer.name}", design, recomposite)], out_dir / "compare.png",
+                                titles=("design", "frame over avatar", "diff x3"))
+    rec["files"] = {k: str(out_dir / f"{k}.png") for k in ("avatar", "frame", "recomposite")}
+    rec["compare_image"] = str(sheet) if sheet else None
+    rec["approximate_render"] = True
+    reasons = []
+    if rec["split_consistency"]["psnr"] < SPLIT_MATCH_PSNR:
+        reasons.append(f"frame over avatar vs whole contents PSNR {rec['split_consistency']['psnr']} dB (< {SPLIT_MATCH_PSNR})")
+    if err > 1.0:
+        reasons.append(f"non-affine transform ({err:.1f} px)")
+    if reasons:
+        rec["status"], rec["reason"] = "mismatch", "; ".join(reasons)
+    elif rec["frame_blend_risks"]:
+        rec["status"] = "candidate_unverified"
+        rec["reason"] = ("frame layers blend onto the avatar (" + "; ".join(
+            f"{x['name']}: {', '.join(x['why'])}" for x in rec["frame_blend_risks"]) +
+            "); frame over avatar may not match - export with split and compare with the merged export")
+    elif rec["resample_floor"]["psnr"] < SPLIT_LAYER_FLOOR_PSNR:
+        # The split is consistent, but psd-tools does not reproduce the inner rendering (layer effects on
+        # shapes, blend modes...). Photoshop has to export it; validate is the check.
+        rec["status"] = "candidate_unverified"
+        rec["reason"] = (f"psd-tools render of the contents vs the layer pixels is only {rec['resample_floor']['psnr']} dB "
+                         f"(< {SPLIT_LAYER_FLOOR_PSNR}); export with split and confirm with validate")
+    else:
+        rec["status"] = "candidate"
+    return rec
+
+
+def frame_instance_candidates(records, suspect, size_tol=0.12):
+    """Unmerged frame layers elsewhere (name mentions a frame, similar size) that could supply the frame."""
+    sw, sh = suspect.get("width") or 0, suspect.get("height") or 0
+    out = []
+    for rec in records or []:
+        if rec.get("layer_id") == suspect.get("layer_id") or rec.get("is_group") or rec.get("is_text"):
+            continue
+        name = (rec.get("name") or "").lower()
+        if not any(k in name for k in FRAME_KEYS):
+            continue
+        w, h = rec.get("width") or 0, rec.get("height") or 0
+        if sw and sh and w and h and abs(w - sw) <= size_tol * sw and abs(h - sh) <= size_tol * sh:
+            out.append({"layer_id": rec.get("layer_id"), "name": rec.get("name"), "path": rec.get("path"),
+                        "size": [w, h], "crop": rec.get("crop")})
+    return out
+
+
+def suggested_split_parts(rec, base_name="<module>_img_avatar"):
+    """Manifest part snippets for a successful smart-object split (agent renames / adds reuse_of)."""
+    ev = {"split_tool": "split-avatar", "match": rec.get("match"), "compare_image": rec.get("compare_image"),
+          "approximate_render": rec.get("approximate_render", True)}
+    return [
+        {"name": base_name, "role": "avatar", "placeholder": True, "layer_id": rec["layer_id"],
+         "select_ids": [rec["layer_id"]], "split_method": "smart_object_contents",
+         "split": {"hide_inner": rec["hide_inner_for_avatar"]}, "split_evidence": ev},
+        {"name": base_name.replace("avatar", "avatar_frame"), "role": "frame", "layer_id": rec["layer_id"],
+         "select_ids": [rec["layer_id"]], "split_method": "smart_object_contents",
+         "split": {"hide_inner": rec["hide_inner_for_frame"]}, "split_evidence": ev},
+    ]
+
+
+def _descendant_ids(tree):
+    """layer_id -> set of descendant layer ids (inclusive) from a prepare layer tree."""
+    out = {}
+
+    def walk(node):
+        ids = {node.get("layer_id")} if node.get("layer_id") is not None else set()
+        for child in node.get("children") or []:
+            ids |= walk(child)
+        if node.get("layer_id") is not None:
+            out[node["layer_id"]] = ids
+        return ids
+    roots = tree if isinstance(tree, list) else ([tree] if isinstance(tree, dict) else [])
+    for root in roots:
+        if isinstance(root, dict):
+            walk(root)
+    return out
+
+
+def load_layer_tree(manifest=None, manifest_path=None):
+    """Layer tree from the manifest, or tree.json next to it (prepare output)."""
+    tree = layer_tree_from_manifest(manifest or {})
+    if tree:
+        return tree
+    if manifest_path:
+        p = Path(manifest_path).parent / "tree.json"
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8")).get("tree")
+            except Exception as exc:
+                warn(f"cannot read {p}: {exc}")
+    return None
+
+
+def load_avatar_suspects(manifest=None, manifest_path=None):
+    """avatar_merge_suspects from the manifest, or reuse_candidates.json next to it."""
+    if manifest and manifest.get("avatar_merge_suspects") is not None:
+        return list(manifest["avatar_merge_suspects"])
+    if manifest_path:
+        p = Path(manifest_path).parent / "reuse_candidates.json"
+        if p.exists():
+            try:
+                return list(json.loads(p.read_text(encoding="utf-8")).get("avatar_merge_suspects") or [])
+            except Exception as exc:
+                warn(f"cannot read {p}: {exc}")
+    return []
+
+
+def check_avatar_splits(entries, decisions, suspects=None, tree=None):
+    """Issues for the avatar/frame rule: try a split first, ask the user only after it fails.
+
+    - split_avatar_merged_default: a split_avatar decision defaults to exporting merged.
+    - split_avatar_not_attempted: a split_avatar decision without attempts (method + reason) or compare_image.
+    - avatar_merged_unsplit: an avatar-merge suspect is exported as one image, with no split and no decision.
+    - split_*: parts that claim a split but are incomplete (unknown method, no evidence, avatar not a
+      placeholder, smart-object split without hide_inner, pixel estimate not marked approximate).
+    """
+    issues = []
+    decided = set()
+    for d in decisions or []:
+        if d.get("type") != "split_avatar":
+            continue
+        decided.update(d.get("instances") or [])
+        did = d.get("id") or d.get("instances")
+        if str(d.get("default") or "").lower() in MERGED_DEFAULTS:
+            issues.append({"type": "split_avatar_merged_default", "decision": did, "default": d.get("default"),
+                           "message": "a split_avatar decision may not default to a merged export; default to "
+                                      "the best split candidate or to waiting for the user"})
+        attempts = [a for a in (d.get("attempts") or []) if isinstance(a, dict) and a.get("method") and (a.get("reason") or a.get("result"))]
+        if not attempts or not d.get("compare_image"):
+            issues.append({"type": "split_avatar_not_attempted", "decision": did,
+                           "message": "try the split methods first (references/slicing.md); a split_avatar decision "
+                                      "needs attempts [{method, result, reason}] and compare_image"})
+    for e in entries or []:
+        method = e.get("split_method")
+        if not method:
+            continue
+        name = e.get("name")
+        if method not in SPLIT_METHODS:
+            issues.append({"type": "split_method_unknown", "name": name, "split_method": method})
+        if not e.get("split_evidence"):
+            issues.append({"type": "split_evidence_missing", "name": name})
+        role = (e.get("part_role") or e.get("role") or "").lower()
+        if role == "avatar" and not e.get("placeholder"):
+            issues.append({"type": "split_avatar_not_placeholder", "name": name})
+        if method == "smart_object_contents" and not ((e.get("split") or {}).get("hide_inner")):
+            issues.append({"type": "split_spec_missing", "name": name,
+                           "message": "smart_object_contents needs split.hide_inner (see split-avatar output)"})
+        if method in APPROXIMATE_SPLIT_METHODS and not (e.get("split_approximate") or (e.get("split_evidence") or {}).get("approximate")):
+            issues.append({"type": "split_approximate_unmarked", "name": name})
+    desc = _descendant_ids(tree) if tree else {}
+    for s in suspects or []:
+        sid = s.get("layer_id")
+        if sid is None:
+            continue
+        users = []
+        for e in entries or []:
+            ids = list(e.get("select_ids") or []) or ([e.get("layer_id")] if e.get("layer_id") is not None else [])
+            if any(i == sid or sid in desc.get(i, ()) for i in ids):
+                users.append(e)
+        if not users:
+            continue
+        split_users = [e for e in users if e.get("split_method")]
+        unsplit = [e.get("name") for e in users if not e.get("split_method") and e.get("name") not in decided]
+        if unsplit and not split_users:
+            issues.append({"type": "avatar_merged_unsplit", "layer_id": sid, "names": unsplit,
+                           "message": "avatar picture and frame are exported as one image; run split-avatar and "
+                                      "split, or add a split_avatar decision with attempts and compare_image"})
+    return issues
+
+
+def frame_from_instance(merged_layer, frame_layer, out_dir, tol=24):
+    """Fallback: the frame comes from an unmerged instance; the avatar region is a pixel estimate."""
+    out_dir = Path(out_dir)
+    rec = {"layer_id": int(merged_layer.layer_id), "name": merged_layer.name, "method": "frame_from_instance",
+           "frame_layer_id": int(frame_layer.layer_id), "frame_name": frame_layer.name, "approximate": True}
+    merged, frame = merged_layer.topil(), frame_layer.topil()
+    if merged is None or frame is None:
+        rec.update(status="error", reason="layer pixels unreadable")
+        return rec
+    merged, frame = merged.convert("RGBA"), frame.convert("RGBA")
+    if abs(merged.width - frame.width) > 1 or abs(merged.height - frame.height) > 1:
+        rec.update(status="size_mismatch", reason=f"merged {merged.size} vs frame {frame.size}")
+        return rec
+    avatar, recomposite, match = estimate_avatar_mask(merged, frame, tol)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    avatar.save(out_dir / "avatar_estimate.png")
+    recomposite.save(out_dir / "recomposite.png")
+    sheet = write_compare_sheet([(f"{rec['layer_id']} {merged_layer.name}", merged, recomposite)], out_dir / "compare.png",
+                                titles=("design", "frame over avatar", "diff x3"))
+    bbox = avatar.getbbox()
+    l, t = int(merged_layer.left), int(merged_layer.top)
+    rec["avatar_rect_estimate"] = [bbox[0] + l, bbox[1] + t, bbox[2] + l, bbox[3] + t] if bbox else None
+    rec["match"] = match
+    rec["compare_image"] = str(sheet) if sheet else None
+    rec["status"] = "candidate" if match["psnr"] >= SPLIT_MATCH_PSNR and bbox else "mismatch"
+    return rec
+
+
+def cmd_split_avatar(args):
+    """Try to split avatar pictures from their frames (offline evidence + manifest snippets)."""
+    psd = open_psd(args.psd)
+    ids = [int(x) for x in (args.layer_id or [])]
+    cand_path = Path(args.candidates) if args.candidates else None
+    suspects = []
+    if cand_path and cand_path.exists():
+        suspects = json.loads(cand_path.read_text(encoding="utf-8")).get("avatar_merge_suspects") or []
+    if not ids:
+        ids = [int(s["layer_id"]) for s in suspects if s.get("layer_id") is not None]
+    if not ids:
+        raise SystemExit("no layers: pass --layer-id or --candidates <reuse_candidates.json> with avatar_merge_suspects")
+    frames = {}
+    for spec in args.frame_instance or []:
+        a, _, b = spec.partition(":")
+        frames[int(a)] = int(b)
+    layers = {}
+    for layer in psd.descendants():
+        try:
+            layers[int(layer.layer_id)] = layer
+        except Exception:
+            continue
+    out_dir = Path(args.out_dir)
+    results = []
+    for lid in ids:
+        layer = layers.get(lid)
+        if layer is None:
+            results.append({"layer_id": lid, "status": "not_found"})
+            continue
+        attempts = []
+        rec = split_smart_object_layer(layer, out_dir / str(lid))
+        attempts.append({"method": rec["method"], "result": rec["status"], "reason": rec.get("reason"),
+                         "match": rec.get("match")})
+        if rec["status"] in {"candidate", "candidate_unverified"}:
+            rec["suggested_parts"] = suggested_split_parts(rec)
+        elif lid in frames and frames[lid] in layers:
+            alt = frame_from_instance(layer, layers[frames[lid]], out_dir / f"{lid}_frame_{frames[lid]}")
+            attempts.append({"method": alt["method"], "result": alt["status"], "reason": alt.get("reason"),
+                             "match": alt.get("match")})
+            if alt["status"] == "candidate":
+                alt["smart_object_attempt"] = {k: rec.get(k) for k in ("status", "reason", "match")}
+                rec = alt
+        rec["attempts"] = attempts
+        results.append(rec)
+    summary = {
+        "psd": str(args.psd),
+        "results": results,
+        "split_ok": [r["layer_id"] for r in results if r.get("status") == "candidate"],
+        "split_needs_photoshop_check": [r["layer_id"] for r in results if r.get("status") == "candidate_unverified"],
+        "needs_other_method": [r["layer_id"] for r in results if r.get("status") not in {"candidate", "candidate_unverified"}],
+        "notes": [
+            "status candidate: frame over avatar matches the whole contents (split_consistency >= %.0f dB) and the layer's "
+            "stored pixels within the resampling floor. Use suggested_parts "
+            "(split_method smart_object_contents: Photoshop exports each part from a temporary copy via Edit Contents, "
+            "hiding split.hide_inner), then confirm with validate." % SPLIT_MATCH_PSNR,
+            "Inner layers are rendered by psd-tools here, so the match is evidence, not the final pixels.",
+            "Other statuses: try mask/clip layers in the document, a frame from an unmerged instance (--frame-instance "
+            "SUSPECT:FRAME), or a pixel/shape mask (approximate). Only when all fail, add a split_avatar decision with "
+            "attempts and compare_image.",
+            "frame_from_instance: the avatar region is a pixel estimate (approximate: true).",
+        ],
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "split_candidates.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({k: summary[k] for k in ("split_ok", "split_needs_photoshop_check", "needs_other_method")} | {"out": str(out_dir / "split_candidates.json")},
+                     ensure_ascii=False, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Frame-like elements (1.4.4): panels, popups, cards, button bases. Default: split by visual
+# layer into stretchable / reusable parts (outer frame, title bar strip, inset panel,
+# non-stretchable decoration). Bake the whole frame only when the split fails, with a reason.
+# ---------------------------------------------------------------------------
+
+FRAME_LIKE_KEYS = ("frame", "panel", "popup", "dialog", "window", "card", "bg", "base", "border",
+                   "框", "底", "弹窗", "面板", "卡片", "背景", "窗")
+DECORATION_KEYS = ("pattern", "dot", "halftone", "deco", "texture", "glow", "light", "shine",
+                   "纹", "点", "光", "花纹", "装饰", "图案", "形状")
+FRAME_MIN_SIDE = 160        # px; smaller images are rarely worth splitting
+FRAME_MIN_LAYERS = 3        # visible layers merged into one image
+
+
+def classify_frame_layers(layers):
+    """Classify the layers of a merged frame by their boxes relative to the union.
+
+    ``layers``: dicts with layer_id, name, bbox [l, t, r, b], blend_mode, effects.
+    Roles: outer (covers >= 85 % of the union both ways), header (wide strip near the top),
+    decoration (non-normal blend mode or a decoration-like name, inside the union), inset (the rest).
+    Heuristic evidence only; the agent checks it against the crops."""
+    boxes = [l for l in layers if l.get("bbox") and l["bbox"][2] > l["bbox"][0] and l["bbox"][3] > l["bbox"][1]]
+    if not boxes:
+        return []
+    ul = min(l["bbox"][0] for l in boxes); ut = min(l["bbox"][1] for l in boxes)
+    ur = max(l["bbox"][2] for l in boxes); ub = max(l["bbox"][3] for l in boxes)
+    uw, uh = max(1, ur - ul), max(1, ub - ut)
+    out = []
+    for l in boxes:
+        x0, y0, x1, y1 = l["bbox"]
+        fw, fh = (x1 - x0) / uw, (y1 - y0) / uh
+        blend = str(l.get("blend_mode") or "normal").lower().replace("blendmode.", "")
+        name = (l.get("name") or "").lower()
+        if fw >= 0.85 and fh >= 0.85:
+            role = "outer"
+        elif fw >= 0.7 and fh <= 0.35 and (y0 - ut) <= 0.15 * uh:
+            role = "header"
+        elif blend not in {"normal", "pass_through", "passthrough", "none"} or any(k in name for k in DECORATION_KEYS):
+            role = "decoration"
+        else:
+            role = "inset"
+        out.append({"layer_id": l.get("layer_id"), "name": l.get("name"), "role": role, "bbox": [x0, y0, x1, y1],
+                    "blend_mode": blend})
+    return out
+
+
+def frame_split_suggestion(classified):
+    """Group classified layers into suggested parts (one export per part, layers exported together)."""
+    parts = {}
+    for c in classified:
+        parts.setdefault(c["role"], []).append(c["layer_id"])
+    sugg = []
+    if parts.get("outer"):
+        sugg.append({"role": "frame", "select_ids": parts["outer"], "kind": "nine_slice",
+                     "note": "outer frame; nine-slice"})
+    if parts.get("header"):
+        sugg.append({"role": "header", "select_ids": parts["header"], "kind": "nine_slice",
+                     "note": "title bar; keep with the outer frame if it only stretches sideways, otherwise "
+                             "export a horizontal three-slice strip so a vertical gradient is not stretched"})
+    if parts.get("inset"):
+        sugg.append({"role": "inset", "select_ids": parts["inset"], "kind": "nine_slice", "note": "inset panel; nine-slice"})
+    if parts.get("decoration"):
+        sugg.append({"role": "decoration", "select_ids": parts["decoration"], "kind": "image",
+                     "note": "decoration / pattern: separate non-stretchable image placed on top; keep blend_mode "
+                             "(or bake it onto a non-stretchable crop); never inside a nine-slice stretch zone"})
+    return sugg
+
+
+def _tree_index(tree):
+    idx = {}
+
+    def walk(node):
+        if node.get("layer_id") is not None:
+            idx[node["layer_id"]] = node
+        for c in node.get("children") or []:
+            walk(c)
+    roots = tree if isinstance(tree, list) else ([tree] if isinstance(tree, dict) else [])
+    for r in roots:
+        if isinstance(r, dict):
+            walk(r)
+    return idx
+
+
+def _visible_leaves(node):
+    out = []
+    for c in node.get("children") or []:
+        if not c.get("visible", True):
+            continue
+        if c.get("children"):
+            out.extend(_visible_leaves(c))
+        elif not c.get("is_text"):
+            out.append(c)
+    return out
+
+
+def _entry_layers(entry, idx):
+    ids = list(entry.get("select_ids") or []) or ([entry.get("layer_id")] if entry.get("layer_id") is not None else [])
+    layers = []
+    for i in ids:
+        node = idx.get(i)
+        if node is None:
+            continue
+        if node.get("children"):
+            layers.extend(_visible_leaves(node))
+        elif not node.get("is_text"):
+            layers.append(node)
+    return layers
+
+
+def _size_of(entry, layers):
+    for key in ("visible_bounds", "logical_bounds"):
+        b = entry.get(key)
+        if isinstance(b, dict) and b.get("right") is not None:
+            return b["right"] - b["left"], b["bottom"] - b["top"]
+    if layers:
+        bb = [l["bbox"] for l in layers if l.get("bbox")]
+        if bb:
+            return max(b[2] for b in bb) - min(b[0] for b in bb), max(b[3] for b in bb) - min(b[1] for b in bb)
+    return 0, 0
+
+
+def check_frame_bakes(entries, tree=None):
+    """frame_baked_whole: a large frame-like image made of several layers exported as one picture
+    without nine_slice and without bake_reason. decoration_in_stretch_zone: a decoration layer of a
+    nine-slice part overlaps its stretchable centre bands. Each issue carries a suggested split."""
+    idx = _tree_index(tree) if tree else {}
+    issues = []
+    for e in entries or []:
+        if e.get("kind") not in {"image", "nine_slice"} or e.get("bake_reason"):
+            continue
+        layers = _entry_layers(e, idx)
+        n_layers = len(layers) or len(e.get("select_ids") or [])
+        w, h = _size_of(e, layers)
+        text = " ".join(str(e.get(k) or "") for k in ("name", "source_name", "source_path", "part_role")).lower()
+        frame_like = any(k in text for k in FRAME_LIKE_KEYS)
+        classified = classify_frame_layers([{"layer_id": l.get("layer_id"), "name": l.get("name"), "bbox": l.get("bbox"),
+                                             "blend_mode": l.get("blend_mode"), "effects": l.get("effects")} for l in layers])
+        if e.get("kind") == "image" and not e.get("nine_slice") and frame_like and n_layers >= FRAME_MIN_LAYERS \
+                and min(w, h) >= FRAME_MIN_SIDE:
+            issues.append({"type": "frame_baked_whole", "name": e.get("name"), "layers": n_layers, "size": [w, h],
+                           "layer_roles": classified, "suggested_parts": frame_split_suggestion(classified),
+                           "message": "frame-like element baked as one image: split it into outer frame / title bar / "
+                                      "inset panel / decoration (nine-slice where possible), or set bake_reason"})
+        ns = e.get("nine_slice")
+        if ns and classified:
+            bb = [c["bbox"] for c in classified]
+            ul, ut = min(b[0] for b in bb), min(b[1] for b in bb)
+            ur, ub = max(b[2] for b in bb), max(b[3] for b in bb)
+            sx0, sx1 = ul + ns.get("left", 0), ur - ns.get("right", 0)
+            sy0, sy1 = ut + ns.get("top", 0), ub - ns.get("bottom", 0)
+            for c in classified:
+                if c["role"] != "decoration":
+                    continue
+                x0, y0, x1, y1 = c["bbox"]
+                if (x0 < sx1 and x1 > sx0) or (y0 < sy1 and y1 > sy0):
+                    issues.append({"type": "decoration_in_stretch_zone", "name": e.get("name"), "layer_id": c["layer_id"],
+                                   "message": "decoration / pattern overlaps the nine-slice stretch zone; export it as a "
+                                              "separate non-stretchable image"})
+    return issues
+
+
+def frame_split_candidates(tree):
+    """prepare: visible groups that look like frames (name, size, >= 3 visible layers), with layer roles."""
+    out = []
+    for node in _tree_index(tree).values():
+        if not node.get("children") or not node.get("visible", True) or node.get("is_artboard"):
+            continue
+        name = (node.get("name") or "").lower()
+        if not any(k in name for k in FRAME_LIKE_KEYS):
+            continue
+        leaves = _visible_leaves(node)
+        bbox = node.get("bbox")
+        if len(leaves) < FRAME_MIN_LAYERS or not bbox or min(bbox[2] - bbox[0], bbox[3] - bbox[1]) < FRAME_MIN_SIDE:
+            continue
+        classified = classify_frame_layers(leaves)
+        roles = {c["role"] for c in classified}
+        if len(roles) < 2:
+            continue
+        out.append({"layer_id": node["layer_id"], "name": node.get("name"), "path": node.get("path"), "bbox": bbox,
+                    "layer_roles": classified, "suggested_parts": frame_split_suggestion(classified)})
     return out
 
 
@@ -2249,6 +3020,12 @@ def flatten_components(manifest):
                 "effect_reason": part.get("effect_reason"),
                 "reuse_of": part.get("reuse_of"),
                 "reuse_accepted": bool(part.get("reuse_accepted")),
+                "placeholder": bool(part.get("placeholder")),
+                "bake_reason": part.get("bake_reason"),
+                "split_method": part.get("split_method"),
+                "split": part.get("split"),
+                "split_evidence": part.get("split_evidence"),
+                "split_approximate": bool(part.get("split_approximate") or (part.get("split_evidence") or {}).get("approximate")),
                 "component_id": comp.get("id"),
                 "component_type": comp.get("type"),
                 "part_role": part.get("role"),
@@ -2408,6 +3185,9 @@ def cmd_flatten(args):
     effect_issues = find_silent_effect_loss(entries, groups)
     decisions = manifest.get("reuse_decisions") or []
     pending = [d.get("id") or d.get("instances") for d in decisions if not d.get("decision") or d.get("decision") == "pending"]
+    tree_for_checks = load_layer_tree(manifest, path)
+    avatar_issues = check_avatar_splits(entries, decisions, load_avatar_suspects(manifest, path), tree_for_checks)
+    frame_issues = check_frame_bakes(entries, tree_for_checks)
     summary = {
         "manifest": str(out),
         "shared_images": dict(Counter(e["image_name"] for e in entries if e.get("reuse_of"))),
@@ -2417,10 +3197,16 @@ def cmd_flatten(args):
         "hidden_entries": sum(1 for e in entries if e.get("hidden")),
         "by_effect_mode": dict(Counter(e.get("effect_mode") or "-" for e in entries)),
         "effect_issues": effect_issues,
+        "avatar_split_issues": avatar_issues,
+        "frame_split_issues": frame_issues,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     for problem in effect_issues:
         warn(f"group effect would be lost: {problem['name']} (group {problem['effect_group_id']})")
+    for problem in frame_issues:
+        warn(f"frame split: {problem['type']} {problem.get('name')}")
+    for problem in avatar_issues:
+        warn(f"avatar split: {problem['type']} {problem.get('name') or problem.get('decision') or problem.get('names') or ''}")
     return 0
 
 
@@ -2772,6 +3558,17 @@ def cmd_build_layout(args):
             node["reuse_source"] = entry.get("reuse_source")
             node["reuse_accepted"] = bool(entry.get("reuse_accepted"))
             node["_bounds_only"] = entry.get("export_png") is False
+        if entry.get("placeholder"):
+            node["placeholder"] = True
+        if entry.get("bake_reason"):
+            node["bake_reason"] = entry["bake_reason"]
+        if entry.get("split_method"):
+            node["split_method"] = entry["split_method"]
+            node["split_evidence"] = entry.get("split_evidence")
+            if entry.get("split"):
+                node["split"] = entry["split"]
+            if entry.get("split_approximate"):
+                node["split_approximate"] = True
         if entry.get("effect_mode"):
             node["effect_mode"] = entry["effect_mode"]
             node["effect_reason"] = entry.get("effect_reason")
@@ -2810,10 +3607,13 @@ def cmd_build_layout(args):
         "nodes": nodes,
         "components": components,
         "missing": manifest.get("missing") or [],
-        "tree": manifest.get("tree") or [],
+        "tree": manifest.get("tree") or load_layer_tree(manifest, Path(args.manifest)) or [],
         "effect_groups": effect_groups,
         "effect_issues": effect_issues,
         "reuse_decisions": manifest.get("reuse_decisions") or [],
+        "avatar_merge_suspects": [
+            {"layer_id": s_.get("layer_id"), "name": s_.get("name")} for s_ in load_avatar_suspects(manifest, Path(args.manifest))
+        ],
         "notes": [
             "Coordinates are artboard-relative pixels (1x).",
             "Hierarchy is component semantics (screen > tab_group > tab > state > part).",
@@ -3660,6 +4460,9 @@ def cmd_validate(args):
     if not effect_groups and (layout.get("layer_tree") or layout.get("tree")):
         effect_groups = effect_groups_from_tree(layout.get("layer_tree") or layout.get("tree"))
     issues.extend(find_silent_effect_loss(layout["nodes"], effect_groups))
+    issues.extend(check_avatar_splits(layout["nodes"], layout.get("reuse_decisions") or [],
+                                      layout.get("avatar_merge_suspects") or [], layout.get("tree") or None))
+    issues.extend(check_frame_bakes(layout["nodes"], layout.get("tree") or None))
 
     fonts_dir = getattr(args, "fonts_dir", None)
     text_opts = {
@@ -3854,6 +4657,14 @@ def build_parser():
              "(or the whole canvas when the document has none).",
     )
     s.set_defaults(func=cmd_prepare)
+
+    s = sub.add_parser("split-avatar", help="Try to split avatar pictures from their frames (smart-object inner layers, frame instance)")
+    s.add_argument("--psd", required=True)
+    s.add_argument("--out-dir", required=True)
+    s.add_argument("--candidates", help="reuse_candidates.json from prepare (its avatar_merge_suspects are tried)")
+    s.add_argument("--layer-id", action="append", help="layer id to try (repeatable); default: all suspects")
+    s.add_argument("--frame-instance", action="append", help="SUSPECT_ID:FRAME_ID, frame from an unmerged instance (fallback)")
+    s.set_defaults(func=cmd_split_avatar)
 
     s = sub.add_parser("flatten", help="Flatten an agent component manifest into export entries")
     s.add_argument("--manifest", required=True)
