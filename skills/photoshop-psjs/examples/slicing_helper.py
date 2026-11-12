@@ -2198,6 +2198,10 @@ def split_smart_object_layer(layer, out_dir, open_kw=None):
     rec["files"] = {k: str(out_dir / f"{k}.png") for k in ("avatar", "frame", "recomposite")}
     rec["compare_image"] = str(sheet) if sheet else None
     rec["approximate_render"] = True
+    rec["frame_hole_fraction"] = alpha_hole_mask(fr_doc)[1]
+    rec["outer_effect_risks"] = outer_effect_risks(layer_effect_list(layer), fr_doc)
+    rec["edge_effect_risks"] = inner_edge_effect_risks(records, cls)
+    rec["effect_fix"] = effect_fix_suggestion(rec)
     reasons = []
     if rec["split_consistency"]["psnr"] < SPLIT_MATCH_PSNR:
         reasons.append(f"frame over avatar vs whole contents PSNR {rec['split_consistency']['psnr']} dB (< {SPLIT_MATCH_PSNR})")
@@ -2205,6 +2209,11 @@ def split_smart_object_layer(layer, out_dir, open_kw=None):
         reasons.append(f"non-affine transform ({err:.1f} px)")
     if reasons:
         rec["status"], rec["reason"] = "mismatch", "; ".join(reasons)
+    elif rec["outer_effect_risks"]:
+        rec["status"] = "candidate_unverified"
+        rec["reason"] = ("edge effects on the smart object layer (" + ", ".join(x["type"] for x in rec["outer_effect_risks"]) +
+                         ") are redrawn along the hole of the frame-only export; export merged / content / frame_plain "
+                         "(see effect_fix) and verify with split-fix")
     elif rec["frame_blend_risks"]:
         rec["status"] = "candidate_unverified"
         rec["reason"] = ("frame layers blend onto the avatar (" + "; ".join(
@@ -2450,6 +2459,11 @@ def cmd_split_avatar(args):
             "SUSPECT:FRAME), or a pixel/shape mask (approximate). Only when all fail, add a split_avatar decision with "
             "attempts and compare_image.",
             "frame_from_instance: the avatar region is a pixel estimate (approximate: true).",
+            "outer_effect_risks / edge_effect_risks: effects redrawn along the frame's new inner edge, or frame-side "
+            "blends that degrade to normal when exported alone. effect_fix lists the Photoshop exports (merged, "
+            "content, frame_plain, one per overlay) and parts; rebuild and verify with split-fix (>= %.0f dB), "
+            "then record split_fix on the frame part. needs_user entries go to the user with layer, why, fix, dB "
+            "and the compare image." % EFFECT_FIX_PSNR,
         ],
     }
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2457,6 +2471,387 @@ def cmd_split_avatar(args):
     print(json.dumps({k: summary[k] for k in ("split_ok", "split_needs_photoshop_check", "needs_other_method")} | {"out": str(out_dir / "split_candidates.json")},
                      ensure_ascii=False, indent=2))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Effects along the new inner edge (1.4.5). Layer effects are drawn along the alpha edge of the
+# layer / group that owns them. Splitting content out of a frame turns a solid shape into a ring, so
+# a drop shadow, outer glow, stroke, inner shadow... on the owner gains a second, inner edge in the
+# frame-only export (e.g. the shadow falls into the hole and is frozen into the frame; normal-over
+# on the content then darkens the inner rim). A frame-side layer with a non-normal blend, exported
+# alone, blends with transparency and degrades to normal. See references/slicing.md
+# ("拆开后拼回去对不上：先定位效果").
+# ---------------------------------------------------------------------------
+
+# psd-tools effect class names (also what prepare writes into tree.json "effects").
+EDGE_EFFECTS_OUTER = ("DropShadow", "OuterGlow", "Stroke", "BevelEmboss")
+EDGE_EFFECTS_INNER = ("InnerShadow", "InnerGlow", "Satin")
+EDGE_EFFECTS = EDGE_EFFECTS_OUTER + EDGE_EFFECTS_INNER
+# Blend modes an engine can replay from a separate overlay image (premultiplied blend functions;
+# linear_burn needs a reverse-subtract blend equation: dst - a * (1 - src)).
+ENGINE_BLENDS = {"normal", "multiply", "screen", "linear_burn", "lighten", "darken", "linear_dodge"}
+# Results depend strongly on the content underneath: hand the decision to the user (with evidence).
+CONTENT_DEPENDENT_BLENDS = {"color_dodge", "color_burn", "overlay", "soft_light", "hard_light", "vivid_light",
+                            "linear_light", "pin_light", "hard_mix", "difference", "exclusion", "subtract",
+                            "divide", "hue", "saturation", "color", "luminosity", "darker_color",
+                            "lighter_color", "dissolve"}
+CONTENT_DEPENDENT_KINDS = {"adjustment", "brightnesscontrast", "levels", "curves", "exposure", "vibrance",
+                           "huesaturation", "colorbalance", "blackandwhite", "photofilter", "channelmixer",
+                           "colorlookup", "invert", "posterize", "threshold", "selectivecolor", "gradientmap"}
+EFFECT_FIX_PSNR = 40.0     # recomposite (content + frame + overlays) vs merged export; measured 42 dB on PS 2026
+HOLE_MIN_FRACTION = 0.05   # enclosed transparent area / bbox area for a frame to count as a ring
+
+
+def _norm_blend(mode):
+    s = _blend_name(mode) if mode is not None else None
+    return (s or "normal").replace(" ", "_").replace("-", "_")
+
+
+def alpha_hole_mask(alpha, thr=8):
+    """Enclosed transparent pixels of an alpha mask (the hole of a ring). Returns (mask, fraction of bbox)."""
+    a = np.asarray(alpha)
+    if a.ndim == 3:
+        a = a[..., 3]
+    clear = a <= thr
+    if clear.all():
+        return np.zeros_like(clear), 0.0
+    pad = np.pad(clear, 1, constant_values=True)
+    im = Image.fromarray(np.where(pad, 255, 0).astype("uint8"), "L").copy()  # copy: fromarray may share a read-only buffer
+    ImageDraw.floodfill(im, (0, 0), 128)
+    hole = (np.asarray(im) == 255)[1:-1, 1:-1]
+    ys, xs = np.nonzero(~clear)
+    area = float((ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1))
+    return hole, round(float(hole.sum()) / area, 4)
+
+
+def layer_effect_list(layer):
+    """Enabled effects of a psd-tools layer as [{type, blend_mode}]."""
+    out = []
+    try:
+        for eff in (layer.effects or []):
+            if getattr(eff, "enabled", True):
+                out.append({"type": eff.__class__.__name__, "blend_mode": _blend_name(getattr(eff, "blend_mode", None))})
+    except Exception:
+        pass
+    return out
+
+
+def outer_effect_risks(effects, frame_alpha=None, owner="smart object layer"):
+    """Edge effects on the owner of both sides (smart object layer or common group) that the split
+    redraws along the frame's new inner edge. Only reported when the frame-only alpha is a ring
+    (or when frame_alpha is None, i.e. unknown)."""
+    fx = [e for e in effects or [] if (e.get("type") if isinstance(e, dict) else e) in EDGE_EFFECTS]
+    if not fx:
+        return []
+    frac = None
+    if frame_alpha is not None:
+        _, frac = alpha_hole_mask(frame_alpha)
+        if frac < HOLE_MIN_FRACTION:
+            return []
+    out = []
+    for e in fx:
+        t = e.get("type") if isinstance(e, dict) else e
+        mech = ("cast into the hole of the frame-only export and frozen into the frame; normal-over on the "
+                "content darkens/tints the inner rim" if t in ("DropShadow", "OuterGlow") else
+                "drawn a second time along the inner edge of the ring")
+        out.append({"scope": "outer", "owner": owner, "type": t,
+                    "blend_mode": e.get("blend_mode") if isinstance(e, dict) else None,
+                    "hole_fraction": frac, "mechanism": mech})
+    return out
+
+
+def inner_edge_effect_risks(records, cls):
+    """Inner-layer causes of a split mismatch, with the fix each one needs.
+
+    - group holding both sides with edge effects: redrawn along the ring's inner edge (fix: take the
+      frame pixels the content never shows through from the merged export).
+    - frame-side layer over the content with a non-normal blend / fill-0 effect overlay: exported alone it
+      blends with transparency (non-normal degrades to normal); fix: export it alone as an overlay part
+      with blend_mode, drawn by the engine above the content.
+    - content-dependent blends / adjustment layers: needs_user."""
+    if not cls.get("avatar") or not cls.get("frame"):
+        return []
+    av = {x["id"] for x in cls["avatar"]}
+    fr = {x["id"] for x in cls["frame"]}
+    by_id = {r["id"]: r for r in records}
+    av_boxes = [by_id[i]["bbox"] for i in av if by_id.get(i, {}).get("bbox")]
+
+    def overlaps(b):
+        return bool(b) and any(b[0] < a[2] and b[2] > a[0] and b[1] < a[3] and b[3] > a[1] for a in av_boxes)
+
+    out = []
+    for r in records:
+        if not r.get("visible"):
+            continue
+        blend = _norm_blend(r.get("blend_mode"))
+        fx = [e for e in r.get("effects") or [] if e.get("type") in EDGE_EFFECTS]
+        if r.get("is_group"):
+            inside = {x["id"] for x in records if r["id"] in (x.get("parents") or [])}
+            if inside & av and inside & fr and fx:
+                out.append({"scope": "inner_group", "id": r["id"], "name": r["name"],
+                            "effects": [f"{e['type']}({e.get('blend_mode') or 'normal'})" for e in fx],
+                            "mechanism": "group effect redrawn along the inner edge of the frame-only shape",
+                            "fix": "frame_from_merged"})
+            continue
+        kind = str(r.get("kind") or "").lower().replace("_", "")
+        if r["id"] not in fr or not overlaps(r.get("bbox")):
+            continue
+        if kind in CONTENT_DEPENDENT_KINDS or blend in CONTENT_DEPENDENT_BLENDS:
+            out.append({"scope": "inner_layer", "id": r["id"], "name": r["name"], "blend_mode": blend,
+                        "mechanism": "result depends on the content underneath", "fix": "needs_user"})
+            continue
+        effect_only = r.get("fill_opacity") == 0 and bool(r.get("effects"))
+        if blend not in NORMAL_BLENDS or effect_only:
+            out.append({"scope": "inner_layer", "id": r["id"], "name": r["name"], "blend_mode": blend,
+                        "effect_only": effect_only,
+                        "mechanism": ("exported alone it blends with transparency, so %s degrades to normal" % blend)
+                        if blend not in NORMAL_BLENDS else "fill-0 effect overlay drawn over the content",
+                        "fix": "overlay_part" if blend in ENGINE_BLENDS else "needs_user"})
+    return out
+
+
+ENGINE_BLEND_NOTES = {
+    "normal": "src-over",
+    "multiply": "dst * src (premultiplied: ONE_MINUS_SRC_ALPHA + DST_COLOR)",
+    "screen": "1 - (1 - dst)(1 - src) (ONE, ONE_MINUS_SRC_COLOR)",
+    "linear_burn": "max(0, dst + src - 1) mixed by alpha = dst - a*(1 - src): reverse-subtract blend equation, "
+                   "shader outputs a*(1 - src), factors ONE, ONE",
+    "lighten": "max(dst, src) mixed by alpha (MAX equation needs a premultiplied pass or a shader)",
+    "darken": "min(dst, src) mixed by alpha (MIN equation needs a premultiplied pass or a shader)",
+    "linear_dodge": "min(1, dst + src) (additive: ONE, ONE on premultiplied src)",
+}
+
+
+def effect_fix_suggestion(rec, base_name="<module>_img_avatar"):
+    """Parts and Photoshop exports for the fix: frame_from_merged + overlay parts with blend_mode."""
+    outer = rec.get("outer_effect_risks") or []
+    inner = rec.get("edge_effect_risks") or []
+    if not outer and not inner:
+        return None
+    needs_user = [x for x in inner if x.get("fix") == "needs_user"]
+    overlays = [x for x in inner if x.get("fix") == "overlay_part"]
+    frame_name = base_name.replace("avatar", "avatar_frame")
+    parts = [{"name": frame_name, "role": "frame", "split_method": rec.get("method", "smart_object_contents"),
+              "split_fix": "frame_from_merged",
+              "build": "pixels the content never shows through (outside the content, opaque frame) from the merged "
+                       "export; the anti-aliased inner edge from the plain frame export"}]
+    for i, x in enumerate(overlays):
+        parts.append({"name": f"{frame_name}_rim{i + 1}", "role": "overlay", "blend_mode": x["blend_mode"] if x["blend_mode"] not in NORMAL_BLENDS else "normal",
+                      "inner_layer": {"id": x["id"], "name": x["name"]}, "split_fix": "overlay_part",
+                      "export": "only this inner layer visible; owner (outer) and group edge effects off; "
+                                "keep only the zone where the content shows through",
+                      "engine": ENGINE_BLEND_NOTES.get(x["blend_mode"] if x["blend_mode"] not in NORMAL_BLENDS else "normal")})
+    exports = {
+        "merged": "the layer as designed",
+        "content": "content side only; owner edge effects off and group edge effects off",
+        "frame_plain": "frame side only; owner edge effects off, group edge effects off, overlay layers hidden",
+    }
+    for p in parts[1:]:
+        exports[p["name"]] = p["export"]
+    return {"parts": parts, "photoshop_exports": exports,
+            "verify": f"split-fix --merged M --content C --frame F --overlay O --overlay-blend MODE; "
+                      f"use the split only at >= {EFFECT_FIX_PSNR:.0f} dB",
+            "needs_user": [{"id": x["id"], "name": x["name"], "why": x["mechanism"]} for x in needs_user]}
+
+
+def _blend_fn(mode):
+    m = _norm_blend(mode)
+    if m in NORMAL_BLENDS:
+        return lambda b, s: s
+    table = {
+        "multiply": lambda b, s: b * s,
+        "screen": lambda b, s: b + s - b * s,
+        "linear_burn": lambda b, s: np.clip(b + s - 1.0, 0, 1),
+        "lighten": np.maximum,
+        "darken": np.minimum,
+        "linear_dodge": lambda b, s: np.clip(b + s, 0, 1),
+    }
+    if m not in table:
+        raise ValueError(f"blend mode {m} is not replayable (supported: {sorted(ENGINE_BLENDS)})")
+    return table[m]
+
+
+def blend_arrays(dst, src, mode="normal"):
+    """W3C separable compositing of straight-alpha RGBA float arrays (0-255): src over dst with blend B."""
+    d, s = dst.astype(float) / 255.0, src.astype(float) / 255.0
+    ab, as_ = d[..., 3:], s[..., 3:]
+    B = _blend_fn(mode)(d[..., :3], s[..., :3])
+    co = as_ * (1 - ab) * s[..., :3] + as_ * ab * B + (1 - as_) * ab * d[..., :3]
+    ao = as_ + ab * (1 - as_)
+    c = np.where(ao > 0, co / np.maximum(ao, 1e-9), 0)
+    return np.concatenate([c, ao], -1) * 255.0
+
+
+def blend_onto(canvas, im, xy, mode=None):
+    """alpha_over with an optional replayable blend mode (normal / None -> plain src-over)."""
+    if _norm_blend(mode) in NORMAL_BLENDS:
+        return alpha_over(canvas, im, xy)
+    layer = alpha_over(Image.new("RGBA", canvas.size, (0, 0, 0, 0)), im, xy)
+    out = blend_arrays(np.asarray(canvas), np.asarray(layer), mode)
+    return Image.fromarray(np.clip(np.round(out), 0, 255).astype("uint8"), "RGBA")
+
+
+def compose_effect_fix(merged, content, frame_plain, overlays=()):
+    """Build the content-independent frame and masked overlays from Photoshop exports, recomposite, compare.
+
+    All images share one canvas. frame = merged where the content never shows through (content alpha 0, or
+    opaque plain frame), else the plain frame (anti-aliased inner edge). Overlays [(image, blend_mode)] are
+    kept only where the content shows through and drawn above content + frame with their blend mode."""
+    m = np.asarray(merged.convert("RGBA")).astype(float)
+    c = np.asarray(content.convert("RGBA")).astype(float)
+    f = np.asarray(frame_plain.convert("RGBA")).astype(float)
+    if not (m.shape == c.shape == f.shape):
+        raise ValueError(f"images must share one canvas: merged {m.shape}, content {c.shape}, frame {f.shape}")
+    from_merged = (c[..., 3:] == 0) | (f[..., 3:] == 255)
+    frame = np.where(from_merged, m, f)
+    zone = (c[..., 3:] > 0) & (f[..., 3:] < 255)
+    to_im = lambda a: Image.fromarray(np.clip(np.round(a), 0, 255).astype("uint8"), "RGBA")
+    rec = blend_arrays(c, frame, "normal")
+    outs = []
+    for im, mode in overlays:
+        o = np.asarray(im.convert("RGBA")).astype(float)
+        if o.shape != m.shape:
+            raise ValueError(f"overlay must share the canvas: {o.shape} vs {m.shape}")
+        o = o * zone
+        rec = blend_arrays(rec, o, mode)
+        outs.append((to_im(o), _norm_blend(mode)))
+    recomposite = to_im(rec)
+    return {"frame": to_im(frame), "overlays": outs, "recomposite": recomposite,
+            "match": split_match(recomposite, merged.convert("RGBA")),
+            "content_zone_px": int(zone.sum())}
+
+
+def _open_canvas_image(spec, size=None):
+    """PATH or PATH#X,Y (offset on a shared canvas of `size`)."""
+    path, _, off = str(spec).partition("#")
+    im = Image.open(path).convert("RGBA")
+    if not off:
+        return im
+    x, y = (int(round(float(v))) for v in off.split(","))
+    if size is None:
+        raise SystemExit("offsets (#X,Y) need --canvas W,H")
+    return alpha_over(Image.new("RGBA", size, (0, 0, 0, 0)), im, (x, y))
+
+
+def cmd_split_fix(args):
+    """Rebuild a split from Photoshop exports: frame_from_merged + overlay parts, recomposite, compare."""
+    size = tuple(int(v) for v in args.canvas.split(",")) if args.canvas else None
+    merged = _open_canvas_image(args.merged, size)
+    size = size or merged.size
+    content = _open_canvas_image(args.content, size)
+    frame = _open_canvas_image(args.frame, size)
+    blends = list(args.overlay_blend or [])
+    ovs = list(args.overlay or [])
+    if len(blends) != len(ovs):
+        raise SystemExit("give one --overlay-blend per --overlay")
+    for b in blends:
+        if _norm_blend(b) not in ENGINE_BLENDS:
+            raise SystemExit(f"--overlay-blend {b}: not replayable; supported {sorted(ENGINE_BLENDS)} "
+                             "(content-dependent blends go to the user)")
+    res = compose_effect_fix(merged, content, frame, [(_open_canvas_image(p, size), b) for p, b in zip(ovs, blends)])
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    res["frame"].save(out / "frame_from_merged.png")
+    parts = [{"file": str(out / "frame_from_merged.png"), "blend_mode": "normal", "role": "frame"}]
+    for i, (im, mode) in enumerate(res["overlays"]):
+        p = out / f"overlay{i + 1}_{mode}.png"
+        im.save(p)
+        parts.append({"file": str(p), "blend_mode": mode, "role": "overlay", "engine": ENGINE_BLEND_NOTES.get(mode)})
+    res["recomposite"].save(out / "recomposite.png")
+    sheet = write_compare_sheet([(f"split-fix {res['match']['psnr']} dB", merged, res["recomposite"])],
+                                out / "compare.png", titles=("merged export", "content + frame + overlays", "diff x3"))
+    plain = split_match(blend_arrays_img(content, frame), merged)
+    summary = {"match": res["match"], "plain_frame_over_content": plain, "threshold_psnr": args.threshold,
+               "pass": res["match"]["psnr"] >= args.threshold, "parts": parts,
+               "compare_image": str(sheet) if sheet else None, "content_zone_px": res["content_zone_px"],
+               "draw_order": ["content (runtime)"] + [p["file"] for p in parts],
+               "note": "frame_from_merged is content-independent only if merged pixels are taken where the content "
+                       "never shows through; check that the content zone is the real content footprint."}
+    (out / "split_fix.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({k: summary[k] for k in ("match", "plain_frame_over_content", "pass", "compare_image")}, ensure_ascii=False, indent=2))
+    return 0 if summary["pass"] else 2
+
+
+def blend_arrays_img(bottom, top, mode="normal"):
+    out = blend_arrays(np.asarray(bottom.convert("RGBA")), np.asarray(top.convert("RGBA")), mode)
+    return Image.fromarray(np.clip(np.round(out), 0, 255).astype("uint8"), "RGBA")
+
+
+def _tree_parent_index(tree):
+    """layer_id -> (node, parent ids outermost first) for a prepare layer tree."""
+    out = {}
+
+    def walk(node, parents):
+        lid = node.get("layer_id")
+        if lid is not None:
+            out[lid] = (node, list(parents))
+        for ch in node.get("children") or []:
+            walk(ch, parents + ([lid] if lid is not None else []))
+    roots = tree if isinstance(tree, list) else ([tree] if isinstance(tree, dict) else [])
+    for r in roots:
+        if isinstance(r, dict):
+            walk(r, [])
+    return out
+
+
+def check_split_effects(entries, tree=None):
+    """Issues for splits whose owner carries edge effects, and for overlay blend modes.
+
+    - outer_effect_into_hole: a frame part of a split exported from a smart object (or with a common parent
+      group) that carries DropShadow / OuterGlow / Stroke / ...; the frame-only export redraws them along the
+      hole unless the part says how it was handled (split_fix: frame_from_merged, or split.outer_effects).
+    - blend_mode_content_dependent: a part's blend_mode depends on the content underneath (needs the user).
+    - blend_mode_not_replayable: a blend_mode outside ENGINE_BLENDS (engine can only approximate with normal)."""
+    issues = []
+    idx = _tree_parent_index(tree) if tree else {}
+    by_comp = {}
+    for e in entries or []:
+        by_comp.setdefault(e.get("component_id"), []).append(e)
+    for e in entries or []:
+        name = e.get("name")
+        bm = e.get("blend_mode")
+        if bm:
+            nb = _norm_blend(bm)
+            if nb in CONTENT_DEPENDENT_BLENDS:
+                issues.append({"type": "blend_mode_content_dependent", "name": name, "blend_mode": nb,
+                               "message": "result depends on the content underneath; ask the user (layer, why, fix, dB, compare image)"})
+            elif nb not in ENGINE_BLENDS and nb not in NORMAL_BLENDS:
+                issues.append({"type": "blend_mode_not_replayable", "name": name, "blend_mode": nb})
+        role = (e.get("part_role") or e.get("role") or "").lower()
+        if not e.get("split_method") or role != "frame":
+            continue
+        handled = e.get("split_fix") or (e.get("split") or {}).get("outer_effects") or (e.get("split_evidence") or {}).get("effects_checked")
+        if handled or not idx:
+            continue
+        owners = []
+        lid = e.get("layer_id")
+        if e.get("split_method") == "smart_object_contents" and lid in idx:
+            owners.append(lid)
+        else:
+            # common ancestors with the content part of the same component
+            mine = set()
+            for i in (e.get("select_ids") or [lid]):
+                if i in idx:
+                    mine |= {p for p in idx[i][1] if p in idx}
+            for o in by_comp.get(e.get("component_id"), []):
+                if (o.get("part_role") or o.get("role") or "").lower() != "avatar":
+                    continue
+                for i in (o.get("select_ids") or [o.get("layer_id")]):
+                    if i in idx:
+                        owners += [p for p in idx[i][1] if p in mine]
+        seen = set()
+        for oid in owners:
+            if oid in seen or oid not in idx:
+                continue
+            seen.add(oid)
+            fx = [x for x in node_effect_names(idx[oid][0]) if x in EDGE_EFFECTS]
+            if fx:
+                issues.append({"type": "outer_effect_into_hole", "name": name, "owner_layer_id": oid, "effects": fx,
+                               "message": "the owner of both sides has edge effects; the frame-only export redraws them "
+                                          "along the hole (e.g. shadow frozen into the frame). Use split-fix "
+                                          "(frame_from_merged + overlays) and record split_fix, or the measured "
+                                          "split_evidence.effects_checked"})
+    return issues
 
 
 # ---------------------------------------------------------------------------
@@ -3025,6 +3420,7 @@ def flatten_components(manifest):
                 "split_method": part.get("split_method"),
                 "split": part.get("split"),
                 "split_evidence": part.get("split_evidence"),
+                "split_fix": part.get("split_fix"),
                 "split_approximate": bool(part.get("split_approximate") or (part.get("split_evidence") or {}).get("approximate")),
                 "component_id": comp.get("id"),
                 "component_type": comp.get("type"),
@@ -3188,6 +3584,7 @@ def cmd_flatten(args):
     tree_for_checks = load_layer_tree(manifest, path)
     avatar_issues = check_avatar_splits(entries, decisions, load_avatar_suspects(manifest, path), tree_for_checks)
     frame_issues = check_frame_bakes(entries, tree_for_checks)
+    avatar_issues = avatar_issues + check_split_effects(entries, tree_for_checks)
     summary = {
         "manifest": str(out),
         "shared_images": dict(Counter(e["image_name"] for e in entries if e.get("reuse_of"))),
@@ -3569,6 +3966,8 @@ def cmd_build_layout(args):
                 node["split"] = entry["split"]
             if entry.get("split_approximate"):
                 node["split_approximate"] = True
+            if entry.get("split_fix"):
+                node["split_fix"] = entry["split_fix"]
         if entry.get("effect_mode"):
             node["effect_mode"] = entry["effect_mode"]
             node["effect_reason"] = entry.get("effect_reason")
@@ -3907,7 +4306,14 @@ def recomposite(layout, slices_dir, canvas_size, render_text=False, fonts_dir=No
             canvas, emulated, unemulated = render_engine_effects(canvas, node, im, x, y)
             info["effects_emulated"] = emulated
             info["effects_unemulated"] = unemulated
-        canvas = alpha_over(canvas, im, (x, y))
+        bm = node.get("blend_mode")
+        try:
+            canvas = blend_onto(canvas, im, (x, y), bm)
+            if _norm_blend(bm) not in NORMAL_BLENDS:
+                info["blend_mode"] = _norm_blend(bm)
+        except ValueError:
+            canvas = alpha_over(canvas, im, (x, y))
+            info["blend_mode_approximated_normal"] = _norm_blend(bm)
         placed.append(info)
     return canvas, placed
 
@@ -4463,6 +4869,7 @@ def cmd_validate(args):
     issues.extend(check_avatar_splits(layout["nodes"], layout.get("reuse_decisions") or [],
                                       layout.get("avatar_merge_suspects") or [], layout.get("tree") or None))
     issues.extend(check_frame_bakes(layout["nodes"], layout.get("tree") or None))
+    issues.extend(check_split_effects(layout["nodes"], layout.get("tree") or None))
 
     fonts_dir = getattr(args, "fonts_dir", None)
     text_opts = {
@@ -4665,6 +5072,17 @@ def build_parser():
     s.add_argument("--layer-id", action="append", help="layer id to try (repeatable); default: all suspects")
     s.add_argument("--frame-instance", action="append", help="SUSPECT_ID:FRAME_ID, frame from an unmerged instance (fallback)")
     s.set_defaults(func=cmd_split_avatar)
+
+    s = sub.add_parser("split-fix", help="Rebuild a split from Photoshop exports (frame from merged + blend overlays) and compare")
+    s.add_argument("--merged", required=True, help="merged export (PATH or PATH#X,Y with --canvas)")
+    s.add_argument("--content", required=True, help="content-side export, owner/group edge effects off")
+    s.add_argument("--frame", required=True, help="plain frame export: owner/group edge effects off, overlay layers hidden")
+    s.add_argument("--overlay", action="append", help="overlay export (one inner layer alone); repeatable")
+    s.add_argument("--overlay-blend", action="append", help="blend mode for each --overlay (normal, multiply, screen, linear_burn, lighten, darken, linear_dodge)")
+    s.add_argument("--canvas", help="W,H of the shared canvas when inputs carry #X,Y offsets")
+    s.add_argument("--threshold", type=float, default=EFFECT_FIX_PSNR)
+    s.add_argument("--out-dir", required=True)
+    s.set_defaults(func=cmd_split_fix)
 
     s = sub.add_parser("flatten", help="Flatten an agent component manifest into export entries")
     s.add_argument("--manifest", required=True)

@@ -11,7 +11,7 @@
 3. **分清共用零件和随状态变化的零件。** 图标、始终存在的底等跨状态不变的，放进该组件的 `shared`，文件名不加状态后缀。槽/底的明暗、选中高亮、只在某一态出现的标签等，放进 `states.<state>.parts`。
 4. **区分状态变体和旧稿。** 主体/内容不变、只改明度、描边、发光、配色或缩放的，是状态变体，可以导出。同一槽位但换了内容或徽记的，当旧稿忽略。内容或母题对不上、吃不准时才写 `uncertain_hidden`，并附上两侧裁切图。
 5. **只给会随状态变化的零件记 missing。** 以同组里状态最完整的那一项为模板（例如某选中项有 base + highlight + label），每个缺少其中一件的兄弟项都要列出，**包括 highlight**。不要因为共用图标没有另一态就标 missing。单个特殊样式的列表行（例如 self 高亮行）只是这一行的一个实例：不要给其它行推断缺失的 self，也不要给这一行推断缺失的 normal，除非设计里每行都有成套变体。
-6. **判断重复元素是否复用（见下文「重复元素：复用还是分开」）。** 先按 UI 用途和常识（游戏 UI 先验）加上 `reuse_candidates.json` 的证据，从逻辑上判断是否该共用一张图；该复用就用 `reuse_of` 指向同一张共享图。再对照效果图：复用后与设计对不上，先怀疑分析错了，只把对不上的实例拆出去单独导出；逻辑证据很强却对不上，写进 `reuse_decisions` 交用户决定。头像图与头像框必须分开：PSD 里合在一起时，**先自己按下文「头像与框合在一起：先拆，拆不开再问」尝试拆开**，拆完用框 + 占位头像重新拼合并和效果图对比；对得上就按拆分导出，只有拆不开或拆后对不上才写 `reuse_decisions`（`type: split_avatar`）交用户。面板、弹窗、卡片、按钮底等 frame 类元素同理：**默认按视觉层次拆成可九宫 / 三宫 / 复用的部件**（见下文「frame 类元素：按视觉层次拆，九宫与装饰」），整张烘焙只在拆不开或拆后对不上时使用，并写 `bake_reason`。
+6. **判断重复元素是否复用（见下文「重复元素：复用还是分开」）。** 先按 UI 用途和常识（游戏 UI 先验）加上 `reuse_candidates.json` 的证据，从逻辑上判断是否该共用一张图；该复用就用 `reuse_of` 指向同一张共享图。再对照效果图：复用后与设计对不上，先怀疑分析错了，只把对不上的实例拆出去单独导出；逻辑证据很强却对不上，写进 `reuse_decisions` 交用户决定。头像图与头像框必须分开：PSD 里合在一起时，**先自己按下文「头像与框合在一起：先拆，拆不开再问」尝试拆开**，拆完用框 + 占位头像重新拼合并和效果图对比；对得上就按拆分导出；对不上时先按「拆开后拼回去对不上：先定位效果，再决定问不问」逐层关效果定位、按修法重做并验证（约 40 dB），只有拆不开、修不好或属于适用边界之外才写 `reuse_decisions`（`type: split_avatar`）交用户，附上哪一层、为什么、修法和 dB 以及对比图。面板、弹窗、卡片、按钮底等 frame 类元素同理：**默认按视觉层次拆成可九宫 / 三宫 / 复用的部件**（见下文「frame 类元素：按视觉层次拆，九宫与装饰」），整张烘焙只在拆不开或拆后对不上时使用，并写 `bake_reason`。
 7. **写好审核清单后停下。** 跑 `flatten` + `preview`，`status` 保持 `pending_review`，等用户改 JSON 确认后再导出。
 8. **确认后一口气跑完，不要停在导出。** 导出 → `build-layout` → `validate` 是一个整体；`export_log.json` 写出不算完成，只有 `validate/validate_report.json` 写出并读过 `issues`（含 `group_effect_lost`）、遮罩 PSNR / ΔE 后才算完成。`validate` 的最后一步用**实际导出的 PNG** 拼出默认态并画上标注，写出 `validate/preview_exported_annotated.png` 与 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注）；把这两张图作为最终成果交给用户。第 7 步导出前的审核预览不变。若 `issues` 里有 `reuse_mismatch`，按第 6 步处理（拆出单独导出，或交用户决定）后重跑。每条长命令都设超时并把输出写进日志；某步超时或报错时，读日志、修正后重跑这一步，不要静默结束。
 
@@ -71,11 +71,75 @@
 **拆完必须验证。** 用框 + 占位头像按绘制顺序重新拼合，与效果图（合并层的 Photoshop 导出或 `full_render.png` 的同一区域）对比：
 
 - 一致：直接按拆分导出。头像 part `role: avatar`、`placeholder: true`；框 part 可复用（`reuse_of`）。两者都写 `split_method`、`split`（智能对象时）和 `split_evidence`（对比结果、对比图路径、所用工具）。`validate` 最后还会按实际导出的 PNG 拼合再比一次。
-- 拆不开或拆后对不上：才写 `reuse_decisions`（`type: split_avatar`），附对比图（`compare_image`）、已尝试的方法与失败原因（`attempts: [{method, result, reason}]`），交用户决定。**默认值不能是 `accept_placeholder` 等合并导出**，用最好的拆分候选（如 `split_best_effort`）或 `wait_for_user`。
+- 拆后对不上：先按下文「拆开后拼回去对不上」逐层定位效果并尝试修法（frame 从合并导出裁 + 带 `blend_mode` 的 overlay），达到阈值就按拆分导出。
+- 拆不开、或定位后仍对不上 / 属于适用边界之外：才写 `reuse_decisions`（`type: split_avatar`），附对比图（`compare_image`）、已尝试的方法与失败原因（`attempts: [{method, result, reason}]`），交用户决定。**默认值不能是 `accept_placeholder` 等合并导出**，用最好的拆分候选（如 `split_best_effort`）或 `wait_for_user`。
 
-`split-avatar` 的状态：`candidate`（拆分自洽，且 psd-tools 渲染与该层的 Photoshop 像素一致）；`candidate_unverified`（拆分结构成立，但框侧有混合模式 / 非正常混合的效果 / 填充 0 的效果层叠在头像上，或 psd-tools 复现不了内层效果；必须用 Photoshop 按拆分导出后和合并导出对比再决定）；`mismatch` / `no_separable_layers` / `not_embedded_psd`（换下一种方法）。psd-tools 只是离线证据，最终以 Photoshop 导出的拼合对比为准。
+`split-avatar` 的状态：`candidate`（拆分自洽，且 psd-tools 渲染与该层的 Photoshop 像素一致）；`candidate_unverified`（拆分结构成立，但智能对象图层本身有投影 / 外发光 / 描边等边缘效果而框是环形（`outer_effect_risks`），或框侧有混合模式 / 非正常混合的效果 / 填充 0 的效果层叠在头像上，或 psd-tools 复现不了内层效果；必须用 Photoshop 按拆分导出后和合并导出对比再决定）；`mismatch` / `no_separable_layers` / `not_embedded_psd`（换下一种方法）。psd-tools 只是离线证据，最终以 Photoshop 导出的拼合对比为准。
 
 `flatten` 与 `validate` 会检查（`avatar_split_issues` / `issues`）：`split_avatar_merged_default`（决定默认合并导出）、`split_avatar_not_attempted`（没有 `attempts` 或 `compare_image`）、`avatar_merged_unsplit`（疑似合并层被整张导出，既没拆也没有 split_avatar 决定；会顺着图层树找到导出其父组的条目）、`split_method_unknown`、`split_evidence_missing`、`split_avatar_not_placeholder`、`split_spec_missing`（智能对象拆分缺 `split.hide_inner`）、`split_approximate_unmarked`。
+
+### 拆开后拼回去对不上：先定位效果，再决定问不问
+
+适用于头像、图标、道具等动态内容与带效果的框拆开的情况，也适用于其他拆分（按钮底与图标、卡片与插图等）。拆完用「框 + 占位内容」拼回去，和合并导出（同一临时副本、同一画布）比 PSNR。低于阈值（`split_match` 约 40 dB，见 10.10）时，**agent 先自己定位**，再决定要不要交用户。
+
+**1. 定位实验（只在临时副本里做）。** 逐个关掉可能的效果，每种组合都导出 合并 / 框 / 内容 三张，同一组合内拼回去和合并导出比 PSNR：
+
+- 外层：智能对象图层或包住两侧的组本身的效果（投影、外发光、描边、斜面浮雕）。在临时导出文档里对该层关效果。
+- 内层（「编辑内容」里）：组内阴影（各项分开关，正片叠底和变亮的作用不同）、非 normal 混合的层（线性加深等）、填充为 0 的纯效果层（内发光、内阴影）、描边。
+- 再加一组「全关」。记下每项的 dB 变化。
+- 用像素证据说明机制：例如内容区内紧贴框内缘的一圈（几个像素宽）的平均亮度，合并导出 vs 拼回去，分上缘 / 下缘；以及框单独导出在这一圈里的平均 alpha（本应为 0）。
+
+**2. 已知机制。**
+
+- 效果沿所属层（或组）的 alpha 边缘绘制。拆开后形状从实心变成环，投影、外发光、描边、内阴影就多出一道内缘：
+  - 外投影 / 外发光投进洞里，被固化进框；再用 normal 盖到内容上，内缘变暗（或被染色）。投影角度朝下时上缘最重。
+  - 组内阴影按新的环形 alpha 重画：例如变亮项在环的内缘多画一道亮边（落在框的像素上）。
+- 非 normal 混合的层（线性加深、正片叠底……）单独导出时和透明底混合，退化成 normal，作用不到内容上。
+
+**3. 修法（引擎从下往上画）。**
+
+1. 内容（运行时替换）。
+2. `frame.png`，normal：内容透不出来的区域（内容外侧、框完全不透明处）直接从合并导出裁，投影、组效果都已算对，和具体内容无关；框内缘的抗锯齿那一圈用「单独导出的框」（外层和组的边缘效果关掉）。
+3. 叠在内容上、但与内容无关的层单独导出成 overlay 部件（例如 `…_rim_burn`、`…_rim_glow`；只开这一层，外层和组的边缘效果关掉，只保留内容透出来的区域），部件写 `blend_mode`，布局 JSON 原样带出，引擎按混合公式画。
+
+对引擎的要求（`ENGINE_BLEND_NOTES`）：
+
+| blend_mode | 公式 | 引擎实现 |
+|---|---|---|
+| normal | src-over | 默认 |
+| multiply | dst × src | 预乘：`ONE_MINUS_SRC_ALPHA + DST_COLOR` |
+| screen | 1 − (1 − dst)(1 − src) | `ONE, ONE_MINUS_SRC_COLOR` |
+| linear_burn | max(0, dst + src − 1)，按 alpha 混合 = dst − a·(1 − src) | **reverse-subtract** 混合方程：着色器输出 a·(1 − src)，因子 `ONE, ONE`，结果截到 0 |
+| lighten / darken | max / min，按 alpha 混合 | MAX / MIN 方程需预乘处理或着色器 |
+| linear_dodge | min(1, dst + src) | 加法 `ONE, ONE` |
+
+引擎不支持某个模式、只能用 normal 近似时，要在拼回去时也按 normal 算 dB，并交用户（见下）。
+
+**验证：** `split-fix` 用 Photoshop 导出的 合并 / 内容 / 框 / overlay 重新生成 `frame_from_merged.png` 和裁好的 overlay，按混合公式拼回去，和合并导出比，写 `split_fix.json`（`match`、`plain_frame_over_content`、`pass`、部件、绘制顺序）和对比图：
+
+```bash
+python slicing_helper.py split-fix --merged M.png --content C.png --frame F.png \
+  --overlay burn.png --overlay-blend linear_burn --overlay glow.png --overlay-blend normal --out-dir out/
+# 输入不同尺寸时用 PATH#X,Y 和 --canvas W,H 放到同一画布；默认阈值 40 dB（--threshold）
+```
+
+达到阈值才按拆分导出：框 part 写 `split_fix: frame_from_merged`，overlay part 写 `blend_mode` 和 `split_fix: overlay_part`，`split_evidence` 写定位结果（每项 dB、机制、像素证据）和 `split_fix.json` 的路径与 dB。`validate` 拼图时按 `blend_mode` 画（不可重放的模式按 normal 并在 `placed` 里记 `blend_mode_approximated_normal`）。
+
+**4. 适用边界：以下情况交用户决定（或接受近似）。**
+
+- 效果依赖下层内容：颜色减淡 / 加深在不同内容上差异大，明度 / 色相 / 饱和度 / 颜色类混合，叠加 / 柔光等对比类混合，调整图层，模糊，蒙版引用内容像素。
+- 引擎不支持对应混合模式，只能用 normal 近似。
+- 链接型智能对象、带变形 / 透视的智能对象（读不到内层或离线映射不准）。
+- 内缘误差只有一两个像素宽时，可以接受近似，写明。
+- 把占位内容烘进框（例如内缘一圈连同占位照片烘进 `frame.png`）只适用于内容固定不换的情况，必须写 `bake_reason`；内容会换时，换上的内容外会露出一圈旧的占位内容。只烘内容底色也不行（实测 31–34 dB）。
+
+交用户时带上：**哪一层、为什么（机制）、修法和每种修法的 dB**，以及对比图（合并导出 | 拼回去 | 差异×3，每行标 PSNR）。
+
+**helper 的自动化：**
+
+- `split-avatar` 对每个智能对象额外给出：`frame_hole_fraction`（框单独渲染的 alpha 里被围住的透明区占比，≥ 0.05 视为环）、`outer_effect_risks`（智能对象图层上的投影 / 外发光 / 描边 / 斜面浮雕 / 内阴影等边缘效果，框是环时报出）、`edge_effect_risks`（包住两侧的组的边缘效果 → `frame_from_merged`；叠在内容上的非 normal 混合层或填充 0 的效果层 → `overlay_part`；依赖内容的混合或调整图层 → `needs_user`）和 `effect_fix`（建议部件、需要 Photoshop 导出的几张图、验证命令、需交用户的项）。有外层边缘效果时状态为 `candidate_unverified`。
+- `flatten` / `validate` 的 issues：`outer_effect_into_hole`（拆分的框 part 所属的智能对象，或与内容 part 共同的父组，在图层树里带边缘效果，而 part 没写 `split_fix` 或 `split_evidence.effects_checked`）、`blend_mode_content_dependent`、`blend_mode_not_replayable`。
+- **没有自动化：** 定位实验本身（在 Photoshop 里逐项关效果并导出 合并 / 框 / 内容）、overlay 的单独导出（`export_slices.psjs` 目前只支持 `split.hide_inner`，不会关外层或组的效果，也不会只保留一层；这几张要按 `effect_fix.photoshop_exports` 另写临时脚本导出）、内缘亮度带的像素证据（要自己算）。`outer_effect_into_hole` 只看图层树里的效果名，不检查框是否真成环。
 
 ### frame 类元素：按视觉层次拆，九宫与装饰
 
@@ -97,6 +161,7 @@
 ```text
 python slicing_helper.py prepare --psd design.psb --out-dir out [--artboard <画板名或id>]
 python slicing_helper.py split-avatar --psd design.psb --candidates out/reuse_candidates.json --out-dir out/avatar_split [--layer-id <id>] [--frame-instance <合并层id>:<框层id>]
+python slicing_helper.py split-fix --merged M.png --content C.png --frame F.png [--overlay O.png --overlay-blend linear_burn ...] --out-dir out/split_fix   # 拆开后对不上时的修法验证
 python slicing_helper.py flatten --manifest out/manifest.json
 python slicing_helper.py preview --manifest out/manifest.json --out out/preview_annotated.png [--ref out/full_render.png]
 python slicing_helper.py build-layout --manifest out/manifest.json --export-log out/export_log.json --slices-dir out/slices --out out/layout.json
@@ -176,6 +241,7 @@ PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))
 | `nine_slice_candidates.json` | 像素启发式给出的九宫格候选（最长的均匀相邻行/列；两边边距都小于 `min_run` 则拒绝）。agent 决定采不采纳。 |
 | `frame_split_candidates.json` | frame 类组（面板、弹窗、卡片、按钮底）的层角色启发式和建议部件（外框 / 标题栏 / 内嵌块 / 装饰），见「frame 类元素」。 |
 | `split-avatar` 输出（另跑） | `<out>/split_candidates.json`：每个疑似合并层的尝试结果、内层分类、`hide_inner_*`、对比数据和 `suggested_parts`；`<out>/<layer_id>/` 下有 avatar / frame / recomposite / compare 图。 |
+| `split-fix` 输出（另跑） | `<out>/split_fix.json`（`match`、`plain_frame_over_content`、`pass`、`parts` 带 `blend_mode`、绘制顺序）、`frame_from_merged.png`、`overlay<N>_<mode>.png`、`recomposite.png`、`compare.png`；未达阈值时退出码 2。 |
 | `materials.json` | 上述路径和数量统计。 |
 
 阅读顺序建议：先看整图，理解屏幕结构；再对照 `crops_sheet.jpg` / 单张裁切图看每个零件长什么样；用 `crops_index.json` 和 `group_effects.json` 把 id 对回 `tree.json` 的路径、可见性、文本和效果。不要只根据图层名做决定，名称经常不准。
@@ -608,6 +674,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 - `components`：与 manifest 相同的语义树，但每个 part 已补上导出后的 `image`、`visible_bounds`、`logical_bounds`、`nine_slice`、文本属性。
 - `nodes`：扁平列表，便于引擎遍历和校验放置。每条含 `name`、`kind`、`component_id`、`part_role`、`state`、`default`、`hidden`、`visible_bounds`（含烘焙效果，画板坐标）、`logical_bounds`（不含效果）、`anchor`（逻辑框中心）、`pivot`（0.5, 0.5）、`nine_slice`、`image`、`text`。有 `effect_mode` 时附 `effect_mode`、`effect_reason`；`engine` 还附 `engine_effects` 和 `effect_bounds`（逻辑框按各效果的距离/角度/大小外扩的**估计**范围，`effect_bounds_estimated: true`，不是 PS 的精确框），此时 `logical_bounds` = `visible_bounds` = 图片框。`components` 里对应的 part 也带这些字段。
 - 复用：带 `reuse_of` 的节点 `image` 都是 `<共享名>.png`，九宫格取源实例；非源实例的 `visible_bounds` = 源实例可见框按两者逻辑框原点的差平移。顶层附 `reuse_decisions`。
+- `blend_mode`：part 的混合模式原样带出（overlay 部件由引擎按公式画，见「拆开后拼回去对不上」）；`split_fix` 记拆分修法（`frame_from_merged` / `overlay_part`）。
 - `effect_groups` / `effect_issues`：参与检查的带效果组，以及组效果被悄悄丢掉的部件（应为空）。
 - 坐标是画板像素（1x）。各引擎导入器自己写，不在本 skill 里。
 
@@ -645,7 +712,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 ## 9. 校验
 
 1. **默认状态**：只拼 `default: true` 的部件（即 PSD 里当前显示的那一态，加上始终可见的 chrome），用 src-over（`Image.alpha_composite`）叠回画板，与 Photoshop 整图比像素差 / CIEDE2000 ΔE。同时报告画上动态文字近似后的数字（`diff_text_rendered`）、以及遮罩动态文字区域后的数字（`diff_text_masked`），并列出误差最大的 10 条。再检查漏切、重名、空图。**判断切图精度只看遮罩后的指标**；带文字的数字只说明预览和效果图有多像。
-2. **引擎效果**：`effect_mode: engine` 的部件，投影 / 外发光按 Pillow 近似画在部件下面（alpha → 按角度/距离偏移 → 扩展后高斯模糊 → 颜色/不透明度，普通混合），报告列在 `engine_effects_emulated`。描边、内阴影、叠加等无法模拟的，按估计的 `effect_bounds` 把外圈（内部效果则整框）从遮罩指标里去掉，列在 `engine_effects_unemulated`。`issues` 里的 `group_effect_lost` 表示选了带效果组的子层却既没烘焙也没写 `engine_effects`，必须修。
+2. **引擎效果**：`effect_mode: engine` 的部件，投影 / 外发光按 Pillow 近似画在部件下面（alpha → 按角度/距离偏移 → 扩展后高斯模糊 → 颜色/不透明度，普通混合），报告列在 `engine_effects_emulated`。描边、内阴影、叠加等无法模拟的，按估计的 `effect_bounds` 把外圈（内部效果则整框）从遮罩指标里去掉，列在 `engine_effects_unemulated`。`issues` 里的 `group_effect_lost` 表示选了带效果组的子层却既没烘焙也没写 `engine_effects`，必须修。部件带 `blend_mode` 时按对应公式叠到画布上（normal / multiply / screen / linear_burn / lighten / darken / linear_dodge；其它模式按 normal 画并在 `placed` 里记 `blend_mode_approximated_normal`）。拆分相关的 `outer_effect_into_hole`、`blend_mode_content_dependent`、`blend_mode_not_replayable` 见「拆开后拼回去对不上」。
 3. **复用实例**：每个带 `reuse_of` 的默认态节点，在其可见框内（去掉动态文字与无法模拟的效果区域）比 PS 整图与拼图。MAE > `--reuse-tol-mae`（默认 4）或差值 >16 的像素占比 > `--reuse-tol-pct`（默认 1%）时记为 `reuse_mismatch`（含实例名、区域、指标和 `validate/reuse/<名>.png` 对比图）；`reuse_accepted` 的改记 `reuse_mismatch_accepted`。逐实例数据在 `reuse_checked`。
 4. **交替状态**：对每个交互组件的非默认状态（含仅存在于 `missing` 中的状态），按「共用部件 + 该状态部件」拼图，互斥组的兄弟项切到对应态，写出 `validate/states/<component_id>_<state>.png`。只对真正缺失的、按设计随状态变化的零件画红框并标 `missing`。这些预览**不**和默认态整图比 PSNR（对不上是正常的）。
 5. **导出后标注预览（最终交付）**：用实际导出的 PNG 按布局 JSON 拼默认态（同上，含引擎效果近似），再按审核预览的样式画标注：每个切图按 `visible_bounds` 画框、规范名、九宫格线、类型和 `fx:baked` / `fx:engine`，复用实例的标签后缀为 `→ <共享名>`。写出 `validate/preview_exported_annotated.png` 和 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注），路径记在报告的 `exported_preview`。把它们交给用户。
@@ -899,7 +966,7 @@ Photoshop 2026（Windows）上只在脚本新建的临时文档里实测，前�
 **真实设计稿（副本）上的头像（已实测）：**
 - 列表行与前三名卡片里的头像都是内嵌 PSB 智能对象，内部有独立的剪贴照片层，可以拆。
 - 但框侧的组内阴影（正片叠底）、线性加深且填充为 0 的描边层和内发光都叠在照片上。用 Photoshop 按拆分导出后再拼合，与合并导出只有 24.8 / 25.1 dB，差异集中在框的内缘。
-- `split-avatar` 因此判为 `candidate_unverified`，并列出这些层。按规则，这种情况写 `split_avatar` 决定交用户：附对比图和尝试记录，默认用最好的拆分。
+- `split-avatar` 因此判为 `candidate_unverified`，并列出这些层。（1.4.5 定位到主因其实是智能对象图层自己的投影投进了框的洞里，修法后回到 42 dB，见 10.10。）
 - 另有只含框的同款智能对象（不同颜色的框），可以用 `frame_from_instance`。
 
 **frame 拆分（离线核对图层结构）：**
@@ -916,3 +983,38 @@ Photoshop 2026（Windows）上只在脚本新建的临时文档里实测，前�
 - 带透视 / 变形的智能对象（离线映射只做仿射，`non_affine_px` > 1 判为 mismatch）。
 - `frame_from_instance` 与 `pixel_mask_estimate` 在真实稿上的效果。
 - `validate` 在透明画布的测试文件上会把透明区的 RGB 差计入，PSNR 很低；正常不透明画板不受影响。
+
+### 10.10 拆开后内缘变暗：效果定位与修法（1.4.5）
+
+Photoshop 2026（Windows）上，在设计稿副本和脚本新建的临时文档里实测（每个临时文档都不保存直接关掉；用户没有打开的文档；副本哈希前后一致）。对象是两个头像智能对象：内嵌 240×240 的内部文档，缩放到 0.75 和 0.9 倍；内部是「底 + 剪贴照片」和环形框。框侧有：包住两侧的组带两项内阴影（正片叠底、变亮）、一个线性加深且填充 0 的纯效果层（内阴影）、一个填充 0 的内发光层；智能对象图层本身有两层黑色 normal 投影（角度朝下，距离 1 和 6）。
+
+**现象：** 按拆分导出后「框 normal 盖到内容上」，和合并导出只有 24.8 / 25.1 dB（合并图可见范围内），框内缘明显偏暗。
+
+**定位（每行与同组合的合并导出比，dB，两个对象）：**
+
+| 组合 | 对象 A | 对象 B |
+|---|---|---|
+| 全开 | 24.81 | 25.11 |
+| 只关内层（组内阴影 / 线性加深层 / 内发光，逐项） | 24.9–25.6 | 24.9–26.0 |
+| 内层三类全关 | 27.17 | 27.20 |
+| 智能对象投影关一层 / 另一层 | 27.18 / 26.80 | 28.00 / 27.12 |
+| 智能对象投影两层都关 | 29.21 | 30.11 |
+| 投影关 + 组内阴影全关 | 36.62 | 46.32 |
+| 投影关 + 只关组内阴影的变亮项 | 35.73 | 38.96 |
+| 投影关 + 只关组内阴影的正片叠底项 | 29.32 | 30.45 |
+| 投影关 + 内层三类全关 | 42.52 | 44.22 |
+
+**像素证据：** 内容区里紧贴框内缘 6 px 一圈的平均亮度，合并导出 134.5（上缘 129.7）vs 拼回去 116.7（上缘 100.0）；另一个对象 122.7（97.5）vs 109.9（76.3）。框单独导出在这一圈里的平均 alpha 是 37（上缘 64），本应为 0：沿内缘取一列，框导出是纯黑、alpha 从 191 递减到 32，合并导出同位置就等于内容本身。只关智能对象的投影后，这一圈亮度和合并导出一致（134.3 / 129.5，122.7 / 97.5）。
+
+**机制：** 内缘变暗来自智能对象图层自己的投影——合并时 alpha 是实心，投影只落在外侧；框单独导出时 alpha 成了环，投影投进洞里被固化进框。剩余误差来自组内阴影按环形 alpha 重画（主要是变亮项沿环内缘多画的亮边），以及线性加深 / 内发光层单独导出时和透明底混合（线性加深退化成 normal）。
+
+**修法实测（与原合并导出比；括号内是 `split-fix` 在整张导出画布上的数字）：**
+
+- 修法 a（`frame.png` 从合并导出裁 + 线性加深 overlay + normal 内发光 overlay，引擎按公式画）：42.25 / 42.27 dB（44.54 / 44.42）。线性加深 overlay 改按 normal 画：32.2 / 45.8（只在后者的暖色阴影上碰巧可用，不能当通用规则）；不画线性加深 overlay：34.3 / 38.9；只有 `frame.png`、没有 overlay：26.2 / 26.0。
+- 投影单独导成 `shadow.png` 垫在最底（外层填充设 0、投影保留）或直接烘进 `frame.png`：两种都精确，只修投影时 29.06 / 29.95，等同于直接关投影。
+- 修法 b（内缘一圈连同内容烘进框）：带占位照片烘 2 / 3 / 4 / 6 px：35.2 / 45.8 / 59.7 / 83.6（对象 A），33.1 / 40.7 / 50.9 / 76.6（对象 B）；只烘内容底色：31–34 dB。带照片 3 px 以上才过 40 dB，但等于冻结占位内容，内容会换时不能用。
+- `split-avatar`（离线）在这两个对象上都报出 `outer_effect_risks`（两层投影，`frame_hole_fraction` 约 0.61）和 `edge_effect_risks`（组 → `frame_from_merged`，线性加深层和内发光层 → `overlay_part`），状态 `candidate_unverified`。
+
+**实测中的坑：** 用 batchPlay 改某个内层的混合模式时，Photoshop 弹出「命令"设置"当前不可用」的提示框（`dialogOptions: dontDisplay` 没拦住），脚本卡住直到点掉；改用 DOM `layer.blendMode` 后不再弹框，但该层的混合模式仍改不了（读回来不变）。关单项效果用读出 `layerEffects` 描述符、把对应项 `enabled` 置 false 再 `set` 回去，读回确认。
+
+**未验证：** 颜色减淡 / 加深等依赖内容的混合、调整图层、链接型或带变形的智能对象；overlay 部件经 `export_slices.psjs` 的自动导出（目前要另写临时脚本）；目标引擎上 reverse-subtract 的实际渲染。
