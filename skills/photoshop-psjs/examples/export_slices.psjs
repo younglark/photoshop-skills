@@ -8,6 +8,16 @@
 // (the script will not run). See export_config.example.json.
 // Use dialogOptions "silent" on every descriptor; "dontDisplay" still pops error dialogs.
 // Top-level await is required. Only documents in the target set are edited or closed.
+//
+// 1.4.12 records (validate checks them; see references/slicing.md):
+// - exporter: sha256 of this script (config exporter_url points at the job copy; only CONFIG_URL may differ),
+//   compared with the skill's shipped examples/export_slices.psjs (exporter_modified);
+// - layers_at_open: every layer's visibility right after the document is opened, before any temporary change;
+//   full_render.hidden_at_render: layers visible at open but hidden when the full render was taken
+//   (visible_layer_hidden unless the user chose to exclude them);
+// - only layers of a reuse_decisions entry the user answered "exclude" (recorded by `confirm --decision` in the
+//   lock's decision_log) are hidden, for slices and the full render. There is no other hide switch.
+// - multi-layer entries (select_ids): select_bounds per layer and logical_bounds_union.
 
 const { app, core, action } = require("photoshop");
 const fs = require("uxp").storage.localFileSystem;
@@ -16,7 +26,8 @@ const fs = require("uxp").storage.localFileSystem;
 const CONFIG_URL = "file:/D:/work/ps-job/export_config.json";
 // -----------------------------------------------------------------------
 
-let ROOT_URL, SOURCE_URL, SOURCE_PATH_HINT, MANIFEST_NAME, LOG_NAME, SLICES_DIR_NAME, FULL_RENDER_NAME;
+const EXPORTER_RELEASE = "1.4.12";
+let ROOT_URL, SOURCE_URL, SOURCE_PATH_HINT, MANIFEST_NAME, LOG_NAME, SLICES_DIR_NAME, FULL_RENDER_NAME, EXPORTER_URL;
 
 async function loadConfig() {
   const entry = await fs.getEntryWithUrl(CONFIG_URL);
@@ -31,6 +42,102 @@ async function loadConfig() {
   LOG_NAME = cfg.log_name || "export_log.json";
   SLICES_DIR_NAME = cfg.slices_dir_name || "slices";
   FULL_RENDER_NAME = cfg.full_render_name || "full_render.png";
+  EXPORTER_URL = cfg.exporter_url || "";
+}
+
+// <sha256>
+// sha256 of the exporter text: CRLF -> LF, BOM dropped, the CONFIG_URL line blanked (slicing_helper.py
+// exporter_text_sha256 computes the same). Plain JS: UXP has no crypto digest.
+function normalizeExporterText(text) {
+  let t = String(text || "");
+  if (t.charCodeAt(0) === 0xfeff) t = t.slice(1);
+  t = t.replace(/\r\n/g, "\n");
+  return t.replace(/^const CONFIG_URL = .*$/m, 'const CONFIG_URL = "";');
+}
+
+function utf8Bytes(str) {
+  const out = [];
+  for (let i = 0; i < str.length; i++) {
+    let c = str.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+      const d = str.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }
+    }
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return out;
+}
+
+function sha256Hex(bytes) {
+  const K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+  const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  const msg = bytes.slice();
+  const bitLen = bytes.length * 8;
+  msg.push(0x80);
+  while (msg.length % 64 !== 56) msg.push(0);
+  const hi = Math.floor(bitLen / 0x100000000);
+  const lo = bitLen >>> 0;
+  msg.push((hi >>> 24) & 255, (hi >>> 16) & 255, (hi >>> 8) & 255, hi & 255,
+           (lo >>> 24) & 255, (lo >>> 16) & 255, (lo >>> 8) & 255, lo & 255);
+  const W = new Array(64);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let off = 0; off < msg.length; off += 64) {
+    for (let t = 0; t < 16; t++) {
+      const j = off + t * 4;
+      W[t] = ((msg[j] << 24) | (msg[j + 1] << 16) | (msg[j + 2] << 8) | msg[j + 3]) | 0;
+    }
+    for (let t = 16; t < 64; t++) {
+      const s0 = rotr(W[t - 15], 7) ^ rotr(W[t - 15], 18) ^ (W[t - 15] >>> 3);
+      const s1 = rotr(W[t - 2], 17) ^ rotr(W[t - 2], 19) ^ (W[t - 2] >>> 10);
+      W[t] = (W[t - 16] + s0 + W[t - 7] + s1) | 0;
+    }
+    let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+    for (let t = 0; t < 64; t++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[t] + W[t]) | 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const mj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + mj) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+    H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+  }
+  return H.map((x) => (x >>> 0).toString(16).padStart(8, "0")).join("");
+}
+
+function exporterSha256(text) {
+  return sha256Hex(utf8Bytes(normalizeExporterText(text)));
+}
+// </sha256>
+
+async function exporterIdentity() {
+  const rec = { release: EXPORTER_RELEASE, script_url: EXPORTER_URL || null, script_path: null, sha256: null };
+  if (!EXPORTER_URL) {
+    rec.error = "exporter_url not set in the export config (point it at this script file)";
+    return rec;
+  }
+  try {
+    const entry = await fs.getEntryWithUrl(EXPORTER_URL);
+    rec.script_path = entry.nativePath || null;
+    rec.sha256 = exporterSha256(await entry.read());
+  } catch (err) {
+    rec.error = "cannot read exporter_url: " + String((err && err.message) || err);
+  }
+  return rec;
 }
 
 
@@ -45,7 +152,11 @@ const log = {
   src: null,
   items: [],
   bound_keys_sample: null,
-  full_render: null
+  full_render: null,
+  exporter: null,
+  layers_at_open: null,
+  excluded_by_user_decision: [],
+  pending_user_decisions: []
 };
 
 const ours = new Set();
@@ -339,6 +450,64 @@ function revealHiddenChain(src, ids) {
   return restored;
 }
 
+// Every layer with its own and effective visibility, right after the document is opened (layers_at_open) and
+// again before the full render. bounds are document pixels with effects; opacity is 0-100.
+function snapshotLayers(doc) {
+  const out = [];
+  function walk(container, parentId, parentVisible) {
+    for (const layer of container.layers || []) {
+      let vis = true, kind = null, bounds = null, opacity = null;
+      try { vis = layer.visible !== false; } catch (err) {}
+      try { kind = String(layer.kind); } catch (err) {}
+      try { bounds = unitRect(layer.bounds); } catch (err) {}
+      try { opacity = layer.opacity; } catch (err) {}
+      const isGroup = !!(layer.layers && layer.layers.length) || String(kind).toLowerCase().indexOf("group") >= 0;
+      const eff = parentVisible && vis;
+      out.push({ id: layer.id, name: layer.name || "", parent_id: parentId, kind: kind, visible: vis,
+                 effective_visible: eff, opacity: opacity, bounds: bounds, group: isGroup });
+      if (layer.layers && layer.layers.length) walk(layer, layer.id, eff);
+    }
+  }
+  walk(doc, null, true);
+  return out;
+}
+
+// Layers the user chose to leave out: a reuse_decisions entry with layer_ids whose decision is an exclusion,
+// decided_by "user" AND recorded by `confirm --decision` in the lock's decision_log. Anything else is kept.
+const EXCLUDE_TYPES = new Set(["layer_inclusion", "exclude_visible_layer"]);
+const TRUTH_TYPES = new Set(["layer_inclusion", "exclude_visible_layer", "hidden_layer_state"]);
+const EXCLUDE_VALUES = new Set(["exclude", "excluded", "hide", "hidden", "omit", "not_exported", "no_export",
+  "skip", "drop", "old_draft", "leftover", "remove"]);
+const PENDING_VALUES = new Set(["", "pending", "wait_for_user", "none", "null"]);
+
+function normDecision(v) { return String(v == null ? "" : v).trim().toLowerCase(); }
+
+function isBlockingDecision(d) {
+  if (TRUTH_TYPES.has(d.type) || d.blocking === true) return true;
+  const aff = Array.isArray(d.affects) ? d.affects : [d.affects];
+  return aff.some((a) => ["truth", "export", "full_render"].indexOf(normDecision(a)) >= 0);
+}
+
+function userDecisionState(manifest, decisionLog) {
+  const excluded = [];
+  const pending = [];
+  for (const d of manifest.reuse_decisions || []) {
+    if (!d || typeof d !== "object") continue;
+    const val = normDecision(d.decision);
+    let last = null;
+    for (const r of decisionLog || []) if (r && String(r.id) === String(d.id)) last = normDecision(r.decision);
+    const answered = d.decision != null && !PENDING_VALUES.has(val) && normDecision(d.decided_by) === "user"
+      && last !== null && last === val;
+    if (!answered) {
+      if (isBlockingDecision(d)) pending.push({ id: d.id, type: d.type || null, layer_ids: d.layer_ids || null });
+      continue;
+    }
+    if (!(EXCLUDE_TYPES.has(d.type) || isBlockingDecision(d)) || !EXCLUDE_VALUES.has(val)) continue;
+    for (const id of d.layer_ids || []) excluded.push({ id: id, decision_id: d.id });
+  }
+  return { excluded: excluded, pending: pending };
+}
+
 function restoreHiddenChain(src, restored) {
   if (!restored || !restored.length) return;
   for (let i = restored.length - 1; i >= 0; i--) {
@@ -460,6 +629,7 @@ async function applySmartObjectSplit(tmp, split, item) {
 
 try {
   await loadConfig();
+  log.exporter = await exporterIdentity();
   rootDir = await fs.getEntryWithUrl(ROOT_URL);
   try {
     slicesDir = await rootDir.getEntry(SLICES_DIR_NAME);
@@ -487,6 +657,15 @@ try {
       "; restore the confirmed manifest, write manifest.proposal.json and ask the user to re-confirm");
   }
   const manifest = JSON.parse(manifestText);
+  let decisionLog = [];
+  try {
+    const shaFile = await rootDir.getEntry(MANIFEST_NAME.replace(/\.json$/i, "") + ".confirmed.sha256");
+    decisionLog = (JSON.parse(await shaFile.read()).decision_log) || [];
+  } catch (errSha) {
+    decisionLog = [];
+  }
+  const decisionState = userDecisionState(manifest, decisionLog);
+  log.pending_user_decisions = decisionState.pending;
   if (manifest.status && manifest.status !== "confirmed" && manifest.status !== "pending_review") {
     // pending_review is allowed only when the operator explicitly treats the auto manifest as confirmed.
     throw new Error("manifest.status must be confirmed (or pending_review for an authorized test run)");
@@ -496,6 +675,7 @@ try {
 
   await core.executeAsModal(async (executionContext) => {
     let src = null;
+    const excludedRestore = [];
     try {
       executionContext.reportProgress({ value: 0.02, commandName: "open source" });
       // Reuse the copy if it is already open (match by path). Never fall back to another file of the same name.
@@ -519,6 +699,9 @@ try {
       if (SOURCE_PATH_HINT && src.path && !samePath(src.path, SOURCE_PATH_HINT)) {
         throw new Error("GUARD: opened unexpected path: " + src.path);
       }
+      // Visibility as the document was opened, before any temporary change (validate: visible_layer_hidden,
+      // visible_layer_unassigned).
+      log.layers_at_open = snapshotLayers(src);
       await flush();
 
       let suspension;
@@ -529,6 +712,16 @@ try {
         });
       } catch (err) {
         log.errs.push({ suspendHistory: String(err) });
+      }
+
+      // User-recorded exclusions only (see userDecisionState); restored before the source is released.
+      for (const ex of decisionState.excluded) {
+        const lyr = findLayer(src, ex.id);
+        const rec = { id: ex.id, decision_id: ex.decision_id, name: lyr ? (lyr.name || "") : null, found: !!lyr };
+        try {
+          if (lyr && lyr.visible !== false) { lyr.visible = false; excludedRestore.push(lyr.id); rec.hidden = true; }
+        } catch (errEx) { rec.error = String(errEx); }
+        log.excluded_by_user_decision.push(rec);
       }
 
       const total = entries.length + 1;
@@ -568,6 +761,27 @@ try {
           item.logical_bounds = bounds.logical;
           item.visible_bounds = bounds.visible;
           item.boundsNoEffects = bounds.logical;
+          if (selectIds.length > 1) {
+            // 1.4.12: the manifest box of a multi-layer entry is the union of its layers; record it.
+            item.select_bounds = [];
+            let u = null;
+            for (const sid of selectIds) {
+              try {
+                const sd = sid === entry.layer_id ? desc
+                  : ((await bp([{ _obj: "get", _target: [{ _ref: "layer", _id: sid }] }]))[0] || {});
+                const sb = pickBounds(sd, findLayer(src, sid));
+                item.select_bounds.push({ id: sid, logical: sb.logical, visible: sb.visible });
+                const r = sb.logical || sb.visible;
+                if (r) {
+                  u = u ? { left: Math.min(u.left, r.left), top: Math.min(u.top, r.top),
+                            right: Math.max(u.right, r.right), bottom: Math.max(u.bottom, r.bottom) } : Object.assign({}, r);
+                }
+              } catch (errSel) {
+                item.select_bounds.push({ id: sid, error: String(errSel) });
+              }
+            }
+            item.logical_bounds_union = u;
+          }
           if (isAttrText(entry.kind) || desc.textKey) {
             item.text = parseText(desc) || entry.text || null;
           }
@@ -724,6 +938,12 @@ try {
       const tFull = nowMs();
       try {
         app.activeDocument = src;
+        // Layers visible at open but hidden now (only user-recorded exclusions may be here).
+        const openVis = {};
+        for (const l of log.layers_at_open || []) openVis[l.id] = l.visible;
+        fullItem.hidden_at_render = snapshotLayers(src)
+          .filter((l) => openVis[l.id] === true && l.visible === false)
+          .map((l) => ({ id: l.id, name: l.name }));
         const hasArtboardId = artboard && artboard.id != null;
         if (hasArtboardId) {
           await bp([{
@@ -748,7 +968,9 @@ try {
         const tmp = app.activeDocument;
         ours.add(tmp.id);
         try { await executionContext.hostControl.registerAutoCloseDocument(tmp.id); } catch (err) {}
-        for (const layer of tmp.layers) layer.visible = true;
+        for (const layer of tmp.layers) {
+          if (excludedRestore.indexOf(layer.id) < 0) layer.visible = true; // keep user exclusions hidden
+        }
         const wantW = artboard && artboard.size && artboard.size[0];
         const wantH = artboard && artboard.size && artboard.size[1];
         const abBounds = artboard && artboard.bounds; // document coords [l,t,r,b]
@@ -810,6 +1032,10 @@ try {
       }
       fullItem.ms = nowMs() - tFull;
       log.full_render = fullItem;
+      for (const id of excludedRestore) {
+        try { const lyr = findLayer(src, id); if (lyr) lyr.visible = true; }
+        catch (errR) { log.errs.push({ restore_excluded: id, error: String(errR) }); }
+      }
       await flush();
 
       if (suspension && suspension.historySuspensionID != null) {
@@ -839,6 +1065,9 @@ try {
       }
     } catch (err) {
       log.fatal = String((err && err.stack) || err);
+      for (const id of excludedRestore) {
+        try { const lyr = src && findLayer(src, id); if (lyr) lyr.visible = true; } catch (errR) {}
+      }
       try {
         if (weOpenedSource && src && ours.has(src.id)) {
           await src.closeWithoutSaving();

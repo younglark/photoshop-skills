@@ -55,6 +55,7 @@ except ImportError:
     ParseLimits = None
 
 SCHEMA_MANIFEST = "psjs-slice-manifest/v2"
+SKILL_VERSION = "1.4.12"
 SCHEMA_LAYOUT = "psjs-layout/v2"
 SCHEMA_MANIFEST_V1 = "psjs-slice-manifest/v1"
 SCHEMA_LAYOUT_V1 = "psjs-layout/v1"
@@ -2626,7 +2627,8 @@ def manifest_lock_state(manifest_path):
     mp = Path(manifest_path)
     copy, sha = manifest_lock_paths(mp)
     st = {"manifest": str(mp), "sha256": file_sha256(mp) if mp.is_file() else None,
-          "locked": sha.is_file(), "confirmed_sha256": None, "confirmed_at": None, "changed": False}
+          "locked": sha.is_file(), "confirmed_sha256": None, "confirmed_at": None, "changed": False,
+          "decision_log": []}
     if sha.is_file():
         try:
             info = json.loads(sha.read_text(encoding="utf-8"))
@@ -2634,8 +2636,250 @@ def manifest_lock_state(manifest_path):
             info = {"sha256": sha.read_text(encoding="utf-8").strip().split()[0]}
         st["confirmed_sha256"] = info.get("sha256")
         st["confirmed_at"] = info.get("confirmed_at")
+        st["decision_log"] = [r for r in (info.get("decision_log") or []) if isinstance(r, dict)]
         st["changed"] = st["sha256"] != st["confirmed_sha256"]
     return st
+
+
+# 1.4.12: every question the user has to answer is a structured entry in reuse_decisions. Types whose answer changes
+# the truth (what the full render / export shows) block validate until the user's own answer is recorded with
+# `confirm --decision ID=VALUE`, which also appends it to the lock's decision_log. A confirm note ("checklist
+# confirmed") locks the manifest but answers no question; a decided_by written by hand is not in the log.
+TRUTH_DECISION_TYPES = {"layer_inclusion", "exclude_visible_layer", "hidden_layer_state"}
+EXCLUDE_DECISION_TYPES = {"layer_inclusion", "exclude_visible_layer"}
+EXCLUDE_DECISIONS = {"exclude", "excluded", "hide", "hidden", "omit", "not_exported", "no_export", "skip", "drop",
+                     "old_draft", "leftover", "remove"}
+BLOCKING_AFFECTS = {"truth", "export", "full_render"}
+
+
+def _norm_decision(v):
+    return str(v if v is not None else "").strip().lower()
+
+
+def decision_is_blocking(d):
+    """True when the answer changes what the export or the full render shows (validate stops until answered)."""
+    if not isinstance(d, dict):
+        return False
+    if d.get("type") in TRUTH_DECISION_TYPES or d.get("blocking") is True:
+        return True
+    aff = d.get("affects")
+    affs = aff if isinstance(aff, (list, tuple)) else [aff]
+    return any(_norm_decision(a) in BLOCKING_AFFECTS for a in affs)
+
+
+def decision_recorded(d, decision_log):
+    """The decision's current value was recorded by `confirm --decision` (lock decision_log)."""
+    did, val = str(d.get("id")), _norm_decision(d.get("decision"))
+    last = None
+    for r in decision_log or []:
+        if str(r.get("id")) == did:
+            last = _norm_decision(r.get("decision"))
+    return last is not None and last == val
+
+
+def decision_answer_state(d, decision_log):
+    """None when the user answered; else the reason it is still open."""
+    if not _decided(d):
+        return "no_decision" if d.get("decision") in (None, "") else "decision_pending"
+    if _norm_decision(d.get("decided_by")) != "user":
+        return "not_decided_by_user"
+    if decision_is_blocking(d) and not decision_recorded(d, decision_log):
+        return "decided_by_user_not_recorded_by_confirm"
+    return None
+
+
+def pending_user_decisions(decisions, decision_log):
+    """Every reuse_decisions entry the user has not answered (any type), with why and whether it blocks validate."""
+    out = []
+    for d in decisions or []:
+        if not isinstance(d, dict):
+            continue
+        reason = decision_answer_state(d, decision_log)
+        if reason is None:
+            continue
+        out.append({"id": d.get("id"), "type": d.get("type"), "question": d.get("question"),
+                    "layer_ids": d.get("layer_ids"), "default": d.get("default"), "decision": d.get("decision"),
+                    "blocking": decision_is_blocking(d), "reason": reason})
+    return out
+
+
+PENDING_USER_DECISION_HINT = (
+    "this question changes what the export / full render shows and the user has not answered it. Ask the user "
+    "this exact question and record the answer with `confirm --decision ID=VALUE`. A plain confirm of the "
+    "checklist, the agent's default copied into decision, or a decided_by written by hand is not an answer. Until "
+    "then keep the safe default: export what the document shows (never hide a visible layer)."
+)
+
+
+def user_decision_issues(decisions, lock_info):
+    """``pending_user_decision`` for blocking decisions without the user's recorded answer."""
+    log = (lock_info or {}).get("decision_log") or []
+    return [dict(p, type="pending_user_decision", decision_type=p["type"], message=PENDING_USER_DECISION_HINT)
+            for p in pending_user_decisions(decisions, log) if p["blocking"]]
+
+
+def approved_exclusions(decisions, lock_info):
+    """{layer_id: decision_id} the user chose to leave out (recorded by confirm --decision). Only these may be
+    hidden by the exporter for slices and the full render."""
+    log = (lock_info or {}).get("decision_log") or []
+    out = {}
+    for d in decisions or []:
+        if not isinstance(d, dict) or not d.get("layer_ids"):
+            continue
+        if d.get("type") not in EXCLUDE_DECISION_TYPES and not decision_is_blocking(d):
+            continue
+        if decision_answer_state(d, log) is not None or _norm_decision(d.get("decision")) not in EXCLUDE_DECISIONS:
+            continue
+        for lid in d.get("layer_ids") or []:
+            out[lid] = d.get("id")
+    return out
+
+
+# The exporter is identified by the sha256 of its text with CRLF -> LF, a BOM dropped and the CONFIG_URL line
+# blanked (the one line a job edits). export_slices.psjs computes the same hash of itself (config exporter_url).
+EXPORTER_CONFIG_LINE = re.compile(r"^const CONFIG_URL = .*$", re.M)
+SHIPPED_EXPORTER = Path(__file__).resolve().with_name("export_slices.psjs")
+
+
+def normalize_exporter_text(text):
+    text = text.lstrip("\ufeff").replace("\r\n", "\n")
+    return EXPORTER_CONFIG_LINE.sub('const CONFIG_URL = "";', text, count=1)
+
+
+def exporter_text_sha256(text):
+    return hashlib.sha256(normalize_exporter_text(text).encode("utf-8")).hexdigest()
+
+
+def shipped_exporter_sha256(path=None):
+    p = Path(path) if path else SHIPPED_EXPORTER
+    return exporter_text_sha256(p.read_bytes().decode("utf-8")) if p.is_file() else None
+
+
+EXPORTER_MODIFIED_HINT = (
+    "the export was not made by the shipped examples/export_slices.psjs of this skill version. Copy it unchanged "
+    "(edit only CONFIG_URL), set exporter_url in the export config to the copy, and export again. Do not edit "
+    "the exporter to hide layers or to silence a check: exclusions come only from a user decision recorded with "
+    "confirm --decision; a false positive is reported, not patched in a job copy."
+)
+VISIBLE_HIDDEN_HINT = (
+    "layers visible when the document was opened were hidden for the full render (the validate reference) without "
+    "a recorded user decision to exclude them. The score then measures an altered reference. Export again with the "
+    "shipped exporter; if a layer may be an old draft, ask the user with a layer_inclusion decision."
+)
+VISIBLE_UNASSIGNED_HINT = (
+    "visible pixel layers inside the artboard are covered by no entry (layer_id / select_ids, or a selected "
+    "ancestor group). Add them to an entry, or ask the user with a layer_inclusion decision whether they belong "
+    "to the current design."
+)
+PIXEL_LAYER_KINDS = {"pixel", "normal", "text", "smartobject", "solidcolor", "solidfill", "gradientfill",
+                     "patternfill", "shape", "layer", "video", "3d"}
+
+
+def _layer_rect(b):
+    r = _rect_to_dict(b)
+    if not r or r["right"] <= r["left"] or r["bottom"] <= r["top"]:
+        return None
+    return r
+
+
+def exporter_issues(exporter, layers_at_open, shipped=None):
+    reasons = []
+    shipped_sha = shipped_exporter_sha256(shipped)
+    if shipped_sha is None:
+        reasons.append(f"shipped exporter not found at {shipped or SHIPPED_EXPORTER}; cannot verify the export")
+    if not isinstance(exporter, dict) or not exporter:
+        reasons.append("export log has no exporter record (an older or edited export_slices.psjs)")
+    else:
+        sha = exporter.get("sha256")
+        if not sha:
+            reasons.append("exporter sha256 missing" + (f": {exporter.get('error')}" if exporter.get("error") else ""))
+        elif shipped_sha and sha != shipped_sha:
+            reasons.append("exporter sha256 differs from the shipped export_slices.psjs")
+        sp = exporter.get("script_path")
+        if sp and Path(sp).is_file() and shipped_sha:
+            try:
+                live = exporter_text_sha256(Path(sp).read_bytes().decode("utf-8"))
+            except Exception as exc:
+                live = f"unreadable: {exc}"
+            if live != shipped_sha:
+                reasons.append(f"script at script_path differs from the shipped export_slices.psjs: {sp}")
+    if layers_at_open is None:
+        reasons.append("export log has no layers_at_open (layer visibility when the document was opened)")
+    if not reasons:
+        return []
+    return [{"type": "exporter_modified", "reasons": reasons,
+             "sha256": (exporter or {}).get("sha256") if isinstance(exporter, dict) else None,
+             "shipped_sha256": shipped_sha, "script_path": (exporter or {}).get("script_path") if isinstance(exporter, dict) else None,
+             "message": EXPORTER_MODIFIED_HINT}]
+
+
+def export_truth_issues(layout, shipped=None):
+    """1.4.12 checks on the export record copied into the layout by build-layout:
+
+    - exporter_modified: no exporter record / sha256, or not the shipped exporter, or no layers_at_open;
+    - visible_layer_hidden: layers visible when the document was opened but hidden for the full render, without
+      a recorded user exclusion;
+    - visible_layer_unassigned: visible pixel layers inside the artboard that no entry covers and the user did
+      not exclude.
+    """
+    exp = (layout or {}).get("export") or {}
+    layers = exp.get("layers_at_open")
+    issues = exporter_issues(exp.get("exporter"), layers, shipped)
+    excluded = approved_exclusions(layout.get("reuse_decisions") or [], layout.get("manifest_lock"))
+    if not layers:
+        return issues
+    by_id = {l.get("id"): l for l in layers if isinstance(l, dict)}
+
+    def ancestors(lid):
+        seen = set()
+        cur = by_id.get(lid)
+        while cur is not None and cur.get("parent_id") is not None and cur["parent_id"] not in seen:
+            seen.add(cur["parent_id"])
+            yield cur["parent_id"]
+            cur = by_id.get(cur["parent_id"])
+
+    def under(lid, ids):
+        return lid in ids or any(a in ids for a in ancestors(lid))
+
+    hidden = [x for x in (exp.get("full_render_hidden") or []) if isinstance(x, dict)]
+    bad = [x for x in hidden if not under(x.get("id"), excluded)]
+    if bad:
+        issues.append({"type": "visible_layer_hidden", "layers": [{"id": x.get("id"), "name": x.get("name")} for x in bad],
+                       "message": VISIBLE_HIDDEN_HINT})
+
+    art = (layout.get("source") or {}).get("artboard") or {}
+    art_id = art.get("id") if art.get("id") in by_id else None
+    ab = art.get("bounds")
+    ab = _rect_to_dict(ab) if ab else None
+    covered = set()
+    for n in layout.get("nodes") or []:
+        if n.get("layer_id") is not None:
+            covered.add(n["layer_id"])
+        covered.update(i for i in (n.get("select_ids") or []) if i is not None)
+    loose = []
+    for l in layers:
+        if not isinstance(l, dict) or l.get("group") or not l.get("effective_visible", l.get("visible")):
+            continue
+        kind = re.sub(r"[^a-z0-9]", "", str(l.get("kind") or "pixel").lower().split(".")[-1])
+        if kind not in PIXEL_LAYER_KINDS:
+            continue
+        if l.get("opacity") is not None and float(l["opacity"]) <= 0:
+            continue
+        r = _layer_rect(l.get("bounds"))
+        if r is None:
+            continue
+        if ab and (r["right"] <= ab["left"] or r["left"] >= ab["right"] or r["bottom"] <= ab["top"] or r["top"] >= ab["bottom"]):
+            continue
+        lid = l.get("id")
+        if art_id is not None and art_id not in set(ancestors(lid)):
+            continue
+        if under(lid, covered) or under(lid, excluded):
+            continue
+        loose.append({"id": lid, "name": l.get("name"), "kind": l.get("kind"), "bounds": r})
+    if loose:
+        issues.append({"type": "visible_layer_unassigned", "count": len(loose), "layers": loose[:50],
+                       "message": VISIBLE_UNASSIGNED_HINT})
+    return issues
 
 
 MANIFEST_CHANGED_HINT = (
@@ -2672,21 +2916,26 @@ def cmd_confirm(args):
             raise SystemExit(f"--decision: no reuse_decisions entry with id {did!r}")
         by_id[did].update(decision=val, decided_by="user", decided_at=stamp)
         recorded.append({"id": did, "decision": val})
-    pending = [{"id": d.get("id"), "type": d.get("type"), "default": d.get("default"),
-                "decision": d.get("decision")}
-               for d in decs if d.get("type") in ("split_avatar", "reuse")
-               and str(d.get("decided_by") or "").lower() != "user"]
+    decision_log = list(st.get("decision_log") or [])
+    for r in recorded:
+        decision_log.append({"id": r["id"], "decision": r["decision"], "decided_at": stamp})
+    pending = pending_user_decisions(decs, decision_log)
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     copy, sha = manifest_lock_paths(path)
     copy.write_bytes(path.read_bytes())
     digest = file_sha256(path)
     sha.write_text(json.dumps({"sha256": digest, "confirmed_at": stamp, "manifest": path.name,
-                               "note": getattr(args, "note", None)}, ensure_ascii=False, indent=2), encoding="utf-8")
+                               "note": getattr(args, "note", None), "decision_log": decision_log},
+                              ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"ok": True, "manifest": str(path), "sha256": digest, "confirmed_copy": str(copy),
                       "lock": str(sha), "user_decisions_recorded": recorded,
                       "not_user_decided": pending,
-                      "note": ("not_user_decided entries do not count for split_below_threshold / reuse over cap; "
-                               "only the user's own answer, recorded with --decision ID=VALUE, does")},
+                      "blocking_not_user_decided": [p["id"] for p in pending if p["blocking"]],
+                      "note": ("the manifest is locked, but not_user_decided entries are not answered: a confirm note "
+                               "answers no question. They do not count for split_below_threshold / reuse over cap, and "
+                               "blocking ones (layer_inclusion / exclude_visible_layer / hidden_layer_state / affects) are "
+                               "pending_user_decision in validate. Only the user's own answer, recorded with "
+                               "--decision ID=VALUE, counts.")},
                      ensure_ascii=False, indent=2))
     return 0
 
@@ -4547,6 +4796,8 @@ def cmd_flatten(args):
         "manifest": str(out),
         "shared_images": dict(Counter(e["image_name"] for e in entries if e.get("reuse_of"))),
         "pending_reuse_decisions": pending,
+        "pending_user_decisions": pending_user_decisions(decisions, manifest_lock_state(path).get("decision_log")
+                                                         if path.is_file() else []),
         "entry_count": len(entries),
         "by_kind": dict(Counter(e["kind"] for e in entries)),
         "hidden_entries": sum(1 for e in entries if e.get("hidden")),
@@ -4810,6 +5061,43 @@ def layer_bounds_conflict(manifest_bounds, measured_bounds, tol=LAYER_BOUNDS_TOL
     return int(round(d)) if d > tol else 0
 
 
+def _union_rect(rects):
+    rs = [r for r in (_rect_to_dict(x) for x in rects) if r]
+    if not rs:
+        return None
+    return {"left": min(r["left"] for r in rs), "top": min(r["top"] for r in rs),
+            "right": max(r["right"] for r in rs), "bottom": max(r["bottom"] for r in rs)}
+
+
+def _inside(inner, outer, tol):
+    a, b = _rect_to_dict(inner), _rect_to_dict(outer)
+    return bool(a and b and a["left"] >= b["left"] - tol and a["top"] >= b["top"] - tol
+                and a["right"] <= b["right"] + tol and a["bottom"] <= b["bottom"] + tol)
+
+
+def entry_layer_bounds_conflict(entry, item, tol=LAYER_BOUNDS_TOL_PX):
+    """layer_bounds_conflict for one manifest entry and its export log item.
+
+    An entry that merges several layers (select_ids) has the union of their boxes as its manifest box. 1.4.12
+    logs carry that union (logical_bounds_union / select_bounds) and it is compared instead of the layer_id box.
+    For older logs (only the layer_id box) a measured box inside the manifest box (+tol) is a part of the union,
+    not a mismatch; a box elsewhere (an instance pointing at its sibling's layer) is still reported."""
+    if not item:
+        return 0
+    man = entry.get("logical_bounds")
+    union = _rect_to_dict(item.get("logical_bounds_union"))
+    if union is None and item.get("select_bounds"):
+        union = _union_rect([(b or {}).get("logical") or (b or {}).get("visible") for b in item["select_bounds"]])
+    if union is not None:
+        return layer_bounds_conflict(man, union, tol)
+    _, logi = extract_bounds_from_export_item(item)
+    d = layer_bounds_conflict(man, logi, tol)
+    multi = len([i for i in (entry.get("select_ids") or []) if i is not None]) > 1
+    if d and multi and _inside(logi, man, tol):
+        return 0
+    return d
+
+
 def place_reused_instances(nodes):
     """Place bounds-only instances of a shared image: source visible box shifted by the logical-origin delta."""
     by_name = {n["name"]: n for n in nodes}
@@ -4879,7 +5167,7 @@ def cmd_build_layout(args):
             logi = _rect_to_dict(entry.get("logical_bounds"))
         if vis is None:
             vis = logi
-        bounds_conflict = layer_bounds_conflict(entry.get("logical_bounds"), logi if item else None)
+        bounds_conflict = entry_layer_bounds_conflict(entry, item) if item else 0
         # Prefer the post-trim inset origin computed in export_slices.psjs.
         # Only fall back to "PNG size == logical size → use logical origin"
         # when the exporter did not record trim insets (older logs).
@@ -4993,6 +5281,9 @@ def cmd_build_layout(args):
     psd_for_text = (manifest.get("source") or {}).get("file")
     if psd_for_text:
         fill_layout_leading_types({"nodes": nodes}, psd_for_text)
+    for p in user_decision_issues(manifest.get("reuse_decisions") or [], lock):
+        warn(f"pending user decision {p['id']} ({p['decision_type']}): {p['reason']}; validate will report it")
+    full_item = export.get("full_render") or {}
     layout = {
         "schema": SCHEMA_LAYOUT,
         "source": manifest["source"],
@@ -5001,6 +5292,11 @@ def cmd_build_layout(args):
             "started": export.get("started"),
             "finished": export.get("finished"),
             "log": str(Path(args.export_log)),
+            "exporter": export.get("exporter"),
+            "layers_at_open": export.get("layers_at_open"),
+            "full_render_hidden": full_item.get("hidden_at_render") if isinstance(full_item, dict) else None,
+            "excluded_by_user_decision": export.get("excluded_by_user_decision"),
+            "pending_user_decisions": export.get("pending_user_decisions"),
         },
         "nodes": nodes,
         "components": components,
@@ -6101,6 +6397,8 @@ def cmd_validate(args):
                               "reuse_max_mae": getattr(args, "reuse_tol_mae", None),
                               "reuse_max_pct_gt16": getattr(args, "reuse_tol_pct", None)})
     issues.extend(lock_issues(layout.get("manifest_lock")))
+    issues.extend(user_decision_issues(layout.get("reuse_decisions") or [], layout.get("manifest_lock")))
+    issues.extend(export_truth_issues(layout, getattr(args, "shipped_exporter", None)))
     issues.extend(check_avatar_splits(layout["nodes"], layout.get("reuse_decisions") or [],
                                       layout.get("avatar_merge_suspects") or [], layout.get("tree") or None, thr))
     issues.extend(check_frame_bakes(layout["nodes"], layout.get("tree") or None))
@@ -6282,6 +6580,11 @@ def cmd_validate(args):
             "a user decision is recorded in reuse_decisions (reuse_accepted alone does not count).",
             "manifest_lock: build-layout records the confirmed-manifest lock; a change after confirmation is "
             "manifest_changed_after_confirm.",
+            "pending_user_decision: a blocking reuse_decisions entry (layer_inclusion / exclude_visible_layer / "
+            "hidden_layer_state / affects truth|export) without the user's answer recorded by confirm --decision.",
+            "visible_layer_hidden / visible_layer_unassigned / exporter_modified: the full render must show what the "
+            "document showed when opened (minus user-recorded exclusions), every visible pixel layer needs an entry "
+            "or an exclusion, and the export must come from the shipped export_slices.psjs.",
         ],
         "issues": issues,
         "placed": len(placed_text),
@@ -6379,7 +6682,8 @@ def build_parser():
     s.add_argument("--note", default=None, help="Who confirmed / what (kept in the lock file)")
     s.add_argument("--relock", action="store_true", help="Re-lock after the user re-confirmed a changed manifest")
     s.add_argument("--decision", action="append", default=[], metavar="ID=VALUE",
-                   help="Record the user's own answer to a reuse_decisions entry (decided_by=user); repeatable")
+                   help="Record the user's own answer to a reuse_decisions entry (decided_by=user, appended to the "
+                        "lock's decision_log); repeatable. A --note answers no decision")
     s.set_defaults(func=cmd_confirm)
 
     s = sub.add_parser("check-lock", help="Exit 3 if the manifest changed after confirm, 4 if not locked")
@@ -6426,6 +6730,9 @@ def build_parser():
                    help="Override thresholds.split_match_psnr (default 35 dB) for split parts vs the PS render")
     s.add_argument("--rules", default=None,
                    help="Project rules JSON; its \"thresholds\" object overrides the defaults (CLI flags win)")
+    s.add_argument("--shipped-exporter", default=None,
+                   help="The skill's examples/export_slices.psjs (default: next to slicing_helper.py); the export "
+                        "log's exporter sha256 must match it (exporter_modified)")
     s.set_defaults(func=cmd_validate)
     return p
 

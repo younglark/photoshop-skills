@@ -147,7 +147,11 @@ class TestReuseFlow(unittest.TestCase):
         mpath.write_text(json.dumps(m), encoding="utf-8")
         self.assertEqual(h.cmd_confirm(SimpleNamespace(manifest=str(mpath), note="test", relock=False)), 0)
         _row_img().save(self.slices / "main_bg_row.png")
-        log = {"ok": True, "items": [
+        # 1.4.12: a current export log carries the exporter record and the layer visibility at open
+        layers = [{"id": lid, "name": f"<layer {lid}>", "parent_id": None, "kind": "pixel", "visible": True,
+                   "effective_visible": True, "opacity": 100, "bounds": b, "group": False}
+                  for lid, b in ((11, _box(5, 5, 35, 15)), (12, _box(5, 25, 35, 35)))]
+        log = {"ok": True, "exporter": {"sha256": h.shipped_exporter_sha256()}, "layers_at_open": layers, "items": [
             {"name": "main_bg_row1", "ok": True, "out_size": [30, 10], "visible_bounds_from_trim_insets": True,
              "visible_bounds": _box(5, 5, 35, 15), "logical_bounds": _box(5, 5, 35, 15)},
             {"name": "main_bg_row2", "ok": True, "bounds_only": True,

@@ -5,5 +5,6 @@
   "manifest_name": "manifest.json",
   "log_name": "export_log.json",
   "slices_dir_name": "slices",
-  "full_render_name": "full_render.png"
+  "full_render_name": "full_render.png",
+  "exporter_url": "file:/D:/work/ps-job/export_slices.psjs"
 }

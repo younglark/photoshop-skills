@@ -13,7 +13,7 @@
 5. **只给会随状态变化的零件记 missing。** 以同组里状态最完整的那一项为模板（例如某选中项有 base + highlight + label），每个缺少其中一件的兄弟项都要列出，**包括 highlight**。不要因为共用图标没有另一态就标 missing。单个特殊样式的列表行（例如 self 高亮行）只是这一行的一个实例：不要给其它行推断缺失的 self，也不要给这一行推断缺失的 normal，除非设计里每行都有成套变体。
 6. **判断重复元素是否复用（见下文「重复元素：复用还是分开」）。** 先按 UI 用途和常识（游戏 UI 先验）加上 `reuse_candidates.json` 的证据，从逻辑上判断是否该共用一张图；该复用就用 `reuse_of` 指向同一张共享图。再对照效果图：复用后与设计对不上，先怀疑分析错了，只把对不上的实例拆出去单独导出；逻辑证据很强却对不上，写进 `reuse_decisions` 交用户决定。头像图与头像框必须分开：PSD 里合在一起时，**先自己按下文「头像与框合在一起：先拆，拆不开再问」尝试拆开**，拆完用框 + 占位头像重新拼合并和效果图对比；对得上就按拆分导出；对不上时先按「拆开后拼回去对不上：先定位效果，再决定问不问」逐层关效果定位、按两张修法重做并验证（换内容后约 35 dB，见 10.11），只有拆不开、修不好或属于适用边界之外才写 `reuse_decisions`（`type: split_avatar`）交用户，附上哪一层、为什么、修法和 dB 以及对比图。面板、弹窗、卡片、按钮底等 frame 类元素同理：**默认按视觉层次拆成可九宫 / 三宫 / 复用的部件**（见下文「frame 类元素：按视觉层次拆，九宫与装饰」），整张烘焙只在拆不开或拆后对不上时使用，并写 `bake_reason`。
 7. **写好审核清单后停下。** 跑 `flatten` + `preview`，`status` 保持 `pending_review`，等用户改 JSON 确认后再导出。用户确认后跑 `confirm` 锁定清单（见第 6 节）；**锁定后不要再改 manifest**，要改就写 `manifest.proposal.json` 并停下等用户重新确认。
-8. **确认后一口气跑完，不要停在导出。** 导出 → `build-layout` → `validate` 是一个整体；`export_log.json` 写出不算完成，只有 `validate/validate_report.json` 写出并读过 `issues`（含 `group_effect_lost`）、遮罩 PSNR / ΔE 后才算完成。`validate` 的最后一步用**实际导出的 PNG** 拼出默认态并画上标注，写出 `validate/preview_exported_annotated.png` 与 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注）；把这两张图作为最终成果交给用户。第 7 步导出前的审核预览不变。若 `issues` 里有 `reuse_mismatch`，按第 6 步处理（拆出单独导出，或交用户决定）后重跑。每条长命令都设超时并把输出写进日志；某步超时或报错时，读日志、修正后重跑这一步，不要静默结束。 `issues` 里的问题不能靠 agent 自己写个「接受」标记消掉（`reuse_accepted`、`split_best_effort`、`effects_checked` 之类的说明都不算）：按对应规则修，修不好就停下，把对比图和数字交给用户，等用户在 `reuse_decisions` 里填 `decision`。
+8. **确认后一口气跑完，不要停在导出。** 导出 → `build-layout` → `validate` 是一个整体；`export_log.json` 写出不算完成，只有 `validate/validate_report.json` 写出并读过 `issues`（含 `group_effect_lost`）、遮罩 PSNR / ΔE 后才算完成。`validate` 的最后一步用**实际导出的 PNG** 拼出默认态并画上标注，写出 `validate/preview_exported_annotated.png` 与 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注）；把这两张图作为最终成果交给用户。第 7 步导出前的审核预览不变。若 `issues` 里有 `reuse_mismatch`，按第 6 步处理（拆出单独导出，或交用户决定）后重跑。每条长命令都设超时并把输出写进日志；某步超时或报错时，读日志、修正后重跑这一步，不要静默结束。 `issues` 里的问题不能靠 agent 自己写个「接受」标记消掉（`reuse_accepted`、`split_best_effort`、`effects_checked` 之类的说明都不算）：按对应规则修，修不好就停下，把对比图和数字交给用户，等用户在 `reuse_decisions` 里填 `decision`。凡是要用户回答的问题（含「这个可见图层是当前设计还是旧稿」「这个隐藏层是交替状态还是残留」），都写成 `reuse_decisions` 里的结构化条目，不能只写在 notes / checklist；未答前按安全默认导出：不隐藏任何当前可见的图层（1.4.12，见第 5、6、9 节）。
 
 选中槽上的隐藏层：若它落在**当前选中项**的槽里，并且是同一主体、只是加了发光或高亮样式，应作为该态的 `highlight`。若默认态就是这一项被选中，即使该高亮层在 PSD 里仍是隐藏的，也要纳入默认选中态，否则拼图会缺一层。只有内容或徽记对不上时，才用 `uncertain_hidden`。
 
@@ -399,6 +399,34 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 `decision` 为空时 `flatten` 会在 `pending_reuse_decisions` 里列出；未决定的按 `default` 导出；但 `default` 不能替用户解除 `split_below_threshold` 或复用超上限（见上）。
 
+**1.4.12：所有交用户回答的问题都进 `reuse_decisions`。** 除 `reuse` / `split_avatar` 外，还有三种会改变真值（整图 / 导出内容）的类型，带 `layer_ids`：
+
+| `type` | 问什么 | 常用 `options` | 排除类回答 |
+|---|---|---|---|
+| `layer_inclusion` | 某个当前可见的图层算不算当前设计（还是旧稿、展示稿） | `include` / `exclude` | `exclude` |
+| `exclude_visible_layer` | 同上，问法是「要不要把它排除」 | `keep` / `exclude` | `exclude` |
+| `hidden_layer_state` | 某个隐藏层是交替状态还是残留 | `state` / `leftover` | —（隐藏层本来不在整图里） |
+
+其它类型的问题如果答案会改变导出内容，加 `"affects": "truth"`（或 `"export"`、`"full_render"`，也可 `"blocking": true`）。这些条目是**阻塞性**的：
+
+```json
+{
+  "id": "inc_<layer>",
+  "type": "layer_inclusion",
+  "layer_ids": [<layer_id>],
+  "question": "<图层名>（可见）是当前设计，还是旧稿/展示稿？",
+  "evidence": ["与第 1–3 行内容重复", "crops/<layer_id>.png"],
+  "options": ["include", "exclude"],
+  "default": "include",
+  "decision": null
+}
+```
+
+- 默认值应是安全的一侧：可见层 `include`。`default` 只是建议，导出器不会按它隐藏任何层。
+- 用户的回答只能用 `confirm --decision ID=VALUE` 记录：写 `decision`、`decided_by: "user"`、`decided_at`，并把 `{id, decision, decided_at}` 追加进 `manifest.confirmed.sha256` 的 `decision_log`（重新锁定时保留）。阻塞性条目要求当前 `decision` 与日志里该 id 最后一次记录一致；agent 手写的 `decided_by: "user"` 不在日志里，仍算未答（`reason: decided_by_user_not_recorded_by_confirm`）。`reuse` / `split_avatar` 仍按 1.4.9 的规则（`decided_by: "user"`）。
+- 排除类回答（`exclude`、`omit`、`old_draft`、`leftover` 等）只在 `decided_by: "user"` 且在 `decision_log` 里时生效：导出器在切图和整图里隐藏这些 `layer_ids`，`validate` 不再把它们算作 `visible_layer_hidden` / `visible_layer_unassigned`。
+- `flatten` 输出新增 `pending_user_decisions`（全部未答条目，带 `blocking` 和 `reason`）。
+
 组件节点常用字段：
 
 | 字段 | 含义 |
@@ -676,7 +704,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 1. 用 `flatten` 把组件树展成 `entries`，再用 `preview` 画标注预览（框出每个切图、标规范名和九宫格线；来自隐藏态的条目会计入标题；有 `effect_mode` 的标 `fx:baked` / `fx:engine(效果类型)`，`engine` 再用细品红框画出估计的效果范围）。`flatten` 输出里的 `effect_issues` 必须为空。
 2. 把 `preview_annotated.png` 和 `manifest.json` 交给用户。用户改 JSON：改名、改类型、改九宫格、拆/合并部件、确认或删除 `missing`、把不该导出的隐藏层拿掉、切换 `effect_mode`、对 `reuse_decisions` 填 `decision`（看对比图）。
-3. `status` 在用户确认前保持 `pending_review`。用户确认后运行 `python slicing_helper.py confirm --manifest manifest.json`：改为 `confirmed`、写 `confirmed_at`，并写出锁 `manifest.confirmed.json`（逐字节副本）和 `manifest.confirmed.sha256`。用户对某条 `reuse_decisions` 的回答用 `--decision ID=VALUE`（可重复）记进去，会写 `decided_by: "user"` 和 `decided_at`；`confirm` 输出的 `not_user_decided` 列出还没有用户回答的 `split_avatar` / `reuse` 条目——其中卡着低于阈值的拆分或超上限复用的，要先问用户再导出。导出脚本拒绝其它状态（测试授权下允许 `pending_review`）。
+3. `status` 在用户确认前保持 `pending_review`。用户确认后运行 `python slicing_helper.py confirm --manifest manifest.json`：改为 `confirmed`、写 `confirmed_at`，并写出锁 `manifest.confirmed.json`（逐字节副本）和 `manifest.confirmed.sha256`。用户对某条 `reuse_decisions` 的回答用 `--decision ID=VALUE`（可重复）记进去，会写 `decided_by: "user"` 和 `decided_at`；`confirm` 输出的 `not_user_decided` 列出**所有**还没有用户回答的条目（任何 `type`，带 `blocking` 和 `reason`），`blocking_not_user_decided` 单列阻塞性的——卡着低于阈值的拆分、超上限复用或阻塞性问题的，要先问用户再导出。**一句「清单确认」（`confirm --note "清单确认"`）只确认切图清单本身**：照常锁定，但不回答任何一条决定；agent 不能把它解读成用户选了某个选项（例如「隐藏某个可见层」）。要回答就单独问，并用 `--decision` 记录。导出脚本拒绝其它状态（测试授权下允许 `pending_review`）。
 4. 用户确认后才进入导出。**锁定后的清单不得再改**（包括加条目、改 `reuse_accepted`、改 `split_evidence`、跑会重写清单的 `flatten`）。`export_slices.psjs` 发现 manifest 和 `manifest.confirmed.json` 不一致就拒绝导出；`build-layout` 发现哈希不一致就退出（退出码 3，不写布局）；`validate` 记 `manifest_changed_after_confirm`；没锁记 `manifest_not_locked`。导出前可以先跑 `check-lock`（改过退出 3，没锁退出 4）。
 5. 导出或校验中发现清单需要改：把改动写进 `manifest.proposal.json`（改什么、为什么、证据和对比图），**停下**交用户；用户同意后再改清单，并用 `confirm --relock` 重新锁定。
 
@@ -693,6 +721,13 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 若条目 `hidden`（或 `from_hidden`）为真，脚本先显示该层及其被隐藏的祖先，再「从图层新建」、trim、保存，然后把可见性改回去。整次作业在 `suspendHistory` 里进行；脚本自己打开的文档一律 `closeWithoutSaving`。每条描述符 `_options.dialogOptions = "silent"`。只操作作业打开的文档，绝不改、存、关用户已打开的其它文档。
 
 可见框记录规则不变：临时文档与源画布对齐时，紧致可见原点 = trim 前 `layer.bounds.left/top` 减 trim 后的 left/top。不要把 trim 前的松框左上角当成 PNG 原点。
+
+**1.4.12 的导出记录（`validate` 据此检查真值，见第 9 节）：**
+- **导出器原样使用。** 把 skill 的 `examples/export_slices.psjs` 复制到作业目录，只改 `CONFIG_URL`；作业 JSON 加 `exporter_url` 指向这份副本。脚本读自己的文本，统一换行、去掉 BOM、把 `CONFIG_URL` 那一行置空后算 sha256，记在 `exporter`（`release`、`script_url`、`script_path`、`sha256`；读不到时 `sha256: null` 加 `error`）。不要为了隐藏图层、改量法或消掉某个误报去改脚本；误报写进报告交给维护者。
+- **打开时的可见性。** 打开（或复用已打开的）源文档后、任何临时显隐之前，记 `layers_at_open`：每个图层的 `id`、`name`、`parent_id`、`kind`、`visible`（自身）、`effective_visible`（含祖先）、`opacity`、`bounds`（文档坐标，含效果）、`group`。
+- **排除只由用户决定驱动。** 脚本读 `manifest.confirmed.sha256` 的 `decision_log`，只隐藏阻塞性 / 排除类条目里用户经 `confirm --decision` 选了排除的 `layer_ids`（记 `excluded_by_user_decision`），整图导完后恢复；没有任何别的隐藏开关。未答的阻塞性条目记在 `pending_user_decisions`，不做任何改动。
+- **整图前再记一次。** 导 `full_render.png` 前记 `full_render.hidden_at_render`：打开时可见、此刻被隐藏的图层。导隐藏状态时的临时显示、拆分时在临时副本里隐藏内层，都必须在整图前恢复，不会出现在这里。
+- **多图层条目。** `select_ids` 多于一层时，逐层读边界记 `select_bounds`（`id`、`logical`、`visible`），并记逻辑框并集 `logical_bounds_union`；`logical_bounds` 仍是 `layer_id` 那一层。
 
 ---
 
@@ -753,12 +788,18 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 ## 9. 校验
 
+1.4.12 的真值护栏（都进 `issues`，`ok:false`；数据来自 `build-layout` 抄进布局 `export` 段的导出记录）：
+- `pending_user_decision`：阻塞性的 `reuse_decisions` 条目（`layer_inclusion` / `exclude_visible_layer` / `hidden_layer_state`，或带 `affects: truth|export|full_render` / `blocking: true`）没有经 `confirm --decision` 记录的用户回答。带 `id`、`decision_type`、`question`、`layer_ids`、`reason`（`no_decision`、`decision_pending`、`not_decided_by_user`、`decided_by_user_not_recorded_by_confirm`）。`build-layout` 也会警告。
+- `visible_layer_hidden`：`full_render.hidden_at_render` 里有打开时可见、却没有被用户排除（自身或祖先在已记录的排除决定里）的图层。此时参考图已被改过，分数不可信。
+- `visible_layer_unassigned`：`layers_at_open` 里画板内（祖先链含画板 id，且边界与画板相交）、有效可见、不透明度 > 0、边界非空的像素类图层（像素、文字、智能对象、填充/形状层；调整层和组不算），既没被任何节点的 `layer_id` / `select_ids` 覆盖（被选中的祖先组也算覆盖），也没被用户排除。最多列 50 个，带 `count`。
+- `exporter_modified`：导出日志没有 `exporter` 记录或 `sha256`、`sha256` 与 skill 自带的 `examples/export_slices.psjs`（`validate --shipped-exporter` 可改路径，默认在 `slicing_helper.py` 旁边）按同样规则算出的值不一致、`script_path` 上的文件现算不一致，或没有 `layers_at_open`。`reasons` 列出原因。这只防「复制后改两行」，不是防篡改；导出器和助手要用同一个 skill 版本。
+
 1.4.9 起的护栏（都进 `issues`，不能由 agent 自行标记接受）：`manifest_changed_after_confirm` / `manifest_not_locked`（第 6 节）；`split_below_threshold`（实测：导出的拆分部件拼回去，在其合并框内与 PS 整图比 dB，见 `split_checked`；或 `split_evidence` 里实测 dB 低于阈值）、`split_unverified`；`reuse_mismatch`（复用误差超上限，见「重复元素」）。用户在 `reuse_decisions` 填了 `decision` 的，改记在 `split_below_threshold_user_accepted` / `reuse_mismatch_accepted`。
 
 1. **默认状态**：只拼 `default: true` 的部件（即 PSD 里当前显示的那一态，加上始终可见的 chrome），用 src-over（`Image.alpha_composite`）叠回画板，与 Photoshop 整图比像素差 / CIEDE2000 ΔE。同时报告画上属性文字（`dynamic_text` / `static_text`）近似后的数字（`diff_text_rendered`）、以及遮罩这些文字区域后的数字（`diff_text_masked`），并列出误差最大的 10 条。再检查漏切、重名、空图。**判断切图精度只看遮罩后的指标**；带文字的数字只说明预览和效果图有多像。
 2. **引擎效果**：`effect_mode: engine` 的部件，投影 / 外发光按 Pillow 近似画在部件下面（alpha → 按角度/距离偏移 → 扩展后高斯模糊 → 颜色/不透明度，普通混合），报告列在 `engine_effects_emulated`。描边、内阴影、叠加等无法模拟的，按估计的 `effect_bounds` 把外圈（内部效果则整框）从遮罩指标里去掉，列在 `engine_effects_unemulated`。`issues` 里的 `group_effect_lost` 表示选了带效果组的子层却既没烘焙也没写 `engine_effects`，必须修。部件带 `blend_mode` 时按对应公式叠到画布上（normal / multiply / screen / linear_burn / lighten / darken / linear_dodge；其它模式按 normal 画并在 `placed` 里记 `blend_mode_approximated_normal`）。拆分相关的 `outer_effect_into_hole`、`blend_mode_content_dependent`、`blend_mode_not_replayable` 见「拆开后拼回去对不上」。
 3. **复用实例**：每个带 `reuse_of` 的默认态节点，在其可见框内（去掉属性文字与无法模拟的效果区域）比 PS 整图与拼图。MAE > `--reuse-tol-mae`（默认 4）或差值 >16 的像素占比 > `--reuse-tol-pct`（默认 1%）时记为 `reuse_mismatch`（含实例名、区域、指标和 `validate/reuse/<名>.png` 对比图）；`reuse_accepted` 的改记 `reuse_mismatch_accepted`。逐实例数据在 `reuse_checked`。
-4. **位置（1.4.11）**：`layer_bounds_mismatch`：清单的 `logical_bounds` 与该条目 `layer_id` 实测的逻辑边界差超过 2 px（指向了兄弟实例的图层）；借用别的实例图的非默认态改按清单的框放，不报。`placement_offset`：每张正常混合、100% 不透明的图（含按原尺寸画的九宫格），用它自己的不透明像素、去掉上层盖住的部分，在 ±2 px 内和 PS 整图配准；某个偏移的 MAE 不到原位的一半且低 0.5 以上就报，附 `fits_at_shift`。处理办法是按当前 `export_slices.psjs` 重导或改正 `layer_id`，不要手动挪布局。参与配准的图数在 `placement_checked`。
+4. **位置（1.4.11）**：`layer_bounds_mismatch`：清单的 `logical_bounds` 与该条目 `layer_id` 实测的逻辑边界差超过 2 px（指向了兄弟实例的图层）；借用别的实例图的非默认态改按清单的框放，不报。1.4.12 起，多图层条目（`select_ids` 多于一层）用日志里的 `logical_bounds_union`（或 `select_bounds` 的并集）比；旧日志只有 `layer_id` 那一层时，实测框落在清单框内（容差 2 px）算并集的一部分、不报，框在别处照报。`placement_offset`：每张正常混合、100% 不透明的图（含按原尺寸画的九宫格），用它自己的不透明像素、去掉上层盖住的部分，在 ±2 px 内和 PS 整图配准；某个偏移的 MAE 不到原位的一半且低 0.5 以上就报，附 `fits_at_shift`。处理办法是按当前 `export_slices.psjs` 重导或改正 `layer_id`，不要手动挪布局。参与配准的图数在 `placement_checked`。
 4. **交替状态**：对每个交互组件的非默认状态（含仅存在于 `missing` 中的状态），按「共用部件 + 该状态部件」拼图，互斥组的兄弟项切到对应态，写出 `validate/states/<component_id>_<state>.png`。只对真正缺失的、按设计随状态变化的零件画红框并标 `missing`。这些预览**不**和默认态整图比 PSNR（对不上是正常的）。
 5. **导出后标注预览（最终交付）**：用实际导出的 PNG 按布局 JSON 拼默认态（同上，含引擎效果近似），再按审核预览的样式画标注：每个切图按 `visible_bounds` 画框、规范名、九宫格线、类型和 `fx:baked` / `fx:engine`，复用实例的标签后缀为 `→ <共享名>`。写出 `validate/preview_exported_annotated.png` 和 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注），路径记在报告的 `exported_preview`。把它们交给用户。
 
@@ -1175,3 +1216,22 @@ PSNR 按整张导出画布计算（括号内是合并图可见范围）。现状
 把修前的数据重放给新检查：`layer_bounds_mismatch` 报出那个复制来的条目，`placement_offset` 报出选中格 `fits_at_shift: [1, 0]`（MAE 0.746 → 0.0）；修后两项都为 0。10.13 表里「2 行底图边缘差 1 px」很可能是同一类问题。
 
 **仍未覆盖：** 借用别的实例图的交替状态（另外两格的选中态、右格的普通态）只能按清单的框放，PSD 里没有对应图层可比；右格普通态在 PSD 里有一个隐藏层，可以改成单独导出。
+
+### 10.16 对着改过的参考图打分：问题没进决定、导出器被改（1.4.12）
+
+起因：一次盲测里，`validate` 分数很高，与真实设计比却很低。机械上发生了三件事：
+1. 审核阶段「某个可见图层是当前设计还是旧稿」只写在 notes / checklist 里，没进 `reuse_decisions`。用户回了一句「清单确认」，agent 把它当成选了「隐藏该层」。
+2. agent 复制了一份 `export_slices.psjs` 改掉几行，导出时把这个可见层隐藏，连 `validate` 用的 `full_render.png` 也是隐藏后导出的，所以校验是对着改过的参考图比。
+3. 一个合并多层的条目（`select_ids` 多层）被 `layer_bounds_mismatch` 误报：日志只量了 `layer_id` 那一层，清单框是并集。agent 也是靠改导出脚本绕过的。
+
+1.4.12 的修法都是机械检查，不依赖 agent 自觉：阻塞性问题必须结构化且由 `confirm --decision` 记录（`pending_user_decision`、锁文件 `decision_log`）；导出器原样使用并记录自己的哈希（`exporter_modified`）；打开时的可见性和整图时被隐藏的层都进日志（`visible_layer_hidden`），没被任何条目覆盖的可见像素层单独报（`visible_layer_unassigned`，即使 agent 没改脚本、只是漏切）；多图层条目按并集比边界。
+
+回归用合成数据（`examples/test_slicing_helper_decisions.py`），覆盖的用例类型：
+- 多图层条目：旧日志只有 `layer_id` 子框（落在并集内）不报；新日志的并集与清单框一致不报；并集或子框在别处（兄弟实例错用 `layer_id`）照报；单层条目仍按严格规则。
+- `confirm --note`：锁定清单但不写 `decided_by`；`not_user_decided` 含新类型并标 `blocking`；`--decision` 才写上并进 `decision_log`，重新锁定后日志保留；手写 `decided_by: "user"` 仍是 `pending_user_decision`。
+- 整图隐藏了打开时可见的层：无决定、抄 `default`、未进日志、回答为 `include` 都报 `visible_layer_hidden`；用户记录的 `exclude` 不报。
+- 可见像素层未被覆盖：报 `visible_layer_unassigned`；被父组条目、`select_ids` 或用户排除覆盖的不报；隐藏、空框、画板外、不透明度 0、调整层、隐藏组里的不报。
+- 导出器：缺记录、缺 `sha256`、哈希不符、缺 `layers_at_open`、`script_path` 上的文件被改过都报 `exporter_modified`；只改了 `CONFIG_URL`（含 CRLF）的副本不报；脚本内的 JS 哈希与 Python 结果一致（装了 node 时）。
+- 端到端：一句「清单确认」+ 隐藏可见层 → `pending_user_decision` + `visible_layer_hidden`，`ok:false`；用户经 `--decision` 选了排除 → `issues` 为空。
+
+尚未在 Photoshop 上重跑这次盲测；`layers_at_open` 在图层很多的文档上的耗时也还没量。
