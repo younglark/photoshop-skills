@@ -17,6 +17,8 @@ Subcommands:
   flatten     Turn an agent-written component manifest into a flat export entry list.
   infer       Optional keyword draft only (draft_manifest.json); the agent must review or replace it.
   preview     Redraw the annotated preview from a (possibly edited) manifest.
+  confirm     Lock the manifest after the user confirms it (manifest.confirmed.json + .sha256).
+  check-lock  Exit non-zero if the manifest changed after confirmation (run before export).
   build-layout  Merge confirmed manifest + Photoshop export log + PNGs into layout JSON.
   validate    Recomposite the default state vs a full PS render; also render alternate states.
 
@@ -27,6 +29,7 @@ attach them to interactive states. Unrelated hidden layers stay unused.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -2538,7 +2541,207 @@ def load_avatar_suspects(manifest=None, manifest_path=None):
     return []
 
 
-def check_avatar_splits(entries, decisions, suspects=None, tree=None):
+
+# ---------------------------------------------------------------------------
+# 1.4.9: thresholds (overridable via the project rules file), recorded user decisions,
+# manifest lock after confirmation.
+# ---------------------------------------------------------------------------
+
+DEFAULT_THRESHOLDS = {
+    # split part(s) recomposited vs the merged design (Photoshop pixels), dB
+    "split_match_psnr": 35.0,
+    # reused image vs each instance in the design, inside the shared image's opaque region
+    "reuse_max_mae": 4.0,
+    "reuse_max_pct_gt16": 1.0,
+}
+REUSE_ACCEPT_DECISIONS = {"reuse", "accept", "accepted", "reuse_accepted", "accept_mismatch", "accept_reuse"}
+PENDING_DECISIONS = {"", "pending", "wait_for_user", "none", "null"}
+
+
+def thresholds_from_rules(rules_data):
+    t = (rules_data or {}).get("thresholds") if isinstance(rules_data, dict) else None
+    return {k: float(v) for k, v in (t or {}).items() if k in DEFAULT_THRESHOLDS and v is not None}
+
+
+def thresholds_from_rules_file(path):
+    if not path or not Path(path).is_file():
+        return {}
+    try:
+        return thresholds_from_rules(json.loads(Path(path).read_text(encoding="utf-8")))
+    except Exception as exc:  # unreadable rules file: keep defaults, but say so
+        warn(f"thresholds: cannot read {path}: {exc}")
+        return {}
+
+
+def resolve_thresholds(*overlays):
+    """Later overlays win. Each overlay is a dict of threshold keys (None values ignored)."""
+    out = dict(DEFAULT_THRESHOLDS)
+    for o in overlays:
+        for k, v in (o or {}).items():
+            if k in DEFAULT_THRESHOLDS and v is not None:
+                out[k] = float(v)
+    return out
+
+
+def _decided(d):
+    v = d.get("decision")
+    return v is not None and str(v).strip().lower() not in PENDING_DECISIONS
+
+
+def user_decision_for(name, decisions, types, reuse_of=None, accept=None):
+    """A recorded (non-pending) user decision covering *name*, or None.
+
+    Only entries in reuse_decisions with a filled ``decision`` AND ``decided_by: "user"`` count (``confirm
+    --decision ID=VALUE`` records both). A decision filled with the option the agent proposed as ``default``
+    but not recorded as the user's, and a part's own flags (``reuse_accepted``, ``split_best_effort`` in
+    evidence), never do."""
+    for d in decisions or []:
+        if d.get("type") not in types or not _decided(d):
+            continue
+        if str(d.get("decided_by") or "").strip().lower() != "user":
+            continue
+        inst = d.get("instances") or []
+        hit = name in inst or (not inst and reuse_of and d.get("reuse_of") == reuse_of)
+        if not hit:
+            continue
+        if accept is not None and str(d.get("decision")).strip().lower() not in accept:
+            continue
+        return d
+    return None
+
+
+def manifest_lock_paths(manifest_path):
+    p = Path(manifest_path)
+    return p.with_name(p.stem + ".confirmed.json"), p.with_name(p.stem + ".confirmed.sha256")
+
+
+def file_sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def manifest_lock_state(manifest_path):
+    """{manifest, sha256, locked, confirmed_sha256, changed}. changed is True when a lock exists
+    and the manifest bytes differ from the confirmed copy."""
+    mp = Path(manifest_path)
+    copy, sha = manifest_lock_paths(mp)
+    st = {"manifest": str(mp), "sha256": file_sha256(mp) if mp.is_file() else None,
+          "locked": sha.is_file(), "confirmed_sha256": None, "confirmed_at": None, "changed": False}
+    if sha.is_file():
+        try:
+            info = json.loads(sha.read_text(encoding="utf-8"))
+        except Exception:
+            info = {"sha256": sha.read_text(encoding="utf-8").strip().split()[0]}
+        st["confirmed_sha256"] = info.get("sha256")
+        st["confirmed_at"] = info.get("confirmed_at")
+        st["changed"] = st["sha256"] != st["confirmed_sha256"]
+    return st
+
+
+MANIFEST_CHANGED_HINT = (
+    "the manifest was edited after the user confirmed it. Do not edit a confirmed manifest during "
+    "export / build-layout / validate: restore manifest.confirmed.json, write the wanted change to "
+    "manifest.proposal.json (what, why, evidence), and stop for the user to re-confirm (then run confirm again)."
+)
+
+
+def cmd_confirm(args):
+    path = Path(args.manifest)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    st = manifest_lock_state(path)
+    if st["locked"] and st["changed"] and not getattr(args, "relock", False):
+        print(json.dumps(dict(st, error="manifest_changed_after_confirm", hint=MANIFEST_CHANGED_HINT),
+                         ensure_ascii=False, indent=2))
+        return 3
+    status = manifest.get("status")
+    if status not in (None, "pending_review", "confirmed"):
+        raise SystemExit(f"manifest.status is {status!r}; only pending_review / confirmed can be confirmed")
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    manifest["status"] = "confirmed"
+    manifest["confirmed_at"] = stamp
+    if getattr(args, "note", None):
+        manifest["confirmed_note"] = args.note
+    decs = manifest.get("reuse_decisions") or []
+    by_id = {str(d.get("id")): d for d in decs if d.get("id") is not None}
+    recorded = []
+    for spec in getattr(args, "decision", None) or []:
+        if "=" not in spec:
+            raise SystemExit(f"--decision expects ID=VALUE, got {spec!r}")
+        did, val = (x.strip() for x in spec.split("=", 1))
+        if did not in by_id:
+            raise SystemExit(f"--decision: no reuse_decisions entry with id {did!r}")
+        by_id[did].update(decision=val, decided_by="user", decided_at=stamp)
+        recorded.append({"id": did, "decision": val})
+    pending = [{"id": d.get("id"), "type": d.get("type"), "default": d.get("default"),
+                "decision": d.get("decision")}
+               for d in decs if d.get("type") in ("split_avatar", "reuse")
+               and str(d.get("decided_by") or "").lower() != "user"]
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    copy, sha = manifest_lock_paths(path)
+    copy.write_bytes(path.read_bytes())
+    digest = file_sha256(path)
+    sha.write_text(json.dumps({"sha256": digest, "confirmed_at": stamp, "manifest": path.name,
+                               "note": getattr(args, "note", None)}, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"ok": True, "manifest": str(path), "sha256": digest, "confirmed_copy": str(copy),
+                      "lock": str(sha), "user_decisions_recorded": recorded,
+                      "not_user_decided": pending,
+                      "note": ("not_user_decided entries do not count for split_below_threshold / reuse over cap; "
+                               "only the user's own answer, recorded with --decision ID=VALUE, does")},
+                     ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_check_lock(args):
+    st = manifest_lock_state(args.manifest)
+    if st["changed"]:
+        print(json.dumps(dict(st, error="manifest_changed_after_confirm", hint=MANIFEST_CHANGED_HINT),
+                         ensure_ascii=False, indent=2))
+        return 3
+    if not st["locked"]:
+        print(json.dumps(dict(st, error="manifest_not_locked",
+                              hint="run `confirm` after the user confirms the manifest"), ensure_ascii=False, indent=2))
+        return 4
+    print(json.dumps(dict(st, ok=True), ensure_ascii=False, indent=2))
+    return 0
+
+
+def lock_issues(lock_info):
+    """validate issues from the manifest lock recorded in the layout (re-checked against the file)."""
+    if not lock_info or not lock_info.get("locked"):
+        return [{"type": "manifest_not_locked",
+                 "message": "no confirmed-manifest lock; run `confirm` after the user confirms, then build-layout"}]
+    cur = manifest_lock_state(lock_info["manifest"]) if lock_info.get("manifest") and Path(lock_info["manifest"]).is_file() else None
+    changed = bool(lock_info.get("changed")) or bool(cur and cur["changed"])
+    if changed:
+        return [{"type": "manifest_changed_after_confirm", "manifest": lock_info.get("manifest"),
+                 "confirmed_sha256": lock_info.get("confirmed_sha256"),
+                 "sha256": (cur or lock_info).get("sha256"), "hint": MANIFEST_CHANGED_HINT}]
+    return []
+
+
+def _evidence_psnr(ev):
+    """Photoshop-verified recomposite dB from split_evidence (None if only offline / prose)."""
+    if not isinstance(ev, dict):
+        return None, None
+    vals = []
+    for key in ("verified_psnr", "recomposite_psnr"):
+        if isinstance(ev.get(key), (int, float)):
+            vals.append((float(ev[key]), key))
+    sf = ev.get("split_fix")
+    if isinstance(sf, dict):
+        m = (sf.get("match") or {}).get("psnr")
+        if isinstance(m, (int, float)):
+            vals.append((float(m), "split_fix.match"))
+        sw = sf.get("swap_min_psnr")
+        if isinstance(sw, (int, float)):
+            vals.append((float(sw), "split_fix.swap_min_psnr"))
+    if isinstance(ev.get("swap_min_psnr"), (int, float)):
+        vals.append((float(ev["swap_min_psnr"]), "swap_min_psnr"))
+    if not vals:
+        return None, None
+    return min(vals)
+
+
+def check_avatar_splits(entries, decisions, suspects=None, tree=None, thresholds=None):
     """Issues for the avatar/frame rule: try a split first, ask the user only after it fails.
 
     - split_avatar_merged_default: a split_avatar decision defaults to exporting merged.
@@ -2548,6 +2751,7 @@ def check_avatar_splits(entries, decisions, suspects=None, tree=None):
       placeholder, smart-object split without hide_inner, pixel estimate not marked approximate).
     """
     issues = []
+    thr = resolve_thresholds(thresholds)
     decided = set()
     for d in decisions or []:
         if d.get("type") != "split_avatar":
@@ -2580,6 +2784,18 @@ def check_avatar_splits(entries, decisions, suspects=None, tree=None):
                            "message": "smart_object_contents needs split.hide_inner (see split-avatar output)"})
         if method in APPROXIMATE_SPLIT_METHODS and not (e.get("split_approximate") or (e.get("split_evidence") or {}).get("approximate")):
             issues.append({"type": "split_approximate_unmarked", "name": name})
+        ev = e.get("split_evidence") or {}
+        if role in ("frame", "avatar") and isinstance(ev, dict) and not user_decision_for(name, decisions, {"split_avatar"}):
+            gate = thr["split_match_psnr"]
+            db, src = _evidence_psnr(ev)
+            if db is not None and db < gate:
+                issues.append({"type": "split_below_threshold", "name": name, "psnr_db": round(db, 2), "source": src,
+                               "threshold_psnr": gate, "message": SPLIT_BELOW_HINT})
+            elif db is None and ev.get("status") == "candidate_unverified":
+                issues.append({"type": "split_unverified", "name": name, "threshold_psnr": gate,
+                               "message": "split-avatar said candidate_unverified: export merged / frame / content in "
+                                          "Photoshop, measure (split-fix) and record split_evidence.verified_psnr, or stop "
+                                          "and ask the user with a split_avatar decision"})
     desc = _descendant_ids(tree) if tree else {}
     for s in suspects or []:
         sid = s.get("layer_id")
@@ -2599,6 +2815,15 @@ def check_avatar_splits(entries, decisions, suspects=None, tree=None):
                            "message": "avatar picture and frame are exported as one image; run split-avatar and "
                                       "split, or add a split_avatar decision with attempts and compare_image"})
     return issues
+
+
+SPLIT_BELOW_HINT = (
+    "split recomposite is below the threshold. 1) Ownership default: outer effects around the content "
+    "(drop shadow, outer glow, stroke) belong to the frame: bake them into the frame part, never onto the "
+    "content or into the frame's hole. 2) Still failing: localize by toggling effects layer by layer and pick a fix "
+    "(references/slicing.md). 3) Still below: STOP and ask the user with a split_avatar decision (attempts, dB, "
+    "compare_image). Never mark it best-effort / accepted yourself."
+)
 
 
 def frame_from_instance(merged_layer, frame_layer, out_dir, tol=24):
@@ -3335,7 +3560,9 @@ def check_split_effects(entries, tree=None):
         role = (e.get("part_role") or e.get("role") or "").lower()
         if not e.get("split_method") or role != "frame":
             continue
-        handled = e.get("split_fix") or (e.get("split") or {}).get("outer_effects") or (e.get("split_evidence") or {}).get("effects_checked")
+        # 1.4.9: only a recorded fix counts (split_fix, or split.outer_effects saying who owns them);
+        # a prose effects_checked note does not.
+        handled = e.get("split_fix") or (e.get("split") or {}).get("outer_effects")
         if handled or not idx:
             continue
         owners = []
@@ -3363,9 +3590,9 @@ def check_split_effects(entries, tree=None):
             if fx:
                 issues.append({"type": "outer_effect_into_hole", "name": name, "owner_layer_id": oid, "effects": fx,
                                "message": "the owner of both sides has edge effects; the frame-only export redraws them "
-                                          "along the hole (e.g. shadow frozen into the frame). Use split-fix "
-                                          "(frame_from_merged + overlays) and record split_fix, or the measured "
-                                          "split_evidence.effects_checked"})
+                                          "along the hole (e.g. shadow frozen into the frame). Default ownership: outer "
+                                          "effects around the content belong to the frame, baked outside the hole (e.g. "
+                                          "split-fix two_part_approx). Record split_fix or split.outer_effects: \"frame\""})
     return issues
 
 
@@ -4098,7 +4325,8 @@ def cmd_flatten(args):
     decisions = manifest.get("reuse_decisions") or []
     pending = [d.get("id") or d.get("instances") for d in decisions if not d.get("decision") or d.get("decision") == "pending"]
     tree_for_checks = load_layer_tree(manifest, path)
-    avatar_issues = check_avatar_splits(entries, decisions, load_avatar_suspects(manifest, path), tree_for_checks)
+    thr = resolve_thresholds(thresholds_from_rules_file(manifest.get("naming_rules_file")))
+    avatar_issues = check_avatar_splits(entries, decisions, load_avatar_suspects(manifest, path), tree_for_checks, thr)
     frame_issues = check_frame_bakes(entries, tree_for_checks)
     avatar_issues = avatar_issues + check_split_effects(entries, tree_for_checks)
     summary = {
@@ -4383,6 +4611,14 @@ def place_reused_instances(nodes):
 
 
 def cmd_build_layout(args):
+    lock = manifest_lock_state(args.manifest)
+    if lock["changed"]:
+        print(json.dumps(dict(lock, error="manifest_changed_after_confirm", hint=MANIFEST_CHANGED_HINT),
+                         ensure_ascii=False, indent=2))
+        print("error: manifest_changed_after_confirm; layout not written", file=sys.stderr, flush=True)
+        return 3
+    if not lock["locked"]:
+        warn("manifest is not locked (run `confirm` after the user confirms); validate will report manifest_not_locked")
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     export = json.loads(Path(args.export_log).read_text(encoding="utf-8"))
     slices_dir = Path(args.slices_dir)
@@ -4527,6 +4763,8 @@ def cmd_build_layout(args):
         "effect_groups": effect_groups,
         "effect_issues": effect_issues,
         "reuse_decisions": manifest.get("reuse_decisions") or [],
+        "manifest_lock": lock,
+        "thresholds": resolve_thresholds(thresholds_from_rules_file(manifest.get("naming_rules_file"))),
         "avatar_merge_suspects": [
             {"layer_id": s_.get("layer_id"), "name": s_.get("name")} for s_ in load_avatar_suspects(manifest, Path(args.manifest))
         ],
@@ -5207,21 +5445,87 @@ def write_state_previews(layout, slices_dir, canvas_size, out_dir, fonts_dir=Non
     return written
 
 
-def reuse_region_checks(layout, ref, rec, mask, out_dir, tol_mae=4.0, tol_pct=1.0):
-    """Per-instance diff for nodes that share an image. Returns (mismatches, accepted, checked)."""
+def _node_opaque_mask(node, slices_dir, region_wh, thr=128):
+    """Opaque region (alpha >= thr) of the node's own image, placed at its visible box. None if unknown."""
+    if not slices_dir or not node.get("image"):
+        return None
+    path = Path(slices_dir) / node["image"]
+    if not path.is_file():
+        return None
+    a = np.asarray(Image.open(path).convert("RGBA"))[..., 3]
+    w, h = region_wh
+    out = np.zeros((h, w), dtype=bool)
+    hh, ww = min(h, a.shape[0]), min(w, a.shape[1])
+    out[:hh, :ww] = a[:hh, :ww] >= thr
+    return out
+
+
+def _covered_above(nodes, idx, box, slices_dir):
+    """Pixels of ``box`` (l, t, r, b canvas coords) touched by nodes painted after ``nodes[idx]``: any non-zero
+    alpha of their image (grown by 1 px for resampling), else their visible box (text nodes use their box).
+    Error there belongs to the upper node, not to this one."""
+    l, t, r, bt = box
+    cov = np.zeros((bt - t, r - l), dtype=bool)
+    for up in nodes[idx + 1:]:
+        b = up.get("visible_bounds") or up.get("logical_bounds")
+        if not b:
+            continue
+        L, T = int(round(b["left"])), int(round(b["top"]))
+        R, B = int(round(b["right"])), int(round(b["bottom"]))
+        il, it, ir, ib = max(l, L), max(t, T), min(r, R), min(bt, B)
+        if ir <= il or ib <= it:
+            continue
+        m = None
+        if not is_attr_text(up.get("kind")) and not up.get("nine_slice"):
+            m = _node_opaque_mask(up, slices_dir, (R - L, B - T), thr=1)
+            if m is not None:
+                g = m.copy()
+                g[1:] |= m[:-1]; g[:-1] |= m[1:]; g[:, 1:] |= m[:, :-1]; g[:, :-1] |= m[:, 1:]
+                m = g
+        if m is None:
+            cov[it - t:ib - t, il - l:ir - l] = True
+        else:
+            cov[it - t:ib - t, il - l:ir - l] |= m[it - T:ib - T, il - L:ir - L]
+    return cov
+
+
+def reuse_region_checks(layout, ref, rec, mask, out_dir, tol_mae=None, tol_pct=None, slices_dir=None,
+                        decisions=None):
+    """Per-instance diff for nodes that share an image. Returns (mismatches, accepted, checked).
+
+    Metric (1.4.9): inside the shared image's opaque region (alpha >= 128, minus attribute-text / unemulated
+    effect masks, minus pixels covered by nodes painted above it -- their error is theirs): MAE (0-255, RGB) and % of pixels whose max channel diff > 16. Over either cap is a
+    ``reuse_mismatch`` issue. ``reuse_accepted`` alone (an agent flag) does not bypass the cap; only a
+    reuse_decisions entry with a recorded user ``decision`` (reuse / accept ...) moves it to accepted."""
+    tol_mae = DEFAULT_THRESHOLDS["reuse_max_mae"] if tol_mae is None else tol_mae
+    tol_pct = DEFAULT_THRESHOLDS["reuse_max_pct_gt16"] if tol_pct is None else tol_pct
+    decisions = decisions if decisions is not None else (layout.get("reuse_decisions") or [])
     ch, cw = ref.shape[0], ref.shape[1]
     mismatches, accepted, checked = [], [], []
-    for node in layout.get("nodes") or []:
+    nodes = layout.get("nodes") or []
+    for idx, node in enumerate(nodes):
         if not node.get("reuse_of") or is_attr_text(node.get("kind")):
             continue
         b = node.get("visible_bounds") or node.get("logical_bounds")
         if not b:
             continue
-        l, t, r, bt = [int(round(v)) for v in (b["left"], b["top"], b["right"], b["bottom"])]
-        l, t, r, bt = max(0, l), max(0, t), min(cw, r), min(ch, bt)
+        L, T = int(round(b["left"])), int(round(b["top"]))
+        R, B = int(round(b["right"])), int(round(b["bottom"]))
+        l, t, r, bt = max(0, L), max(0, T), min(cw, R), min(ch, B)
         if r <= l or bt <= t:
             continue
         keep = ~mask[t:bt, l:r] if mask is not None else np.ones((bt - t, r - l), dtype=bool)
+        opaque = None if node.get("nine_slice") else _node_opaque_mask(node, slices_dir, (R - L, B - T))
+        region = "visible_bounds"
+        if opaque is not None:
+            sub = opaque[t - T:bt - T, l - L:r - L]
+            if sub.shape == keep.shape and (keep & sub).any():
+                keep = keep & sub
+                region = "opaque_alpha>=128"
+        above = _covered_above(nodes, idx, (l, t, r, bt), slices_dir)
+        if above.any() and (keep & ~above).any():
+            keep = keep & ~above
+            region += ",not_covered_above"
         if not keep.any():
             continue
         aa = ref[t:bt, l:r, :3].astype(np.int16)[keep]
@@ -5231,8 +5535,10 @@ def reuse_region_checks(layout, ref, rec, mask, out_dir, tol_mae=4.0, tol_pct=1.
             "name": node["name"],
             "reuse_of": node["reuse_of"],
             "bounds": [l, t, r, bt],
+            "region": region,
             "mae": round(float(d.mean()), 3),
             "pct_px_diff_gt16": round(float((d.max(axis=-1) > 16).mean() * 100), 3),
+            "cap": {"mae": tol_mae, "pct_px_diff_gt16": tol_pct},
         }
         checked.append(row)
         if row["mae"] <= tol_mae and row["pct_px_diff_gt16"] <= tol_pct:
@@ -5243,14 +5549,68 @@ def reuse_region_checks(layout, ref, rec, mask, out_dir, tol_mae=4.0, tol_pct=1.
             titles=("design (PS)", "shared image", "diff x3"),
         )
         row["compare_image"] = str(img) if img else None
-        if node.get("reuse_accepted"):
-            accepted.append(row)
-        else:
-            mismatches.append(dict(row, type="reuse_mismatch", hint=(
-                "Reused image differs from the design here. First suspect the reuse analysis and export this "
-                "instance separately; if logical evidence still says reuse, add a reuse_decisions entry for the user."
-            )))
+        d_user = user_decision_for(node["name"], decisions, {"reuse"}, reuse_of=node.get("reuse_of"),
+                                   accept=REUSE_ACCEPT_DECISIONS)
+        if d_user:
+            accepted.append(dict(row, decision_id=d_user.get("id"), decision=d_user.get("decision")))
+            continue
+        extra = {"reuse_accepted_by_agent_only": True} if node.get("reuse_accepted") else {}
+        mismatches.append(dict(row, type="reuse_mismatch", **extra, hint=(
+            "Reused image differs from the design here (over the cap). First suspect the reuse analysis and export "
+            "this instance separately; if logical evidence still says reuse, add a reuse_decisions entry for the "
+            "user. reuse_accepted set without a recorded user decision does not count.")))
     return mismatches, accepted, checked
+
+
+def split_region_checks(layout, ref, rec, mask, out_dir, threshold=None, decisions=None):
+    """Measured split check (1.4.9): for each component with split parts in the default state, compare the
+    recomposite of the exported parts with the Photoshop render over the union of their visible boxes
+    (attribute-text / unemulated masks excluded). Below the threshold -> ``split_below_threshold``
+    unless a split_avatar decision with a recorded user decision covers one of its parts."""
+    threshold = DEFAULT_THRESHOLDS["split_match_psnr"] if threshold is None else threshold
+    decisions = decisions if decisions is not None else (layout.get("reuse_decisions") or [])
+    ch, cw = ref.shape[0], ref.shape[1]
+    groups = {}
+    for node in layout.get("nodes") or []:
+        if not node.get("split_method") or is_attr_text(node.get("kind")):
+            continue
+        b = node.get("visible_bounds") or node.get("logical_bounds")
+        if not b:
+            continue
+        groups.setdefault(node.get("component_id") or node["name"], []).append(node)
+    bad, accepted, checked = [], [], []
+    for cid, nodes in groups.items():
+        roles = {(n.get("part_role") or n.get("role") or "").lower() for n in nodes}
+        if "frame" not in roles:
+            continue  # a lone placeholder is the merged image itself; nothing was split here
+        l = max(0, int(min(n["visible_bounds"]["left"] for n in nodes if n.get("visible_bounds"))))
+        t = max(0, int(min(n["visible_bounds"]["top"] for n in nodes if n.get("visible_bounds"))))
+        r = min(cw, int(max(n["visible_bounds"]["right"] for n in nodes if n.get("visible_bounds"))))
+        bt = min(ch, int(max(n["visible_bounds"]["bottom"] for n in nodes if n.get("visible_bounds"))))
+        if r <= l or bt <= t:
+            continue
+        m = mask[t:bt, l:r] if mask is not None else None
+        met = metrics(ref[t:bt, l:r], rec[t:bt, l:r], m)
+        if not met:
+            continue
+        row = {"component_id": cid, "names": [n["name"] for n in nodes], "bounds": [l, t, r, bt],
+               "psnr_db": met["psnr_db"], "mae": met["mae"], "pct_px_diff_gt16": met["pct_px_diff_gt16"],
+               "threshold_psnr": threshold}
+        checked.append(row)
+        if met["psnr_db"] >= threshold:
+            continue
+        img = write_compare_sheet([(f"{cid} {met['psnr_db']} dB", Image.fromarray(ref[t:bt, l:r]),
+                                    Image.fromarray(rec[t:bt, l:r]))],
+                                  Path(out_dir) / "splits" / f"{slugify(str(cid))}.png",
+                                  titles=("design (PS)", "exported parts", "diff x3"))
+        row["compare_image"] = str(img) if img else None
+        d_user = next((user_decision_for(n, decisions, {"split_avatar"}) for n in row["names"]
+                       if user_decision_for(n, decisions, {"split_avatar"})), None)
+        if d_user:
+            accepted.append(dict(row, decision_id=d_user.get("id"), decision=d_user.get("decision")))
+        else:
+            bad.append(dict(row, type="split_below_threshold", message=SPLIT_BELOW_HINT))
+    return bad, accepted, checked
 
 
 def layout_nodes_as_preview_entries(nodes):
@@ -5396,8 +5756,14 @@ def cmd_validate(args):
     if not effect_groups and (layout.get("layer_tree") or layout.get("tree")):
         effect_groups = effect_groups_from_tree(layout.get("layer_tree") or layout.get("tree"))
     issues.extend(find_silent_effect_loss(layout["nodes"], effect_groups))
+    thr = resolve_thresholds(layout.get("thresholds"),
+                             thresholds_from_rules_file(getattr(args, "rules", None)),
+                             {"split_match_psnr": getattr(args, "split_threshold", None),
+                              "reuse_max_mae": getattr(args, "reuse_tol_mae", None),
+                              "reuse_max_pct_gt16": getattr(args, "reuse_tol_pct", None)})
+    issues.extend(lock_issues(layout.get("manifest_lock")))
     issues.extend(check_avatar_splits(layout["nodes"], layout.get("reuse_decisions") or [],
-                                      layout.get("avatar_merge_suspects") or [], layout.get("tree") or None))
+                                      layout.get("avatar_merge_suspects") or [], layout.get("tree") or None, thr))
     issues.extend(check_frame_bakes(layout["nodes"], layout.get("tree") or None))
     issues.extend(check_split_effects(layout["nodes"], layout.get("tree") or None))
 
@@ -5484,9 +5850,15 @@ def cmd_validate(args):
     state_previews = write_state_previews(layout, slices_dir, (w, h), out_dir, fonts_dir=fonts_dir)
     reuse_bad, reuse_ok, reuse_checked = reuse_region_checks(
         default_layout, ref, rec_m, masked_all, out_dir,
-        tol_mae=getattr(args, "reuse_tol_mae", 4.0) or 4.0, tol_pct=getattr(args, "reuse_tol_pct", 1.0) or 1.0,
+        tol_mae=thr["reuse_max_mae"], tol_pct=thr["reuse_max_pct_gt16"], slices_dir=slices_dir,
+        decisions=layout.get("reuse_decisions") or [],
     )
     issues.extend(reuse_bad)
+    split_bad, split_ok, split_checked = split_region_checks(
+        default_layout, ref, rec_m, masked_all, out_dir, threshold=thr["split_match_psnr"],
+        decisions=layout.get("reuse_decisions") or [],
+    )
+    issues.extend(split_bad)
     exported_preview = write_exported_preview(default_layout, rec_text, full.crop((0, 0, cw, ch)), out_dir)
 
     rendered = sum(1 for p in placed_text if p.get("rendered"))
@@ -5535,6 +5907,10 @@ def cmd_validate(args):
         "exported_preview": exported_preview,
         "reuse_checked": reuse_checked,
         "reuse_mismatch_accepted": reuse_ok,
+        "split_checked": split_checked,
+        "split_below_threshold_user_accepted": split_ok,
+        "thresholds": thr,
+        "manifest_lock": layout.get("manifest_lock"),
         "reuse_decisions": layout.get("reuse_decisions") or [],
         "state_previews": [
             {k: v for k, v in item.items() if k != "activation"} | {"activation": item["activation"]}
@@ -5557,6 +5933,12 @@ def cmd_validate(args):
             "on dynamic_text / static_text is expected. For pixel-identical text, rasterise the text layers in Photoshop.",
             "visible_bounds use post-trim insets (before.left - after.left) so the PNG origin matches the tight opaque box.",
             "Alternate states are written to validate/states/<component>_<state>.png for visual check, not measured against the default render.",
+            "split_checked: exported split parts recomposited vs the PS render over their union box; below "
+            "thresholds.split_match_psnr is an issue unless a user decision is recorded (split_avatar).",
+            "reuse_checked: MAE / % px diff>16 inside the shared image's opaque region; over the cap is an issue unless "
+            "a user decision is recorded in reuse_decisions (reuse_accepted alone does not count).",
+            "manifest_lock: build-layout records the confirmed-manifest lock; a change after confirmation is "
+            "manifest_changed_after_confirm.",
         ],
         "issues": issues,
         "placed": len(placed_text),
@@ -5646,6 +6028,18 @@ def build_parser():
     s.add_argument("--ref-is-document", action="store_true", help="Ref is full-document sized, not artboard-cropped")
     s.set_defaults(func=cmd_preview)
 
+    s = sub.add_parser("confirm", help="After the user confirms: set status confirmed and lock the manifest")
+    s.add_argument("--manifest", required=True)
+    s.add_argument("--note", default=None, help="Who confirmed / what (kept in the lock file)")
+    s.add_argument("--relock", action="store_true", help="Re-lock after the user re-confirmed a changed manifest")
+    s.add_argument("--decision", action="append", default=[], metavar="ID=VALUE",
+                   help="Record the user's own answer to a reuse_decisions entry (decided_by=user); repeatable")
+    s.set_defaults(func=cmd_confirm)
+
+    s = sub.add_parser("check-lock", help="Exit 3 if the manifest changed after confirm, 4 if not locked")
+    s.add_argument("--manifest", required=True)
+    s.set_defaults(func=cmd_check_lock)
+
     s = sub.add_parser("build-layout", help="Build engine-agnostic layout JSON from export results")
     s.add_argument("--manifest", required=True)
     s.add_argument("--export-log", required=True)
@@ -5678,8 +6072,14 @@ def build_parser():
     s.add_argument("--no-snap-glyph-origin", dest="snap_glyph_origin", action="store_false",
                    help="Keep sub-pixel glyph positions")
     s.add_argument("--group-effects", default=None, help="Optional group_effects.json for the silent effect-loss check")
-    s.add_argument("--reuse-tol-mae", type=float, default=4.0, help="Per-instance MAE above which a reused image is a reuse_mismatch")
-    s.add_argument("--reuse-tol-pct", type=float, default=1.0, help="Per-instance %% of pixels with diff > 16 above which it is a reuse_mismatch")
+    s.add_argument("--reuse-tol-mae", type=float, default=None,
+                   help="Override thresholds.reuse_max_mae (default 4): per-instance MAE cap for a reused image")
+    s.add_argument("--reuse-tol-pct", type=float, default=None,
+                   help="Override thresholds.reuse_max_pct_gt16 (default 1): per-instance %% of pixels with diff > 16")
+    s.add_argument("--split-threshold", type=float, default=None,
+                   help="Override thresholds.split_match_psnr (default 35 dB) for split parts vs the PS render")
+    s.add_argument("--rules", default=None,
+                   help="Project rules JSON; its \"thresholds\" object overrides the defaults (CLI flags win)")
     s.set_defaults(func=cmd_validate)
     return p
 

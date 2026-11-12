@@ -219,7 +219,10 @@ class TestCheckSplitEffects(unittest.TestCase):
         self.assertEqual(iss[0]["owner_layer_id"], 10)
         self.assertEqual(h.check_split_effects([dict(e, split_fix="frame_from_merged")], self.TREE), [])
         self.assertEqual(h.check_split_effects([dict(e, split_fix="two_part_approx")], self.TREE), [])
-        self.assertEqual(h.check_split_effects([dict(e, split_evidence={"effects_checked": True})], self.TREE), [])
+        # 1.4.9: a prose effects_checked note no longer counts; ownership must be recorded
+        self.assertEqual([i["type"] for i in h.check_split_effects([dict(e, split_evidence={"effects_checked": True})], self.TREE)],
+                         ["outer_effect_into_hole"])
+        self.assertEqual(h.check_split_effects([dict(e, split={"hide_inner": [1], "outer_effects": "frame"})], self.TREE), [])
 
     def test_common_group_owner_and_blend_modes(self):
         fr = {"name": "c_frame", "part_role": "frame", "split_method": "mask_or_clip_layers", "layer_id": 22,

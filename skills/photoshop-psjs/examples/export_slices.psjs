@@ -470,7 +470,23 @@ try {
   await flush();
 
   const manifestFile = await rootDir.getEntry(MANIFEST_NAME);
-  const manifest = JSON.parse(await manifestFile.read());
+  const manifestText = await manifestFile.read();
+  // 1.4.9 manifest lock: `slicing_helper.py confirm` writes <stem>.confirmed.json (byte copy).
+  // A different manifest text means it was edited after the user confirmed it: refuse to export.
+  const lockName = MANIFEST_NAME.replace(/\.json$/i, "") + ".confirmed.json";
+  let lockedText = null;
+  try {
+    const lockFile = await rootDir.getEntry(lockName);
+    lockedText = await lockFile.read();
+  } catch (errLock) {
+    lockedText = null;
+  }
+  log.manifest_locked = lockedText !== null;
+  if (lockedText !== null && lockedText !== manifestText) {
+    throw new Error("manifest_changed_after_confirm: " + MANIFEST_NAME + " differs from " + lockName +
+      "; restore the confirmed manifest, write manifest.proposal.json and ask the user to re-confirm");
+  }
+  const manifest = JSON.parse(manifestText);
   if (manifest.status && manifest.status !== "confirmed" && manifest.status !== "pending_review") {
     // pending_review is allowed only when the operator explicitly treats the auto manifest as confirmed.
     throw new Error("manifest.status must be confirmed (or pending_review for an authorized test run)");

@@ -12,8 +12,8 @@
 4. **区分状态变体和旧稿。** 主体/内容不变、只改明度、描边、发光、配色或缩放的，是状态变体，可以导出。同一槽位但换了内容或徽记的，当旧稿忽略。内容或母题对不上、吃不准时才写 `uncertain_hidden`，并附上两侧裁切图。
 5. **只给会随状态变化的零件记 missing。** 以同组里状态最完整的那一项为模板（例如某选中项有 base + highlight + label），每个缺少其中一件的兄弟项都要列出，**包括 highlight**。不要因为共用图标没有另一态就标 missing。单个特殊样式的列表行（例如 self 高亮行）只是这一行的一个实例：不要给其它行推断缺失的 self，也不要给这一行推断缺失的 normal，除非设计里每行都有成套变体。
 6. **判断重复元素是否复用（见下文「重复元素：复用还是分开」）。** 先按 UI 用途和常识（游戏 UI 先验）加上 `reuse_candidates.json` 的证据，从逻辑上判断是否该共用一张图；该复用就用 `reuse_of` 指向同一张共享图。再对照效果图：复用后与设计对不上，先怀疑分析错了，只把对不上的实例拆出去单独导出；逻辑证据很强却对不上，写进 `reuse_decisions` 交用户决定。头像图与头像框必须分开：PSD 里合在一起时，**先自己按下文「头像与框合在一起：先拆，拆不开再问」尝试拆开**，拆完用框 + 占位头像重新拼合并和效果图对比；对得上就按拆分导出；对不上时先按「拆开后拼回去对不上：先定位效果，再决定问不问」逐层关效果定位、按两张修法重做并验证（换内容后约 35 dB，见 10.11），只有拆不开、修不好或属于适用边界之外才写 `reuse_decisions`（`type: split_avatar`）交用户，附上哪一层、为什么、修法和 dB 以及对比图。面板、弹窗、卡片、按钮底等 frame 类元素同理：**默认按视觉层次拆成可九宫 / 三宫 / 复用的部件**（见下文「frame 类元素：按视觉层次拆，九宫与装饰」），整张烘焙只在拆不开或拆后对不上时使用，并写 `bake_reason`。
-7. **写好审核清单后停下。** 跑 `flatten` + `preview`，`status` 保持 `pending_review`，等用户改 JSON 确认后再导出。
-8. **确认后一口气跑完，不要停在导出。** 导出 → `build-layout` → `validate` 是一个整体；`export_log.json` 写出不算完成，只有 `validate/validate_report.json` 写出并读过 `issues`（含 `group_effect_lost`）、遮罩 PSNR / ΔE 后才算完成。`validate` 的最后一步用**实际导出的 PNG** 拼出默认态并画上标注，写出 `validate/preview_exported_annotated.png` 与 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注）；把这两张图作为最终成果交给用户。第 7 步导出前的审核预览不变。若 `issues` 里有 `reuse_mismatch`，按第 6 步处理（拆出单独导出，或交用户决定）后重跑。每条长命令都设超时并把输出写进日志；某步超时或报错时，读日志、修正后重跑这一步，不要静默结束。
+7. **写好审核清单后停下。** 跑 `flatten` + `preview`，`status` 保持 `pending_review`，等用户改 JSON 确认后再导出。用户确认后跑 `confirm` 锁定清单（见第 6 节）；**锁定后不要再改 manifest**，要改就写 `manifest.proposal.json` 并停下等用户重新确认。
+8. **确认后一口气跑完，不要停在导出。** 导出 → `build-layout` → `validate` 是一个整体；`export_log.json` 写出不算完成，只有 `validate/validate_report.json` 写出并读过 `issues`（含 `group_effect_lost`）、遮罩 PSNR / ΔE 后才算完成。`validate` 的最后一步用**实际导出的 PNG** 拼出默认态并画上标注，写出 `validate/preview_exported_annotated.png` 与 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注）；把这两张图作为最终成果交给用户。第 7 步导出前的审核预览不变。若 `issues` 里有 `reuse_mismatch`，按第 6 步处理（拆出单独导出，或交用户决定）后重跑。每条长命令都设超时并把输出写进日志；某步超时或报错时，读日志、修正后重跑这一步，不要静默结束。 `issues` 里的问题不能靠 agent 自己写个「接受」标记消掉（`reuse_accepted`、`split_best_effort`、`effects_checked` 之类的说明都不算）：按对应规则修，修不好就停下，把对比图和数字交给用户，等用户在 `reuse_decisions` 里填 `decision`。
 
 选中槽上的隐藏层：若它落在**当前选中项**的槽里，并且是同一主体、只是加了发光或高亮样式，应作为该态的 `highlight`。若默认态就是这一项被选中，即使该高亮层在 PSD 里仍是隐藏的，也要纳入默认选中态，否则拼图会缺一层。只有内容或徽记对不上时，才用 `uncertain_hidden`。
 
@@ -47,7 +47,9 @@
 
 1. **先从逻辑上判断。** 结合 UI 用途、游戏开发常识和结构证据（同一智能对象/链接源、同尺寸、同九宫格、重复组件里的同一角色、同名模式），判断这些实例是否本该共用一张资源（例如由代码实例化的列表行底、多处同一图标）。该复用就只导出**一张**：每个实例的 part 写 `reuse_of: <共享名>`，布局 JSON 里每个实例仍有自己的节点、位置和边界，只是 `image` 指向同一张图。共享名去掉实例序号（如 `<module>_bg_row`，不是 `<module>_bg_row1`）。
 2. **再对照效果图。** 复用后拼图在某实例区域与设计不一致（颜色、尺寸、效果、内容等逐实例不同，超出容差），先怀疑分析错了：只把不一致的实例改成单独导出（去掉 `reuse_of`），一致的仍可共用。`prepare` 的 `reuse_candidates.json` 和 `validate` 的 `reuse_mismatch` 都给出逐实例差异。
-3. **有逻辑证据却对不上时，不要默默决定。** 写进清单顶层 `reuse_decisions`，附对比图（每个实例：设计裁切 | 共享图 | 差异）、问题描述和证据，交用户决定。决定前默认单独导出，并标明待决定。用户确认按复用处理的实例写 `reuse_accepted: true`，校验时差异改记在 `reuse_mismatch_accepted`，不再算问题。
+3. **有逻辑证据却对不上时，不要默默决定。** 写进清单顶层 `reuse_decisions`，附对比图（每个实例：设计裁切 | 共享图 | 差异）、问题描述和证据，交用户决定。决定前默认单独导出，并标明待决定。只有该条 `reuse_decisions` 记着用户本人的回答（`decision` 为 `reuse` / `accept` 等，且 `decided_by: "user"`，由 `confirm --decision ID=VALUE` 写入）的实例，校验时差异才改记在 `reuse_mismatch_accepted`；agent 把 `default` 抄进 `decision`、或用户只回了一句「清单确认」都不算用户回答了这一条；agent 自己给 part 写 `reuse_accepted: true` 不算，超过上限照样是 `reuse_mismatch`（报告里带 `reuse_accepted_by_agent_only`）。
+
+**复用误差上限（1.4.9）：** 在共享图的不透明区域（alpha ≥ 128，去掉属性文字、无法模拟的效果区，以及被它上面绘制的节点盖住的像素——那里的误差算上层节点的）内比较设计与拼图：MAE（RGB，0–255）不超过 `reuse_max_mae`（默认 4），且通道最大差 > 16 的像素占比不超过 `reuse_max_pct_gt16`（默认 1%）。默认偏保守；项目规则文件的 `thresholds` 可以改，`validate --reuse-tol-mae / --reuse-tol-pct` 可临时覆盖。超过上限按上面第 2、3 步走：先怀疑复用判断，把这个实例拆出去单独导出；逻辑证据很强才交用户决定。
 
 **游戏 UI 常见先验**（默认判断，像素对照可以推翻，冲突交用户）：
 
@@ -68,10 +70,13 @@
 3. **框从同类未合并的实例复用（`frame_from_instance`）。** 别处（同画板或其它画板、规范页）有只含框的同款层时，框用它导出并写 `reuse_of`；头像区域用 `split-avatar --frame-instance 合并层id:框层id` 按像素差估出（`approximate: true`），占位头像可以导出合并层本身（叠在框下，运行时被替换），并记下估计的头像框 `avatar_rect_estimate`。
 4. **按像素 / 形状分析生成遮罩（`pixel_mask_estimate`）。** 只剩这一种时才用，结果必须标 `split_approximate: true`（或 `split_evidence.approximate: true`）。
 
+**效果归属的默认判断（常识，先于任何修法）。** 框（头像框、标题框、徽章框……）和它框住的动态内容（头像、标题文字、徽章）叠在一起时，落在内容外侧或四周、不依赖内容的外部效果（投影、外发光、外描边等）默认**属于框**：烘进框这一张图，不要挂在内容部件上，也不要漏进框的洞里（拆开后最常见的错误是投影/外发光沿洞的内缘被固化进框，盖到内容上变成暗圈）。这只是默认判断，具体怎么做到用手头的工具（例如 `split-fix` 的两张近似，或用设计给出的单独框资源）；判断依据和做法记在框 part 的 `split_fix` 或 `split.outer_effects: "frame"`。
+
 **拆完必须验证。** 用框 + 占位头像按绘制顺序重新拼合，与效果图（合并层的 Photoshop 导出或 `full_render.png` 的同一区域）对比：
 
 - 一致：直接按拆分导出。头像 part `role: avatar`、`placeholder: true`；框 part 可复用（`reuse_of`）。两者都写 `split_method`、`split`（智能对象时）和 `split_evidence`（对比结果、对比图路径、所用工具）。`validate` 最后还会按实际导出的 PNG 拼合再比一次。
-- 拆后对不上：先按下文「拆开后拼回去对不上」逐层定位效果并尝试修法（默认只出框 + 内容两张，框侧效果近似进 `frame.png`），占位内容和换过的内容都达到约 35 dB 就按两张导出。
+- 拆后对不上（低于 `split_match_psnr`，默认 35 dB）：先套用上面的效果归属默认判断；还对不上，再按下文「拆开后拼回去对不上」逐层关效果定位、选修法（默认只出框 + 内容两张，框侧效果近似进 `frame.png`），占位内容和换过的内容都达标就按两张导出。实测 dB 写进 `split_evidence.verified_psnr`（或附 `split_fix` 的结果），不要只写在文字说明里。
+- 还低于阈值：**停下交用户**，写 `split_avatar` 决定（附对比图、`attempts`、各步的 dB）。**禁止**自己把低于阈值的拆分标成 best-effort / 已接受后继续导出：`validate` 会按实际导出的 PNG 在框和内容的合并框内重新量 dB（`split_checked`），低于阈值记 `split_below_threshold`，直到该决定记着用户本人的回答（`decided_by: "user"`，用 `confirm --decision ID=VALUE` 记录；只有一句「清单确认」不算回答了这一条，要单独问）。`split-avatar` 给出 `candidate_unverified` 而没有 Photoshop 实测 dB 的，记 `split_unverified`。
 - 拆不开、或定位后仍对不上 / 属于适用边界之外：才写 `reuse_decisions`（`type: split_avatar`），附对比图（`compare_image`）、已尝试的方法与失败原因（`attempts: [{method, result, reason}]`），交用户决定。**默认值不能是 `accept_placeholder` 等合并导出**，用最好的拆分候选（如 `split_best_effort`）或 `wait_for_user`。
 
 `split-avatar` 的状态：`candidate`（拆分自洽，且 psd-tools 渲染与该层的 Photoshop 像素一致）；`candidate_unverified`（拆分结构成立，但智能对象图层本身有投影 / 外发光 / 描边等边缘效果而框是环形（`outer_effect_risks`），或框侧有混合模式 / 非正常混合的效果 / 填充 0 的效果层叠在头像上，或 psd-tools 复现不了内层效果；必须用 Photoshop 按拆分导出后和合并导出对比再决定）；`mismatch` / `no_separable_layers` / `not_embedded_psd`（换下一种方法）。psd-tools 只是离线证据，最终以 Photoshop 导出的拼合对比为准。
@@ -81,6 +86,8 @@
 ### 拆开后拼回去对不上：先定位效果，再决定问不问
 
 适用于头像、图标、道具等动态内容与带效果的框拆开的情况，也适用于其他拆分（按钮底与图标、卡片与插图等）。拆完用「框 + 占位内容」拼回去，和合并导出（同一临时副本、同一画布）比 PSNR。低于精确拆分的参考阈值（约 40 dB，见 10.10）或两张近似的阈值（约 35 dB，见 10.11）时，**agent 先自己定位**，再决定要不要交用户。
+
+**0. 先套用效果归属默认判断**（见上文「效果归属的默认判断」）：外侧的投影 / 外发光 / 描边归框，烘进框、不进洞。多数内缘发暗的问题到这一步就解决了。
 
 **1. 定位实验（只在临时副本里做）。** 逐个关掉可能的效果，每种组合都导出 合并 / 框 / 内容 三张，同一组合内拼回去和合并导出比 PSNR：
 
@@ -149,6 +156,16 @@ python slicing_helper.py split-fix --merged M.png --content C.png --frame F.png 
 - `split-avatar` 对每个智能对象额外给出：`frame_hole_fraction`（框单独渲染的 alpha 里被围住的透明区占比，≥ 0.05 视为环）、`outer_effect_risks`（智能对象图层上的投影 / 外发光 / 描边 / 斜面浮雕 / 内阴影等边缘效果，框是环时报出）、`edge_effect_risks`（包住两侧的组的边缘效果 → `frame_from_merged`；叠在内容上的非 normal 混合层或填充 0 的效果层 → `overlay_part`；依赖内容的混合或调整图层 → `needs_user`）和 `effect_fix`（默认建议只有框一张，`split_fix: two_part_approx`；overlay 列在 `optional_overlays` 里，仅当两张近似低于约 35 dB 时才作为选项）。有外层边缘效果时状态为 `candidate_unverified`。`split-fix` 默认输出 `frame.png`（两张拆法）；`--emit-overlays` 才写出独立 overlay。
 - `flatten` / `validate` 的 issues：`outer_effect_into_hole`（拆分的框 part 所属的智能对象，或与内容 part 共同的父组，在图层树里带边缘效果，而 part 没写 `split_fix` 或 `split_evidence.effects_checked`）、`blend_mode_content_dependent`、`blend_mode_not_replayable`。
 - **没有自动化：** 定位实验本身（在 Photoshop 里逐项关效果并导出 合并 / 框 / 内容）、overlay 的单独导出（`export_slices.psjs` 目前只支持 `split.hide_inner`，不会关外层或组的效果，也不会只保留一层；这几张要按 `effect_fix.photoshop_exports` 另写临时脚本导出）、内缘亮度带的像素证据（要自己算）。`outer_effect_into_hole` 只看图层树里的效果名，不检查框是否真成环。
+
+### 阈值（项目规则文件可覆盖）
+
+阈值写在项目规则文件（`--rules` 用的同一个 JSON，`manifest.naming_rules_file`）的 `thresholds` 里，`build-layout` 带进布局，`validate --rules` 或单项参数可再覆盖（优先级：命令行 > `--rules` > 布局 > 默认）：
+
+```json
+"thresholds": { "split_match_psnr": 35, "reuse_max_mae": 4, "reuse_max_pct_gt16": 1 }
+```
+
+报告的 `thresholds` 记实际用的值。阈值只能由用户或项目规则改，agent 不要为了过校验去调。
 
 ### frame 类元素：按视觉层次拆，九宫与装饰
 
@@ -365,7 +382,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 }
 ```
 
-`decision` 为空时 `flatten` 会在 `pending_reuse_decisions` 里列出；未决定的按 `default` 导出。
+`decision` 为空时 `flatten` 会在 `pending_reuse_decisions` 里列出；未决定的按 `default` 导出；但 `default` 不能替用户解除 `split_below_threshold` 或复用超上限（见上）。
 
 组件节点常用字段：
 
@@ -384,7 +401,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 | `children` | 子组件 |
 | `source_path` / `layer_id` | 仅供对照的源图层引用 |
 
-部件（`part`）常用字段：`name`（规范文件名）、`role`（`base`、`highlight`、`icon`、`text` 等）、`kind`、`layer_id`、`select_ids`、`hidden`、`nine_slice`、`text`、`logical_bounds`、`source_name`、`source_path`。重复元素复用时加 `reuse_of`（共享图名，不带实例序号）；用户确认接受差异时加 `reuse_accepted: true`。运行时内容的占位图（如头像）加 `placeholder: true`。拆分出来的部件加 `split_method`（`smart_object_contents` | `mask_or_clip_layers` | `frame_from_instance` | `pixel_mask_estimate`）、`split_evidence`（对比结果和对比图），智能对象拆分再加 `split: { "hide_inner": [{ "id": 内层id, "name": 内层名 }] }`（导出时在临时副本里隐藏这些内层；先按 id、再按唯一的名字匹配，找不到就报错），像素估算加 `split_approximate: true`。frame 类元素仍整张烘焙时加 `bake_reason`。父组带效果时再加：`effect_mode`（`"baked"` | `"engine"`）、`effect_reason`（一句话理由，审核时可见）、`engine_effects`（仅 `engine`，从 `effect_params` 抄）。
+部件（`part`）常用字段：`name`（规范文件名）、`role`（`base`、`highlight`、`icon`、`text` 等）、`kind`、`layer_id`、`select_ids`、`hidden`、`nine_slice`、`text`、`logical_bounds`、`source_name`、`source_path`。重复元素复用时加 `reuse_of`（共享图名，不带实例序号）；（`reuse_accepted: true` 只是说明，不能绕过复用误差上限；接受差异必须是用户在 `reuse_decisions` 里填的 `decision`。）运行时内容的占位图（如头像）加 `placeholder: true`。拆分出来的部件加 `split_method`（`smart_object_contents` | `mask_or_clip_layers` | `frame_from_instance` | `pixel_mask_estimate`）、`split_evidence`（对比结果和对比图），智能对象拆分再加 `split: { "hide_inner": [{ "id": 内层id, "name": 内层名 }] }`（导出时在临时副本里隐藏这些内层；先按 id、再按唯一的名字匹配，找不到就报错），像素估算加 `split_approximate: true`。frame 类元素仍整张烘焙时加 `bake_reason`。父组带效果时再加：`effect_mode`（`"baked"` | `"engine"`）、`effect_reason`（一句话理由，审核时可见）、`engine_effects`（仅 `engine`，从 `effect_params` 抄）。
 
 ```json
 {
@@ -644,8 +661,9 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 1. 用 `flatten` 把组件树展成 `entries`，再用 `preview` 画标注预览（框出每个切图、标规范名和九宫格线；来自隐藏态的条目会计入标题；有 `effect_mode` 的标 `fx:baked` / `fx:engine(效果类型)`，`engine` 再用细品红框画出估计的效果范围）。`flatten` 输出里的 `effect_issues` 必须为空。
 2. 把 `preview_annotated.png` 和 `manifest.json` 交给用户。用户改 JSON：改名、改类型、改九宫格、拆/合并部件、确认或删除 `missing`、把不该导出的隐藏层拿掉、切换 `effect_mode`、对 `reuse_decisions` 填 `decision`（看对比图）。
-3. `status` 在用户确认前保持 `pending_review`，确认后改为 `confirmed`。导出脚本拒绝其它状态（测试授权下允许 `pending_review`）。
-4. 用户确认后才进入导出。
+3. `status` 在用户确认前保持 `pending_review`。用户确认后运行 `python slicing_helper.py confirm --manifest manifest.json`：改为 `confirmed`、写 `confirmed_at`，并写出锁 `manifest.confirmed.json`（逐字节副本）和 `manifest.confirmed.sha256`。用户对某条 `reuse_decisions` 的回答用 `--decision ID=VALUE`（可重复）记进去，会写 `decided_by: "user"` 和 `decided_at`；`confirm` 输出的 `not_user_decided` 列出还没有用户回答的 `split_avatar` / `reuse` 条目——其中卡着低于阈值的拆分或超上限复用的，要先问用户再导出。导出脚本拒绝其它状态（测试授权下允许 `pending_review`）。
+4. 用户确认后才进入导出。**锁定后的清单不得再改**（包括加条目、改 `reuse_accepted`、改 `split_evidence`、跑会重写清单的 `flatten`）。`export_slices.psjs` 发现 manifest 和 `manifest.confirmed.json` 不一致就拒绝导出；`build-layout` 发现哈希不一致就退出（退出码 3，不写布局）；`validate` 记 `manifest_changed_after_confirm`；没锁记 `manifest_not_locked`。导出前可以先跑 `check-lock`（改过退出 3，没锁退出 4）。
+5. 导出或校验中发现清单需要改：把改动写进 `manifest.proposal.json`（改什么、为什么、证据和对比图），**停下**交用户；用户同意后再改清单，并用 `confirm --relock` 重新锁定。
 
 ---
 
@@ -719,6 +737,8 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 ---
 
 ## 9. 校验
+
+1.4.9 起的护栏（都进 `issues`，不能由 agent 自行标记接受）：`manifest_changed_after_confirm` / `manifest_not_locked`（第 6 节）；`split_below_threshold`（实测：导出的拆分部件拼回去，在其合并框内与 PS 整图比 dB，见 `split_checked`；或 `split_evidence` 里实测 dB 低于阈值）、`split_unverified`；`reuse_mismatch`（复用误差超上限，见「重复元素」）。用户在 `reuse_decisions` 填了 `decision` 的，改记在 `split_below_threshold_user_accepted` / `reuse_mismatch_accepted`。
 
 1. **默认状态**：只拼 `default: true` 的部件（即 PSD 里当前显示的那一态，加上始终可见的 chrome），用 src-over（`Image.alpha_composite`）叠回画板，与 Photoshop 整图比像素差 / CIEDE2000 ΔE。同时报告画上属性文字（`dynamic_text` / `static_text`）近似后的数字（`diff_text_rendered`）、以及遮罩这些文字区域后的数字（`diff_text_masked`），并列出误差最大的 10 条。再检查漏切、重名、空图。**判断切图精度只看遮罩后的指标**；带文字的数字只说明预览和效果图有多像。
 2. **引擎效果**：`effect_mode: engine` 的部件，投影 / 外发光按 Pillow 近似画在部件下面（alpha → 按角度/距离偏移 → 扩展后高斯模糊 → 颜色/不透明度，普通混合），报告列在 `engine_effects_emulated`。描边、内阴影、叠加等无法模拟的，按估计的 `effect_bounds` 把外圈（内部效果则整框）从遮罩指标里去掉，列在 `engine_effects_unemulated`。`issues` 里的 `group_effect_lost` 表示选了带效果组的子层却既没烘焙也没写 `engine_effects`，必须修。部件带 `blend_mode` 时按对应公式叠到画布上（normal / multiply / screen / linear_burn / lighten / darken / linear_dodge；其它模式按 normal 画并在 `placed` 里记 `blend_mode_approximated_normal`）。拆分相关的 `outer_effect_into_hole`、`blend_mode_content_dependent`、`blend_mode_not_replayable` 见「拆开后拼回去对不上」。
@@ -1065,3 +1085,27 @@ PSNR 按整张导出画布计算（括号内是合并图可见范围）。现状
 - `art_text`：仅当存在引擎画不了的效果时出图——渐变填充或渐变叠加、斜面浮雕、变形或非仿射变换、图案叠加、绸缎、内发光、内阴影、外发光、颜色叠加、渐变/图案描边，以及已栅格化或非文字图层；未知效果同样出图。
 - 三种文字类型的 `nine_slice` 必须为 null。`infer` / `build-layout` 不再对文字做九宫分析；`validate` 对带九宫的文字记 `text_has_nine_slice`。
 
+
+### 10.13 拆分阈值、清单锁、复用上限（1.4.9）
+
+起因：一次真实的两阶段运行里，`validate` 给出 `ok: true`，但实际有三处问题。第一，头像框拆开后框洞内缘带一圈暗边：`split-fix` 只有 25.4 dB，低于 35 dB 门槛，agent 自己把决定写成 `split_best_effort` 后继续导出。第二，用户确认清单后，第二阶段又加了 3 个条目，并给 13 个条目加了 `reuse_accepted`。第三，共享框的复用误差 MAE 约 4.8，约 11% 的像素差值大于 16，也被记为「已接受」。
+
+1.4.9 的规则见上文「效果归属的默认判断」「阈值」以及第 6 节，主要四条：
+
+- 拆分由 `validate` 按导出的 PNG 重新测量，结果写在 `split_checked`，不再采信 agent 自己报的数值。
+- 清单确认后由 `confirm` 加锁。
+- 复用误差只在共享图的不透明区域内计算，并去掉被上层节点盖住的像素。
+- 只有记录了 `decided_by: "user"` 的决定才能解除这些问题。
+
+回归测试使用已有产物，只重新运行 `validate`，不重新打开 Photoshop：
+
+| 样本 | 1.4.8 | 1.4.9 |
+|---|---|---|
+| 列表页 A（旧运行，没有锁） | masked 47.29 dB；9 个 `group_effect_lost`、5 个 `text_has_nine_slice`、2 个 `split_avatar_not_attempted` | masked 47.29 dB；问题与左栏相同，另加 1 个 `manifest_not_locked`；没有新增复用或拆分问题 |
+| 列表页 B（上面这次运行） | `ok: true`，`issues` 为空；masked 32.15 / 全图 32.35 dB | `ok: false`：7 个 `split_below_threshold`（实测 23.2–24.5 dB，附对比图）、9 个 `reuse_mismatch`（7 个共享框 MAE 4.5–5.1，10.8–11.6% 像素差值 > 16；2 行底图边缘差 1 px，其中一行大部分被导航盖住）、7 个 `outer_effect_into_hole`、14 个 `split_unverified`、1 个 `manifest_not_locked`；dB 不变 |
+| 列表页 B 的清单锁 | — | 第一阶段清单执行 `confirm` 后，`check-lock` 返回 0。换成第二阶段改过的清单后，`check-lock` 和 `build-layout` 都返回 3（`manifest_changed_after_confirm`），也不会写出 layout |
+| 两个头像智能对象，两张拆法（10.11） | `split-fix` 占位 41.95 / 45.36 dB，换内容最低 40.55 / 43.79 dB | 相同 |
+
+列表页 B 的 agent 在第二阶段把 `decision` 填成了 `default`，所以不能只看 `decision` 有没有填。用户只说一句「清单确认」，也不算回答了具体的拆分或复用问题。这类问题要单独问用户，再用 `confirm --decision ID=VALUE` 记录。
+
+**仍有缺口：** agent 如果自己写 `decided_by: "user"`，规则拦不住。好在锁会抓住确认之后的改动；确认之前写入的，只能靠用户审核清单时看到。

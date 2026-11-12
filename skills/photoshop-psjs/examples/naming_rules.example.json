@@ -160,5 +160,10 @@
   "value_name_keywords": [
     "username",
     "nickname"
-  ]
+  ],
+  "thresholds": {
+    "split_match_psnr": 35,
+    "reuse_max_mae": 4,
+    "reuse_max_pct_gt16": 1
+  }
 }

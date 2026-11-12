@@ -145,6 +145,7 @@ class TestReuseFlow(unittest.TestCase):
         h.flatten_components(m)
         mpath = self.tmp / "manifest.json"
         mpath.write_text(json.dumps(m), encoding="utf-8")
+        self.assertEqual(h.cmd_confirm(SimpleNamespace(manifest=str(mpath), note="test", relock=False)), 0)
         _row_img().save(self.slices / "main_bg_row.png")
         log = {"ok": True, "items": [
             {"name": "main_bg_row1", "ok": True, "out_size": [30, 10], "visible_bounds_from_trim_insets": True,
