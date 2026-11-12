@@ -758,6 +758,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 1. **默认状态**：只拼 `default: true` 的部件（即 PSD 里当前显示的那一态，加上始终可见的 chrome），用 src-over（`Image.alpha_composite`）叠回画板，与 Photoshop 整图比像素差 / CIEDE2000 ΔE。同时报告画上属性文字（`dynamic_text` / `static_text`）近似后的数字（`diff_text_rendered`）、以及遮罩这些文字区域后的数字（`diff_text_masked`），并列出误差最大的 10 条。再检查漏切、重名、空图。**判断切图精度只看遮罩后的指标**；带文字的数字只说明预览和效果图有多像。
 2. **引擎效果**：`effect_mode: engine` 的部件，投影 / 外发光按 Pillow 近似画在部件下面（alpha → 按角度/距离偏移 → 扩展后高斯模糊 → 颜色/不透明度，普通混合），报告列在 `engine_effects_emulated`。描边、内阴影、叠加等无法模拟的，按估计的 `effect_bounds` 把外圈（内部效果则整框）从遮罩指标里去掉，列在 `engine_effects_unemulated`。`issues` 里的 `group_effect_lost` 表示选了带效果组的子层却既没烘焙也没写 `engine_effects`，必须修。部件带 `blend_mode` 时按对应公式叠到画布上（normal / multiply / screen / linear_burn / lighten / darken / linear_dodge；其它模式按 normal 画并在 `placed` 里记 `blend_mode_approximated_normal`）。拆分相关的 `outer_effect_into_hole`、`blend_mode_content_dependent`、`blend_mode_not_replayable` 见「拆开后拼回去对不上」。
 3. **复用实例**：每个带 `reuse_of` 的默认态节点，在其可见框内（去掉属性文字与无法模拟的效果区域）比 PS 整图与拼图。MAE > `--reuse-tol-mae`（默认 4）或差值 >16 的像素占比 > `--reuse-tol-pct`（默认 1%）时记为 `reuse_mismatch`（含实例名、区域、指标和 `validate/reuse/<名>.png` 对比图）；`reuse_accepted` 的改记 `reuse_mismatch_accepted`。逐实例数据在 `reuse_checked`。
+4. **位置（1.4.11）**：`layer_bounds_mismatch`：清单的 `logical_bounds` 与该条目 `layer_id` 实测的逻辑边界差超过 2 px（指向了兄弟实例的图层）；借用别的实例图的非默认态改按清单的框放，不报。`placement_offset`：每张正常混合、100% 不透明的图（含按原尺寸画的九宫格），用它自己的不透明像素、去掉上层盖住的部分，在 ±2 px 内和 PS 整图配准；某个偏移的 MAE 不到原位的一半且低 0.5 以上就报，附 `fits_at_shift`。处理办法是按当前 `export_slices.psjs` 重导或改正 `layer_id`，不要手动挪布局。参与配准的图数在 `placement_checked`。
 4. **交替状态**：对每个交互组件的非默认状态（含仅存在于 `missing` 中的状态），按「共用部件 + 该状态部件」拼图，互斥组的兄弟项切到对应态，写出 `validate/states/<component_id>_<state>.png`。只对真正缺失的、按设计随状态变化的零件画红框并标 `missing`。这些预览**不**和默认态整图比 PSNR（对不上是正常的）。
 5. **导出后标注预览（最终交付）**：用实际导出的 PNG 按布局 JSON 拼默认态（同上，含引擎效果近似），再按审核预览的样式画标注：每个切图按 `visible_bounds` 画框、规范名、九宫格线、类型和 `fx:baked` / `fx:engine`，复用实例的标签后缀为 `→ <共享名>`。写出 `validate/preview_exported_annotated.png` 和 `validate/preview_exported_vs_ps.png`（左 PS 整图、右导出拼图+标注），路径记在报告的 `exported_preview`。把它们交给用户。
 
@@ -1152,3 +1153,25 @@ PSNR 按整张导出画布计算（括号内是合并图可见范围）。现状
 只把模拟路径改成抗锯齿带邻域合并、不用探针时，同一输入上占位 33.0 → 33.4 dB，`aa_band_noise` 2.86 → 2.16，真实换内容 27.2 → 27.6 dB：有改善，但离探针拟合很远，所以文档把探针定为首选。
 
 **仍未覆盖：** 探针要求内容形状能单独填色（剪贴底、形状层或内容图层的 alpha）；内容本身半透明、又压在半透明框下的像素（`zone_partial_content_px`）直接取合并图；正片叠底一类与内容相关的混合仍是近似（真实渲染上留一法最低 39 dB）。
+
+### 10.15 位置记错：效果边界取整与复制来的 layer_id（1.4.11）
+
+起因：10.14 之后列表页 B 还剩两处：第 8 行露出一半的头像（被底部导航盖住下半）拼回去 29.94 dB；导航选中格的复用检查 2.48% 像素差 > 16（上限 1%）。
+
+**第 8 行：** 该行头像智能对象内部与第 2–7 行同构（蓝色渐变底 + 头像 + 带斜面浮雕的底板 + 紫色描边 + 内发光层），旧清单却把它当成共享框的复用实例，把 160×166 的共享框画在 140×143 的格子上，内容又只取了头像本身。按第 2–7 行的拆法重做：内容 = 渐变底 + 头像（组效果关掉），框 = 底板 + 描边 + 内发光，自己出图（146×153），不拉伸共享框；渐变底填 6 种纯色（先关掉它自己的渐变叠加，读回确认）用 `split-fix --probe` 拟合框。实测：占位拼回 51.0 dB（导出画布），`content_check` 61.5 dB 无边圈，换内容留一法 32.0–48.4 dB（最低的是白色，误差都在内容半透明的抗锯齿边上：这个智能对象的底板在内容下面，两张拆法下那一圈只能取合并图）。`validate` `split_checked` 29.94 → 62.03 dB。
+
+**导航选中格：** 两个原因叠在一起。
+- 中间格的普通态条目复制自左格，`layer_id` 没改：`build-layout` 按左格实测的边界放，中间格画在左格上，中间那格背景缺失，复用检查在叠放位置上比，查不出来。改正 `layer_id` 后两格复用差为 0。
+- 选中格和左格都是带内阴影 / 渐变叠加的形状层。导出日志里裁剪前边界 `[1894, 2265]`、裁剪后 `[-5, 366]`（宽度都是 371），按内缩算出的原点 1899，而 PNG 的内容实际从 1900 开始（`boundsNoEffects` 也是 1900）：效果边界是取整后报的，平移后取整方向变了。拼图整体左移 1 px，格子两侧竖边和压在上面的图标边缘都出差。按像素层量（先合并成像素层再量）后两格原点都是 1900，其余 73 条的边界一条没变；导航上的奖杯图标顺带变得与 PS 整图一致（不透明区 MAE 1.64 → 0.01，它不是错位，是单层带效果直接存 PNG 的渲染差）。
+
+| 指标 | 修前 | 修后 |
+|---|---|---|
+| 第 8 行 `split_checked` | 29.94 dB | 62.03 dB |
+| 选中格 `reuse_checked`（MAE / 差 > 16） | 0.746 / 2.48% | 0 / 0% |
+| 中间格 | 没画（左格画两次） | 0 / 0% |
+| 整页（遮罩文字 / 全图） | 36.52 / 36.34 dB | 55.77 / 44.89 dB |
+| `issues` | 2（`split_below_threshold`、`reuse_mismatch`） | 0 |
+
+把修前的数据重放给新检查：`layer_bounds_mismatch` 报出那个复制来的条目，`placement_offset` 报出选中格 `fits_at_shift: [1, 0]`（MAE 0.746 → 0.0）；修后两项都为 0。10.13 表里「2 行底图边缘差 1 px」很可能是同一类问题。
+
+**仍未覆盖：** 借用别的实例图的交替状态（另外两格的选中态、右格的普通态）只能按清单的框放，PSD 里没有对应图层可比；右格普通态在 PSD 里有一个隐藏层，可以改成单独导出。

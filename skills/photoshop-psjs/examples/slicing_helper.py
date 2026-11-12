@@ -4795,6 +4795,21 @@ def enrich_components(components, nodes_by_name):
     return [enrich(c) for c in components]
 
 
+LAYER_BOUNDS_TOL_PX = 2
+
+
+def layer_bounds_conflict(manifest_bounds, measured_bounds, tol=LAYER_BOUNDS_TOL_PX):
+    """Largest edge difference (px) between the manifest box of an entry and the logical box Photoshop measured
+    on its layer_id, when it is over ``tol``; else 0. A large value means the entry points at another layer than
+    the one it describes (an instance whose layer_id was copied from its sibling), so it is placed at the wrong
+    spot and the instance it names is missing."""
+    a, b = _rect_to_dict(manifest_bounds), _rect_to_dict(measured_bounds)
+    if not a or not b:
+        return 0
+    d = max(abs(a[k] - b[k]) for k in ("left", "top", "right", "bottom"))
+    return int(round(d)) if d > tol else 0
+
+
 def place_reused_instances(nodes):
     """Place bounds-only instances of a shared image: source visible box shifted by the logical-origin delta."""
     by_name = {n["name"]: n for n in nodes}
@@ -4864,6 +4879,7 @@ def cmd_build_layout(args):
             logi = _rect_to_dict(entry.get("logical_bounds"))
         if vis is None:
             vis = logi
+        bounds_conflict = layer_bounds_conflict(entry.get("logical_bounds"), logi if item else None)
         # Prefer the post-trim inset origin computed in export_slices.psjs.
         # Only fall back to "PNG size == logical size → use logical origin"
         # when the exporter did not record trim insets (older logs).
@@ -4917,6 +4933,22 @@ def cmd_build_layout(args):
             "default": entry.get("default", True),
             "hidden": entry.get("hidden", False),
         }
+        if bounds_conflict:
+            man_ab = _shift(_rect_to_dict(entry.get("logical_bounds")), ox, oy)
+            node["layer_bounds_mismatch"] = {
+                "manifest_logical_bounds": man_ab,
+                "measured_logical_bounds": logi_ab,
+                "max_edge_px": bounds_conflict,
+            }
+            if entry.get("reuse_of") and entry.get("export_png") is False and not entry.get("default", True):
+                # A non-default state drawn with another instance's image (no layer of its own at that spot):
+                # the manifest box says where it goes; shift the shared image there.
+                node["logical_bounds"] = dict(man_ab)
+                node["anchor"] = _center(man_ab)
+                node["layer_bounds_mismatch"]["placed_from"] = "manifest_logical_bounds"
+            else:
+                warn(f"{name}: layer {entry.get('layer_id')} measures {logi_ab} but the manifest box is "
+                     f"{man_ab} (wrong layer_id / copied instance?)")
         if entry.get("reuse_of"):
             node["reuse_of"] = entry["reuse_of"]
             node["reuse_source"] = entry.get("reuse_source")
@@ -5703,6 +5735,99 @@ def _covered_above(nodes, idx, box, slices_dir):
     return cov
 
 
+def layer_bounds_issues(nodes):
+    """``layer_bounds_mismatch`` for nodes whose layer measured somewhere else than their manifest box."""
+    out = []
+    for n in nodes:
+        m = n.get("layer_bounds_mismatch")
+        if not m or m.get("placed_from") == "manifest_logical_bounds":
+            continue
+        out.append({"type": "layer_bounds_mismatch", "name": n.get("name"), "layer_id": n.get("layer_id"),
+                    "source_path": n.get("source_path"), **m,
+                    "hint": ("The layer_id / select_ids of this entry measure at another box than its logical_bounds: "
+                             "it probably points at a sibling instance (copied entry), so the instance it names is "
+                             "not drawn and its sibling is drawn twice. Point it at the layer that is really at "
+                             "logical_bounds (source_path), relock, re-export.")})
+    return out
+
+
+PLACEMENT_MAX_SHIFT = 2
+PLACEMENT_MIN_PX = 64
+PLACEMENT_MAX_SAMPLES = 200000
+
+
+def placement_offset_checks(layout, ref, mask, slices_dir, max_shift=PLACEMENT_MAX_SHIFT):
+    """Is each image drawn where Photoshop draws it? Compare the node's own opaque pixels (alpha 255, not covered by
+    nodes above, outside text / unemulated masks) with the PS render at its placed box and at every shift up to
+    ``max_shift`` px. A shift that clearly fits better (half the MAE or less, and at least 0.5 lower) means the
+    recorded position is off: ``placement_offset`` with the shift that fits. Normal-blend, full-opacity images (and
+    nine-slices drawn at their native size) only.
+    Returns (issues, checked)."""
+    issues, checked = [], []
+    if not slices_dir:
+        return issues, checked
+    nodes = layout.get("nodes") or []
+    ch, cw = ref.shape[0], ref.shape[1]
+    pad = max_shift
+    refp = np.zeros((ch + 2 * pad, cw + 2 * pad, 3), dtype=np.int16)
+    refp[pad:pad + ch, pad:pad + cw] = ref[..., :3]
+    inside = np.zeros((ch + 2 * pad, cw + 2 * pad), dtype=bool)
+    inside[pad:pad + ch, pad:pad + cw] = True
+    for idx, node in enumerate(nodes):
+        if is_attr_text(node.get("kind")) or not node.get("image"):
+            continue
+        if str(node.get("blend_mode") or "normal").lower() not in ("normal", "passthrough", "pass_through"):
+            continue
+        op = node.get("opacity")
+        if op is not None and float(op) not in (1.0, 100.0):
+            continue
+        b = node.get("visible_bounds")
+        path = Path(slices_dir) / node["image"]
+        if not b or not path.is_file():
+            continue
+        img = np.asarray(Image.open(path).convert("RGBA"))
+        L, T = int(round(b["left"])), int(round(b["top"]))
+        h, w = img.shape[0], img.shape[1]
+        if node.get("nine_slice") and (int(round(b["right"])) - L, int(round(b["bottom"])) - T) != (w, h):
+            continue  # stretched nine-slice: its pixels are not the PNG's 1:1
+        l, t, r, bt = max(0, L), max(0, T), min(cw, L + w), min(ch, T + h)
+        if r <= l or bt <= t:
+            continue
+        keep = img[t - T:bt - T, l - L:r - L, 3] == 255
+        if mask is not None:
+            keep &= ~mask[t:bt, l:r]
+        above = _covered_above(nodes, idx, (l, t, r, bt), slices_dir)
+        keep &= ~above
+        ys, xs = np.nonzero(keep)
+        if ys.size < PLACEMENT_MIN_PX:
+            continue
+        if ys.size > PLACEMENT_MAX_SAMPLES:
+            step = int(np.ceil(ys.size / PLACEMENT_MAX_SAMPLES))
+            ys, xs = ys[::step], xs[::step]
+        own = img[t - T:bt - T, l - L:r - L, :3].astype(np.int16)[ys, xs]
+        gy, gx = ys + t + pad, xs + l + pad
+        scores = {}
+        for dy in range(-max_shift, max_shift + 1):
+            for dx in range(-max_shift, max_shift + 1):
+                ok = inside[gy + dy, gx + dx]
+                if ok.sum() < PLACEMENT_MIN_PX:
+                    continue
+                scores[(dx, dy)] = float(np.abs(refp[gy + dy, gx + dx][ok] - own[ok]).mean())
+        if (0, 0) not in scores:
+            continue
+        mae0 = scores[(0, 0)]
+        (bdx, bdy), best = min(scores.items(), key=lambda kv: (kv[1], abs(kv[0][0]) + abs(kv[0][1])))
+        row = {"name": node["name"], "px": int(ys.size), "mae": round(mae0, 3)}
+        checked.append(row)
+        if (bdx, bdy) != (0, 0) and best <= 0.5 * mae0 and mae0 - best >= 0.5:
+            issues.append(dict(row, type="placement_offset", fits_at_shift=[bdx, bdy], mae_at_shift=round(best, 3),
+                               hint=("The image matches the design better when moved by fits_at_shift px: its "
+                                     "recorded visible_bounds are off (a trim-inset origin measured on live effects, "
+                                     "or a wrong layer). Re-export with the current export_slices.psjs; do not "
+                                     "nudge the layout by hand.")))
+    return issues, checked
+
+
 def reuse_region_checks(layout, ref, rec, mask, out_dir, tol_mae=None, tol_pct=None, slices_dir=None,
                         decisions=None):
     """Per-instance diff for nodes that share an image. Returns (mismatches, accepted, checked).
@@ -6073,6 +6198,9 @@ def cmd_validate(args):
         decisions=layout.get("reuse_decisions") or [],
     )
     issues.extend(split_bad)
+    issues.extend(layer_bounds_issues(layout["nodes"]))
+    placement_bad, placement_checked = placement_offset_checks(default_layout, ref, masked_all, slices_dir)
+    issues.extend(placement_bad)
     exported_preview = write_exported_preview(default_layout, rec_text, full.crop((0, 0, cw, ch)), out_dir)
 
     rendered = sum(1 for p in placed_text if p.get("rendered"))
@@ -6122,6 +6250,7 @@ def cmd_validate(args):
         "reuse_checked": reuse_checked,
         "reuse_mismatch_accepted": reuse_ok,
         "split_checked": split_checked,
+        "placement_checked": len(placement_checked),
         "split_below_threshold_user_accepted": split_ok,
         "thresholds": thr,
         "manifest_lock": layout.get("manifest_lock"),

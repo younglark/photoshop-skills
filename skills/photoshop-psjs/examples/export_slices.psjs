@@ -623,6 +623,17 @@ try {
           // Convert to 8-bit before measuring / trimming so near-zero 16-bit
           // alpha is quantized the same way as the exported PNG.
           await ensureEightBit(tmp);
+          // 1.4.11: measure on pixels, not on live effects. A single layer with layer
+          // effects reports effect bounds that Photoshop rounds per document; after trim the
+          // shifted bounds can round the other way, putting the trim-inset origin 1 px off
+          // (the PNG is right, its recorded position is not). Merging with an empty layer
+          // bakes the same composite into a raster layer whose bounds are whole pixels.
+          if (tmp.layers.length === 1) {
+            try {
+              await bp([{ _obj: "make", _target: [{ _ref: "layer" }] }]);
+              item.measured_on_raster = true;
+            } catch (err) { item.raster_measure_error = String(err); }
+          }
           if (tmp.layers.length > 1) {
             try { await bp([{ _obj: "mergeVisible" }]); }
             catch (err) { item.merge_error = String(err); }

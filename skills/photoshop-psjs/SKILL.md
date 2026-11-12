@@ -5,7 +5,7 @@ license: MIT-0
 compatibility: "Requires Adobe Photoshop 2023 (v23.5+) or later with UXP scripting, on Windows or macOS. The optional slicing helper needs Python 3 with psd-tools, Pillow and numpy; its validate step also requires uharfbuzz + freetype-py (or uharfbuzz + skia-python), plus scipy for strokes and effect spread, when the layout has dynamic_text or static_text."
 metadata:
   author: younglark
-  version: "1.4.10"
+  version: "1.4.11"
   homepage: https://github.com/younglark/photoshop-skills
 ---
 
@@ -234,12 +234,16 @@ await out.write(JSON.stringify(log, null, 2));
 3. **审核门闩**：`flatten` + `preview` 产出标注预览和 JSON（标签带 `fx:baked` / `fx:engine`，引擎效果画出估计范围，便于用户在审核时改方式；`flatten` 会在 `effect_issues` 里列出会丢效果的部件）。用户改 JSON 确认；`status` 在确认前保持 `pending_review`。`preview` 会跳过倒置或空的包围盒并给出警告，不要因此中断。 用户确认后跑 `confirm` 锁定清单（写 `manifest.confirmed.json` + `.sha256`）；锁定后不得再改清单，要改就写 `manifest.proposal.json` 停下等用户重新确认，`export_slices.psjs` / `build-layout` / `validate` 发现改动会拒绝或记 `manifest_changed_after_confirm`。
 4. **导出（`.psjs`）**：脚本只硬编码一个 `CONFIG_URL`，从作业 JSON 读路径。按 `layer_id` / `select_ids` 导出 1x PNG：`baked` 选组，效果烘焙进图；`engine` 选子层合并，图里不含组效果。带 `reuse_of` 的实例只导出一张共享图，其余实例只记边界。`dynamic_text` 和 `static_text` 不出图，只导出文本属性（含描边、投影）；`art_text` 出图。隐藏状态层会临时显示再恢复，文档不保存。
 5. **布局 JSON**：按组件语义组织（如 `screen > tab_group > tab > state > part`），源图层 id/路径仅供对照。记录可见尺寸（含烘焙效果）、逻辑尺寸（不含效果）、锚点、九宫格、文本属性和图片；`engine` 部件另带 `effect_mode`、`engine_effects`、`effect_reason` 和估计的 `effect_bounds`；复用实例的 `image` 都指向共享图，各自保留位置和边界。各引擎导入器自己写。
-6. **校验**：只把**默认状态**按 src-over 拼回去，和 PS 整图比像素差 / CIEDE2000 ΔE（含属性文字近似渲染版与遮罩版，并列误差最大的 10 条）。`dynamic_text` 和 `static_text` 按布局 JSON 的文字属性（按变换缩放的字号/行距、样式片段、效果开关、字距方式）用同一套 HarfBuzz + FreeType 渲染器近似画出（投影要画，总开关或单项关闭的效果不画；没有 Pillow 回退），只是预览，不等于 Photoshop 或引擎的效果；**切图精度看遮罩文字后的指标**，要像素一致的文字就让 Photoshop 栅格化文字图层导出。文字条目若带 `nine_slice`，记入 `text_has_nine_slice`。`engine` 部件的投影/外发光用 Pillow 近似画上；其它引擎效果（描边等）的估计范围从遮罩指标里去掉，并列入 `engine_effects_unemulated`。再为每个交替状态写出预览图供目视检查。同时检查漏切、重名、空图，组效果被悄悄丢掉的部件（`group_effect_lost`），以及复用后与设计不一致的实例（`reuse_mismatch`，附逐实例对比图；按复用规则拆开或交用户决定后重跑）。头像与框、frame 类元素的检查：`avatar_merged_unsplit`、`split_avatar_merged_default`、`split_avatar_not_attempted`、`split_*`（拆分部件不完整）、`frame_baked_whole`、`decoration_in_stretch_zone`（`flatten` 里也会提前报出）。
+6. **校验**：只把**默认状态**按 src-over 拼回去，和 PS 整图比像素差 / CIEDE2000 ΔE（含属性文字近似渲染版与遮罩版，并列误差最大的 10 条）。`dynamic_text` 和 `static_text` 按布局 JSON 的文字属性（按变换缩放的字号/行距、样式片段、效果开关、字距方式）用同一套 HarfBuzz + FreeType 渲染器近似画出（投影要画，总开关或单项关闭的效果不画；没有 Pillow 回退），只是预览，不等于 Photoshop 或引擎的效果；**切图精度看遮罩文字后的指标**，要像素一致的文字就让 Photoshop 栅格化文字图层导出。文字条目若带 `nine_slice`，记入 `text_has_nine_slice`。`engine` 部件的投影/外发光用 Pillow 近似画上；其它引擎效果（描边等）的估计范围从遮罩指标里去掉，并列入 `engine_effects_unemulated`。再为每个交替状态写出预览图供目视检查。同时检查漏切、重名、空图，组效果被悄悄丢掉的部件（`group_effect_lost`），以及复用后与设计不一致的实例（`reuse_mismatch`，附逐实例对比图；按复用规则拆开或交用户决定后重跑）、位置记错的图（`placement_offset`，给出吻合的偏移；按当前 `export_slices.psjs` 重导，不要手改布局）和图层不在自己框上的条目（`layer_bounds_mismatch`，多半是复制条目时 `layer_id` 没改）。头像与框、frame 类元素的检查：`avatar_merged_unsplit`、`split_avatar_merged_default`、`split_avatar_not_attempted`、`split_*`（拆分部件不完整）、`frame_baked_whole`、`decoration_in_stretch_zone`（`flatten` 里也会提前报出）。
 7. **跑完再收尾**：确认后，导出、`build-layout`、`validate` 要连续跑完；写出 `export_log.json` 不算完成，读过 `validate/validate_report.json`（`issues`、遮罩 PSNR / ΔE）才算完成。`validate` 最后会用**实际导出的 PNG** 拼出默认态，再画上与审核预览同样的标注（按 `visible_bounds` 的框、规范名、九宫格线、类型与效果方式，复用实例加 `→ <共享名>`），写出 `validate/preview_exported_annotated.png` 和与 PS 整图并排的 `validate/preview_exported_vs_ps.png`。**这两张图是交给用户的最终成果**，连同报告要点一起给。导出前的审核预览流程不变。长命令设超时并写日志，失败就读日志修正重跑，不要静默停下。
 
 沿用第 2–5 节的规则：每条描述符 `_options.dialogOptions = "silent"`，轮询结果 JSON，文档 id 守卫，不加额外 CLI 参数，顶层 `await`，`executeAsModal`，需要时 `suspendHistory`。
 
 **实测（Windows / PS 2026，一份列表界面 PSB 副本上的 1080×2340 画板，Asia/Shanghai）：** 修后可见元素 65 条（image 18 / nine_slice 21 / dynamic_text 22 / art_text 4），遮罩动态文字后 mean ΔE **0.047**、PSNR **46.24 dB**。规则文件外置后同一数字仍保持。细节见 [references/slicing.md](references/slicing.md) 第 10 节。第 10 节表里的类型计数是 1.4.8 规则之前测的，不改写。Agent 驱动的组件/状态轮次（10.4）在同一副本上默认态遮罩 PSNR 仍为 46.24 dB；隐藏的页签/导航交替状态已导出并单独出预览，未画出来的状态记入 `missing`。
+
+**1.4.11：** 两处「图画对了、位置记错了」的问题，都在 `validate` 的 `issues` 里报：
+- **按像素量位置，不按实时效果量。** 单个带图层效果的图层，Photoshop 报的效果边界是取整过的；裁掉透明边后边界平移再取整，可能取到另一边，trim 内缩算出的原点就差 1 px（PNG 本身是对的）。`export_slices.psjs` 现在先给临时副本加一个空图层再合并可见图层，在像素层上量边界（`measured_on_raster: true`）；合成结果和原来一样，单层带效果直接存 PNG 时偶尔与 PS 整图不一致的情况也一并消失。`validate` 的 `placement_offset`：每张图自己的不透明像素（去掉被上层盖住的、文字和无法模拟的效果区域）在 ±2 px 内与 PS 整图配准，挪一下明显更吻合（MAE 至少减半且降 0.5 以上）就报，并给出 `fits_at_shift`。正常混合、100% 不透明的图和按原尺寸画的九宫格才查。
+- **条目的图层要真的在它的框上。** 复制兄弟条目时 `layer_id` 没改，`build-layout` 按该图层实测的边界放，结果兄弟被画两次、自己那一格没画。`build-layout` 比较清单的 `logical_bounds` 和该图层实测的逻辑边界，差超过 2 px 记 `layer_bounds_mismatch`（默认态和自己导出图的条目都报）。非默认态、借用别的实例图（`export_png: false`）、PSD 里本来没有这一层的交替状态，改按清单的框放（`placed_from: manifest_logical_bounds`），不报。
 
 **1.4.10：** 拆分框与内容时两处修正，都按「效果归属」处理：
 - **内容不能带框色的边。** 包住框和内容两侧的组（或智能对象内层的组）带的内阴影 / 内发光 / 描边 / 斜面浮雕，在只留内容导出时会按内容自己的 alpha 重画，在内容边缘画出一圈框色的边（设计里这些效果画在整组外缘、落在框上，不碰内容）。这些效果和内容无关，**归框**：导出内容时关掉（组用逐项 `enabled: false`，读回确认），框里保留。
