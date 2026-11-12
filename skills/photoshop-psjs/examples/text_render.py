@@ -126,6 +126,8 @@ DEFAULT_OPTIONS = {
     # 1.4.0: 0. The 1.3.x value 0.86 was fitted on five two-line samples and did not hold on
     # 38 new two-line Photoshop samples (auto and fixed leading); see references/slicing.md 10.6.
     "mixed_leading_k": 0.0,
+    # When True (the default), each layer's leadingType and transform select k and gamma.
+    "auto_text_rules": True,
     "auto_leading_pct": 1.2,
     "snap_glyph_origin": True,
     "shadow_sigma_div": 2.0,
@@ -148,14 +150,20 @@ DEFAULT_OPTIONS = {
     "faux_italic_shear": 0.2,     # faux italic: x shear; 0 = not drawn
 }
 
-# Text profiles (validate --text-profile). "ps2026": text layers that Photoshop 2026 lays out and rasterises
-# as new layers (all 345 gold images of references/slicing.md 10.6). "older-file": text layers in a file that
-# behaved differently on the one board measured (cause not confirmed; likely saved by an older Photoshop /
-# text engine): line drops matched mixed_leading_k 0.86 and PlatformGray edges matched no gamma, while the
-# effect rules still helped. One board only: treat as a hint, not a rule.
+# Extra baseline drop for mixed-size lines when paragraph leadingType is leadingAbove
+# (top-to-top). Fitted on Exo / Noto probes and the measured board; HarfBuzz typo
+# ascender ratios did not match (Exo ~1.00 vs this 0.86). See references/slicing.md 10.7.
+LEADING_ABOVE_K = 0.86
+UNIFORM_TRANSFORM_EPS = 1e-6
+
+# Text profiles (validate --text-profile). "auto" (default) picks mixed-line drop and
+# PlatformGray gamma per layer from leadingType and the layer transform (10.7).
+# "ps2026": force the 1.4.0 new-layer rules (k 0, gamma on). "older-file": force
+# k 0.86 and no anti-alias gamma on every layer.
 TEXT_PROFILES = {
-    "ps2026": {},
-    "older-file": {"mixed_leading_k": 0.86, "aa_rules": {}},
+    "auto": {"auto_text_rules": True},
+    "ps2026": {"auto_text_rules": False},
+    "older-file": {"auto_text_rules": False, "mixed_leading_k": 0.86, "aa_rules": {}},
 }
 
 # The 1.3.x drawing rules, for comparison runs (validate --text-legacy-rules).
@@ -381,10 +389,177 @@ def kern_enabled(text, runs=None):
     return False, f"unknown kerning mode {mode!r}; kern off"
 
 
+
+def _engine_key(d, key):
+    """Look up a Photoshop EngineData key, with or without typographic quotes."""
+    if d is None or isinstance(d, (str, bytes)) or not (isinstance(d, dict) or hasattr(d, "keys")):
+        return None
+    if key in d:
+        return d[key]
+    quoted = "'" + key + "'"
+    if quoted in d:
+        return d[quoted]
+    try:
+        keys = list(d.keys())
+    except Exception:
+        return None
+    for k in keys:
+        if str(k).strip("'") == key:
+            return d[k]
+    return None
+
+
+def _engine_items(o):
+    if o is None or isinstance(o, (str, bytes, int, float, bool)):
+        return []
+    if isinstance(o, dict) or (hasattr(o, "items") and not isinstance(o, (list, tuple))):
+        try:
+            return list(o.items())
+        except Exception:
+            return []
+    if hasattr(o, "__iter__"):
+        try:
+            return list(enumerate(o))
+        except Exception:
+            return []
+    return []
+
+
+def leading_type_from_engine(engine_dict):
+    """Map EngineData LeadingType to ``leadingAbove`` / ``leadingBelow``.
+
+    Photoshop's batchPlay descriptor often omits ``leadingType``; EngineData still
+    stores it (0 = leadingBelow / baseline-to-baseline, 1 = leadingAbove / top-to-top).
+    """
+    values = []
+
+    def walk(o):
+        for k, v in _engine_items(o):
+            if str(k).strip("'") == "LeadingType":
+                values.append(v)
+            else:
+                walk(v)
+
+    walk(engine_dict)
+    if not values:
+        return None
+    v = values[0]
+    if isinstance(v, str):
+        s = v.strip()
+        if s in ("leadingAbove", "1") or "Above" in s:
+            return "leadingAbove"
+        if s in ("leadingBelow", "0") or "Below" in s:
+            return "leadingBelow"
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    if n == 1:
+        return "leadingAbove"
+    if n == 0:
+        return "leadingBelow"
+    return None
+
+
+def leading_types_from_psd(path):
+    """Read-only map of layer_id -> leadingAbove/leadingBelow from a PSD/PSB EngineData."""
+    from psd_tools import PSDImage
+    try:
+        from psd_tools.psd.parse_limits import ParseLimits
+    except Exception:
+        ParseLimits = None
+    kw = {}
+    if ParseLimits is not None:
+        kw["parse_limits"] = ParseLimits(max_objects=None)
+    psd = PSDImage.open(path, **kw)
+    out = {}
+
+    def walk(layers):
+        for layer in layers:
+            kind = getattr(layer, "kind", None)
+            lid = getattr(layer, "layer_id", None)
+            if kind == "type" and lid is not None:
+                try:
+                    ed = layer.engine_dict
+                except Exception:
+                    ed = None
+                lt = leading_type_from_engine(ed)
+                if lt:
+                    out[int(lid)] = lt
+            children = None
+            try:
+                children = list(layer)
+            except Exception:
+                children = None
+            if children:
+                walk(children)
+
+    walk(list(psd))
+    return out
+
+
+def transform_is_uniform(tf, eps=UNIFORM_TRANSFORM_EPS):
+    """True when the text layer scale is uniform (xx ~= yy), including a missing / identity matrix.
+
+    A non-uniform layer transform (even 1.001 vs 1.0) makes Photoshop 2026 skip TextBlendGamma
+    on freshly rasterised text. Rotation / shear with xx == yy is unmeasured and treated as uniform.
+    """
+    if not tf:
+        return True
+    xx = tf.get("xx")
+    yy = tf.get("yy")
+    xx = 1.0 if xx is None else float(xx)
+    yy = 1.0 if yy is None else float(yy)
+    return abs(xx - yy) <= eps
+
+
+def aa_rules_without_gamma(rules):
+    """Copy aa_rules with coverage-gamma removed (embolden / snap kept)."""
+    out = {}
+    for mode, rule in (rules or {}).items():
+        r = {k: v for k, v in dict(rule or {}).items() if k != "gamma"}
+        if r:
+            out[mode] = r
+    return out
+
+
+def layer_leading_type(text):
+    if not isinstance(text, dict):
+        return None
+    for p in text.get("paragraphs") or []:
+        if p.get("leading_type"):
+            return p["leading_type"]
+    return text.get("leading_type")
+
+
+def apply_auto_text_rules(text, options=None):
+    """Return render options, filling k and anti-alias gamma from this layer when auto_text_rules is on.
+
+    leadingAbove (from the descriptor or EngineData) uses LEADING_ABOVE_K unless the caller
+    already set mixed_leading_k. A non-uniform transform drops coverage gamma unless the
+    caller already set aa_rules. Explicit --text-profile ps2026 / older-file sets
+    auto_text_rules False and skips this.
+    """
+    passed = dict(options or {})
+    opts = dict(DEFAULT_OPTIONS, **passed)
+    if not opts.get("auto_text_rules"):
+        return opts
+    lt = layer_leading_type(text)
+    if lt:
+        opts["leading_type"] = lt
+    if lt == "leadingAbove" and "mixed_leading_k" not in passed:
+        opts["mixed_leading_k"] = LEADING_ABOVE_K
+    if (not transform_is_uniform(text.get("transform") if isinstance(text, dict) else None)
+            and "aa_rules" not in passed):
+        opts["aa_rules"] = aa_rules_without_gamma(opts.get("aa_rules"))
+    return opts
+
+
 def text_spec(text, *, doc_size=None, art_origin=(0, 0), bounds=None, options=None):
     """Normalise a layout JSON ``text`` dict into what the renderers need."""
-    opts = dict(DEFAULT_OPTIONS, **(options or {}))
     text = text or {}
+    opts = apply_auto_text_rules(text, options)
     content = str(text.get("content") or "")
     m = matrix_of(text)
     runs = _norm_runs(text, m) if text.get("runs") else _legacy_runs(text, m)
@@ -395,10 +570,12 @@ def text_spec(text, *, doc_size=None, art_origin=(0, 0), bounds=None, options=No
             "to": int(p.get("to") if p.get("to") is not None else 1 << 30),
             "align": str(p.get("align") or "left").lower(),
             "auto_leading_pct": _f(p.get("auto_leading_pct")),
+            "leading_type": p.get("leading_type") or text.get("leading_type"),
         })
     if not paragraphs:
         paragraphs = [{"from": 0, "to": 1 << 30, "align": str(text.get("alignment") or "left").lower(),
-                       "auto_leading_pct": _f(text.get("auto_leading_pct"))}]
+                       "auto_leading_pct": _f(text.get("auto_leading_pct")),
+                       "leading_type": text.get("leading_type")}]
     ox, oy = (art_origin or (0, 0))[:2]
     cp = text.get("click_point") or {}
     dw, dh = (doc_size or (None, None))[:2] if doc_size else (None, None)
@@ -562,20 +739,26 @@ def _para_at(paras, i):
     return paras[-1]
 
 
-def line_advance(prev_line_runs, line_runs, opts, auto_pct=None):
+def line_advance(prev_line_runs, line_runs, opts, auto_pct=None, leading_type=None):
     """Baseline-to-baseline distance (pt) from the previous line to this one.
 
     Leading is the largest leading on the line (auto leading = auto_pct x size).
     When this line's largest size exceeds the previous line's, add
     ``mixed_leading_k`` x the increase (empirical, see module docstring).
+    For ``leadingAbove`` (top-to-top), the extra drop is applied in both
+    directions: k x (this size - previous size), including a shrink.
     """
     pct = auto_pct or opts.get("auto_leading_pct") or 1.2
     leads = [(r["size_pt"] * pct) if (r["auto_leading"] or r["leading_pt"] is None) else r["leading_pt"]
              for r in line_runs]
     adv = max(leads)
-    grow = max(r["size_pt"] for r in line_runs) - max(r["size_pt"] for r in prev_line_runs)
-    if grow > 0:
-        adv += float(opts.get("mixed_leading_k") or 0.0) * grow
+    delta = max(r["size_pt"] for r in line_runs) - max(r["size_pt"] for r in prev_line_runs)
+    lt = leading_type or opts.get("leading_type")
+    k = float(opts.get("mixed_leading_k") or 0.0)
+    if lt == "leadingAbove":
+        adv += k * delta
+    elif delta > 0:
+        adv += k * delta
     return adv
 
 
@@ -607,7 +790,8 @@ def layout_glyphs(spec, shaper_for, fonts_dir=None, resolve_font=None):
         line_runs = [r for _, r in segs] or [_run_at(runs, pos)]
         para = _para_at(paras, pos)
         if li > 0:
-            base += line_advance(prev_runs, line_runs, opts, para.get("auto_leading_pct"))
+            base += line_advance(prev_runs, line_runs, opts, para.get("auto_leading_pct"),
+                                 leading_type=para.get("leading_type") or opts.get("leading_type"))
         x = 0.0
         lg = []
         for s, r in segs:
@@ -1277,7 +1461,8 @@ def text_attrs_from_descriptor(desc):
         pct = _f(ps.get("autoLeadingPercentage"))
         paras.append({"from": int(p.get("from") or 0), "to": int(p.get("to") or 0),
                       "align": _ev(ps.get("align")) or "left",
-                      "auto_leading_pct": pct})
+                      "auto_leading_pct": pct,
+                      "leading_type": _ev(ps.get("leadingType")) or None})
     kerns = sorted({str(r["auto_kern"]) for r in runs}) or ["manual"]
     shape = "point"
     shapes = tk.get("textShape") or []
@@ -1320,6 +1505,7 @@ def text_attrs_from_descriptor(desc):
         "scale": {"x": round(sx, 6), "y": round(sy, 6)},
         "runs": runs,
         "paragraphs": paras,
+        "leading_type": paras[0].get("leading_type") if paras else None,
         "kerning": kerns[0] if len(kerns) == 1 else "mixed",
         "manual_kerning_ranges": len(tk.get("kerningRange") or []),
         "anti_alias": _ev(tk.get("antiAlias")),

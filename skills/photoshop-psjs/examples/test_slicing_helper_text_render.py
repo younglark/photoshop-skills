@@ -477,6 +477,74 @@ class MixedLines(unittest.TestCase):
         self.assertFalse(h.text_has_mixed_size_lines({"content": "Level\r280", "runs": same}))
 
 
+
+class Rules141(unittest.TestCase):
+    """1.4.1 auto rules: leadingType and non-uniform transform (references/slicing.md 10.7)."""
+
+    def test_leading_type_from_descriptor_and_engine(self):
+        desc = _desc()
+        desc["textKey"]["paragraphStyleRange"][0]["paragraphStyle"]["leadingType"] = {
+            "_enum": "leadingType", "_value": "leadingAbove"}
+        attrs = T.text_attrs_from_descriptor(desc)
+        self.assertEqual(attrs["leading_type"], "leadingAbove")
+        self.assertEqual(attrs["paragraphs"][0]["leading_type"], "leadingAbove")
+        self.assertEqual(T.leading_type_from_engine({
+            "ParagraphRun": {"RunArray": [{"ParagraphSheet": {"Properties": {"LeadingType": 1}}}]}
+        }), "leadingAbove")
+        self.assertEqual(T.leading_type_from_engine({
+            "'ParagraphRun'": {"'RunArray'": [{"'ParagraphSheet'": {"'Properties'": {"'LeadingType'": 0}}}]}
+        }), "leadingBelow")
+        self.assertIsNone(T.leading_type_from_engine({"StyleRun": {}}))
+
+    def test_transform_is_uniform(self):
+        self.assertTrue(T.transform_is_uniform(None))
+        self.assertTrue(T.transform_is_uniform({"xx": 1.345, "yy": 1.345}))
+        self.assertFalse(T.transform_is_uniform({"xx": 1.3488, "yy": 1.345}))
+        self.assertFalse(T.transform_is_uniform({"xx": 1.001, "yy": 1.0}))
+        self.assertTrue(T.transform_is_uniform({"xx": 1.345, "yy": 1.345 + 1e-9}))
+
+    def test_auto_rules_select_k_and_gamma(self):
+        base = T.text_attrs_from_descriptor(_desc())
+        # default new-layer: uniform scale, no leadingType -> k 0, gamma kept
+        opts = T.apply_auto_text_rules(base, {})
+        self.assertTrue(opts["auto_text_rules"])
+        self.assertEqual(opts["mixed_leading_k"], 0.0)
+        self.assertEqual(opts["aa_rules"]["antiAliasPlatformGray"], {"gamma": 1.4})
+        above = dict(base, leading_type="leadingAbove", paragraphs=[{**base["paragraphs"][0], "leading_type": "leadingAbove"}])
+        opts_a = T.apply_auto_text_rules(above, {})
+        self.assertAlmostEqual(opts_a["mixed_leading_k"], 0.86)
+        nonu = dict(base, transform={"xx": 1.3488, "xy": 0, "yx": 0, "yy": 1.345})
+        opts_n = T.apply_auto_text_rules(nonu, {})
+        self.assertNotIn("gamma", opts_n["aa_rules"].get("antiAliasPlatformGray") or {})
+        # explicit overrides win
+        opts_o = T.apply_auto_text_rules(above, {"mixed_leading_k": 0.5})
+        self.assertAlmostEqual(opts_o["mixed_leading_k"], 0.5)
+        opts_g = T.apply_auto_text_rules(nonu, {"aa_rules": {"antiAliasPlatformGray": {"gamma": 1.4}}})
+        self.assertEqual(opts_g["aa_rules"]["antiAliasPlatformGray"], {"gamma": 1.4})
+        # forced profiles skip auto
+        opts_ps = T.apply_auto_text_rules(above, dict(T.TEXT_PROFILES["ps2026"]))
+        self.assertEqual(opts_ps["mixed_leading_k"], 0.0)
+        opts_old = T.apply_auto_text_rules(base, dict(T.TEXT_PROFILES["older-file"]))
+        self.assertEqual((opts_old["mixed_leading_k"], opts_old["aa_rules"]), (0.86, {}))
+
+    def test_leading_above_is_bidirectional(self):
+        prev = [{"size_pt": 30.0, "auto_leading": False, "leading_pt": 33.0}]
+        bigger = [{"size_pt": 42.0, "auto_leading": False, "leading_pt": 33.0}]
+        smaller = [{"size_pt": 20.0, "auto_leading": False, "leading_pt": 33.0}]
+        opts = dict(T.DEFAULT_OPTIONS, mixed_leading_k=0.86, leading_type="leadingAbove")
+        self.assertAlmostEqual(T.line_advance(prev, bigger, opts, leading_type="leadingAbove"), 33.0 + 0.86 * 12.0)
+        self.assertAlmostEqual(T.line_advance(prev, smaller, opts, leading_type="leadingAbove"), 33.0 + 0.86 * (20.0 - 30.0))
+        # leadingBelow still only adds on a size increase
+        self.assertAlmostEqual(T.line_advance(prev, smaller, dict(T.DEFAULT_OPTIONS, mixed_leading_k=0.86)), 33.0)
+
+    def test_cli_default_profile_is_auto(self):
+        parser = h.build_parser()
+        args = parser.parse_args(["validate", "--layout", "l.json", "--slices-dir", "s",
+                                  "--full-render", "f.png", "--out-dir", "o"])
+        self.assertEqual(args.text_profile, "auto")
+        self.assertIn("auto", T.TEXT_PROFILES)
+
+
 @unittest.skipIf(find_test_font() is None or T._hb is None or T._ft is None, "uharfbuzz / freetype-py or a TTF missing")
 class Rules14Rendering(unittest.TestCase):
     def setUp(self):

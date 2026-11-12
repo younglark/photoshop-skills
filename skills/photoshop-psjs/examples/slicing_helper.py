@@ -2795,6 +2795,9 @@ def cmd_build_layout(args):
     effect_issues = find_silent_effect_loss(nodes, effect_groups)
     for problem in effect_issues:
         warn(f"group effect lost: {problem['name']} (group {problem['effect_group_id']})")
+    psd_for_text = (manifest.get("source") or {}).get("file")
+    if psd_for_text:
+        fill_layout_leading_types({"nodes": nodes}, psd_for_text)
     layout = {
         "schema": SCHEMA_LAYOUT,
         "source": manifest["source"],
@@ -3575,8 +3578,49 @@ def write_exported_preview(layout, rec, ref, out_dir, title=None):
     return paths
 
 
+
+def fill_layout_leading_types(layout, psd_path):
+    """Copy EngineData LeadingType onto dynamic_text nodes that lack leading_type (descriptor often omits it)."""
+    if not psd_path or not Path(psd_path).is_file():
+        return 0
+    mapping = text_render.leading_types_from_psd(psd_path)
+    if not mapping:
+        return 0
+    n = 0
+    for node in layout.get("nodes") or []:
+        if node.get("kind") != "dynamic_text":
+            continue
+        text = node.get("text")
+        if not isinstance(text, dict):
+            continue
+        lid = node.get("layer_id")
+        if lid is None:
+            continue
+        lt = mapping.get(int(lid))
+        if not lt:
+            continue
+        if not text.get("leading_type"):
+            text["leading_type"] = lt
+            n += 1
+        for para in text.get("paragraphs") or []:
+            if not para.get("leading_type"):
+                para["leading_type"] = lt
+    return n
+
+
+def resolve_layout_psd(layout, explicit=None):
+    if explicit:
+        return explicit
+    src = (layout or {}).get("source") or {}
+    path = src.get("file") or src.get("path")
+    return path if path and Path(path).is_file() else None
+
+
 def cmd_validate(args):
     layout = json.loads(Path(args.layout).read_text(encoding="utf-8"))
+    psd_for_text = resolve_layout_psd(layout, getattr(args, "psd", None))
+    if psd_for_text:
+        fill_layout_leading_types(layout, psd_for_text)
     slices_dir = Path(args.slices_dir)
     full = Image.open(args.full_render).convert("RGBA")
     art = layout["source"]["artboard"]
@@ -3624,7 +3668,7 @@ def cmd_validate(args):
         "snap_glyph_origin": getattr(args, "snap_glyph_origin", None),
     }
     text_opts = {k: v for k, v in text_opts.items() if v is not None}
-    profile = getattr(args, "text_profile", None) or "ps2026"
+    profile = getattr(args, "text_profile", None) or "auto"
     text_opts = dict(text_render.TEXT_PROFILES[profile], **text_opts)
     if getattr(args, "text_legacy_rules", False):
         text_opts = dict(text_render.LEGACY_1_3_OPTIONS, **text_opts)
@@ -3711,12 +3755,11 @@ def cmd_validate(args):
     mixed_nodes = [n["name"] for n in default_layout["nodes"]
                    if n.get("kind") == "dynamic_text" and text_has_mixed_size_lines(n.get("text") or {})]
     if mixed_nodes:
-        warn("note: %d dynamic_text node(s) have lines of different font sizes (%s); mixed_leading_k=%s. "
-             "New Photoshop 2026 text layers match 0; text layers in one older file matched 0.86. "
-             "If these nodes are among the worst elements, compare --text-profile older-file "
-             "(references/slicing.md 10.6)."
+        warn("note: %d dynamic_text node(s) have lines of different font sizes (%s). "
+             "Profile %s selects mixed-line drop from each layer's leadingType (leadingAbove uses k=0.86; "
+             "leadingBelow uses 0). See references/slicing.md 10.7."
              % (len(mixed_nodes), ", ".join(mixed_nodes[:5]),
-                dict(text_render.DEFAULT_OPTIONS, **text_opts).get("mixed_leading_k")))
+                getattr(args, "text_profile", None) or "auto"))
     report = {
         "artboard": art,
         "full_render": str(args.full_render),
@@ -3732,7 +3775,7 @@ def cmd_validate(args):
             "options": {k: v for k, v in dict(text_render.DEFAULT_OPTIONS, **text_opts).items() if k != "renderer"},
             "legacy_v1_text_attrs": len(legacy_v1),
             "legacy_v1_nodes": legacy_v1,
-            "profile": getattr(args, "text_profile", None) or "ps2026",
+            "profile": getattr(args, "text_profile", None) or "auto",
             "mixed_size_line_nodes": mixed_nodes,
         },
         "dynamic_text_rendered": rendered,
@@ -3849,11 +3892,16 @@ def build_parser():
                    help="dynamic_text preview renderer: auto (freetype, else skia), freetype, skia. "
                         "Missing packages are an error, not a fallback")
     s.add_argument("--mixed-leading-k", type=float, default=None,
-                   help="Extra drop of a following line, as a fraction of its font-size increase (default 0 since 1.4.0; 1.3.x used 0.86)")
-    s.add_argument("--text-profile", choices=list(text_render.TEXT_PROFILES), default="ps2026",
-                   help="ps2026: text laid out and rasterised by Photoshop 2026 as new layers (default, measured on "
-                        "345 gold images). older-file: text layers that behaved like an older file on one measured board "
-                        "(mixed_leading_k 0.86, no anti-alias gamma; cause not confirmed)")
+                   help="Override extra drop of a following line as a fraction of its font-size change "
+                        "(auto profile uses 0.86 only on leadingAbove layers; otherwise default 0)")
+    s.add_argument("--text-profile", choices=list(text_render.TEXT_PROFILES), default="auto",
+                   help="auto (default): per layer, leadingAbove uses mixed_leading_k 0.86 and a non-uniform "
+                        "layer transform disables anti-alias gamma (references/slicing.md 10.7). "
+                        "ps2026: force new-layer rules (k 0, gamma on). "
+                        "older-file: force k 0.86 and no anti-alias gamma on every layer")
+    s.add_argument("--psd", default=None,
+                   help="Optional PSD/PSB used only to read EngineData LeadingType when the layout omits leading_type. "
+                        "Defaults to layout.source.file when that path exists")
     s.add_argument("--text-legacy-rules", action="store_true", default=False,
                    help="Draw dynamic_text with the 1.3.x rules (no anti-alias rules, legacy stroke / spread, "
                         "no faux bold / italic, mixed_leading_k 0.86) for comparison")

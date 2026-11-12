@@ -605,7 +605,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
      - 投影/外发光的扩展用 4 倍分辨率距离变换外扩；外发光模糊 σ = 大小 / 2.5，并读取外发光的「范围」（`inputRange`，新版 `export_slices.psjs` 导出为 `range`）。
      - 仿粗体：轮廓外扩 0.01 em，每个字形前进量加 0.03 em；仿斜体：水平错切 0.2。都只是近似（报告里记在 `approximations`），仿粗体仍有约 21 dB 的误差。
      - `--snap-glyph-origin`（默认开）在新数据上复核成立：关掉后中位数掉约 6 dB。
-   - `--text-profile`：`ps2026`（默认，即上面的规则）；`older-file` 把 `mixed_leading_k` 设为 0.86 并关掉抗锯齿 gamma，其它规则不变——在一份较早的设计文件上，它的文字图层按这套参数才对得上（原因未确认，见 10.6，只有一块画板的证据）。布局里有「不同行字号不同」的文字时，`validate` 会在 stderr 提示并在报告 `text_renderer.mixed_size_line_nodes` 列出节点；这些节点排在最差元素里时，用 `--text-profile older-file` 对比一次。`--mixed-leading-k` 仍可单独覆盖。`--text-legacy-rules` 按 1.3.x 规则画，只用于对比。
+   - `--text-profile`：`auto`（默认，1.4.1）：按图层自动选择规则，见 10.7。`ps2026` 强制使用上面的新建图层规则（k = 0，PlatformGray gamma 开）。`older-file` 对所有图层使用 `mixed_leading_k` 0.86 并关掉抗锯齿 gamma。布局里有「不同行字号不同」的文字时，`validate` 会在 stderr 提示并在报告 `text_renderer.mixed_size_line_nodes` 列出节点。`--mixed-leading-k` 仍可单独覆盖。`--text-legacy-rules` 按 1.3.x 规则画，只用于对比。`validate --psd`（或 layout 的 `source.file`）用于在描述符缺少 `leadingType` 时从 EngineData 读取。
    - 不支持、会记入 `approximations` 的：变形文字、段落文字自动换行（按点文字排在框顶，约 11–12 dB）、字符水平/垂直缩放、渐变描边、非正常混合模式、颜色叠加以外的内部效果。找不到某条文字的字体、或某个字形加载失败时，`validate` 报错退出（`error.type: text_render_failed`，消息里带节点名），不跳过、不换字体也不换渲染器。用到描边、投影或外发光的扩展时需要 scipy，缺了同样报错（`text_renderer_unavailable`，安装命令 `pip install scipy`）。`--fonts-dir` 指向设计所用字体（Windows 用户安装的字体通常在 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`）。
 
 `Image.paste(..., mask=)` 不是正确的 Porter-Duff over。预览文字复现不了 PS 自己的光栅化、混合模式和效果算法，带文字的指标残差集中在文字本身属于预期。
@@ -780,3 +780,17 @@ Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、�
 | 缩放 0.5 × 效果 | 约 20 dB | 未定位 | 接受 |
 
 **未验证**：变形文字、段落换行、渐变描边、字符水平/垂直缩放、内阴影等内部效果、macOS 上的 Photoshop、PlatformLCD 与 None 的大样本、`older-file` 在其它文件上是否成立。
+
+### 10.7 行距模型与文字 gamma 的根因（1.4.1）
+
+在 10.5 / 10.6 那块列表画板上，文字图层要 `mixed_leading_k` 0.86 且 PlatformGray **不加** gamma 才对得上；在 Photoshop 2026 里新建的图层则是 k = 0、gamma 1.4。1.4.1 确认了这两处差别的来源，并按图层自动选择，不再需要手动 `--text-profile`。
+
+**行距（已确认）。** 画板文字段落的 EngineData `LeadingType` 为 1，即 `leadingAbove`（从上到上 / top-to-top）。batchPlay 描述符经常省略 `leadingType`（画板原文如此；把同一项显式设成 leadingAbove 后描述符里才会出现）。在副本上把 leadingType 改成 `leadingBelow` 后，第二行会上移约 14 px，此时 k = 0 对齐（约 46 dB）；改回 `leadingAbove` 则与原文像素一致。用 leadingAbove 新建的探针（Exo Bold、Noto Sans SC、Noto Serif）也是 k ≈ 0.86 对齐。因此混排行距的「额外下落」来自从上到上模型：`adv = leading + k × (本行字号 − 上一行字号)`（缩小同样适用）。系数 0.86 是拟合值，不是 HarfBuzz typoAscender/em（Exo 约为 1.00，对不上）。Roboto 单独拟合更接近 0.80，残差记为字体度量未完全对齐。自动行距 + leadingAbove 的公式仍未对齐（探针 r09），未采用。检测顺序：描述符 `paragraphStyle.leadingType`，缺了再读 EngineData `LeadingType`（0 = leadingBelow，1 = leadingAbove）。
+
+**Gamma（已确认，有范围）。** 应用设置 `TextBlendGamma` 为 1.45，与颜色探针上拟合的最佳 gamma 1.5 接近（与文字颜色无关）。在 Photoshop 2026 里新建、且图层变换等比（含恒等、xx = yy）的文字，PlatformGray 加 gamma 1.4 对齐。同一套文字只要图层变换**不等比**（xx ≠ yy，包括 1.3488×1.345 这种画板常用缩放，以及 1.001×1.0 这种 0.1% 偏差），新鲜栅格化后也不再套文字 gamma，最佳是 gamma 1.0。位深 16/8、ICC、分辨率、排版引擎、均匀缩放、文字颜色都已排除。未测量：xx = yy 但带旋转/切变时是否关 gamma。
+
+**存储像素的限制（无法从描述符判断）。** Photoshop 打开/导出时不会重画未改动的文字；磁盘上的像素反映当初写入时的环境。画板上一层恒等变换的单行文字，存储像素对齐 gamma 1.0；在本机强制重排后对齐 gamma 1.4。自动规则对「变换等比」的图层仍加 gamma，因此这类缓存像素可能对不齐；需要时用 `--text-profile older-file` 关掉全部文字 gamma。
+
+`auto` 配置文件按图层应用上述规则；`ps2026` / `older-file` 仍可强制全局。
+
+回归（相对 1.4.0）：345 张矩阵金图与 1.4.0 默认逐条 PSNR 完全一致（中位 28.26 dB，均值 28.29 dB）。那块列表画板文字框 PSNR：`auto` 37.39 dB（整板文字渲染 44.51 dB），`ps2026` 19.92 / 29.76（与 1.4.0 默认相同），`older-file` 39.57 / 45.52（与 1.4.0 相同）。`auto` 远好于默认，但比强制 `older-file` 低约 2.2 dB，差额来自变换等比的缓存像素（例如名次「4」、部分名字行）被加上了本机文字 gamma；这无法从描述符判断。要比齐这类存储像素，仍用 `--text-profile older-file`。

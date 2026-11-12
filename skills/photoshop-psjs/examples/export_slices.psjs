@@ -203,7 +203,8 @@ function parseText(desc) {
     return {
       from: p.from || 0, to: p.to || 0,
       align: enumVal(ps.align) || "left",
-      auto_leading_pct: ps.autoLeadingPercentage != null ? val(ps.autoLeadingPercentage) : null
+      auto_leading_pct: ps.autoLeadingPercentage != null ? val(ps.autoLeadingPercentage) : null,
+      leading_type: enumVal(ps.leadingType) || null
     };
   });
   const kerns = Array.from(new Set(runs.map((r) => String(r.auto_kern)))).sort();
@@ -227,6 +228,7 @@ function parseText(desc) {
     size_pt: (first.size_pt != null) ? first.size_pt : null,
     color: first.color || null,
     alignment: paragraphs.length ? paragraphs[0].align : null,
+    leading_type: paragraphs.length ? paragraphs[0].leading_type : null,
     tracking: (first.tracking != null) ? first.tracking : null,
     leading: (first.leading_pt != null) ? first.leading_pt : null,
     leading_px: (first.leading_px != null) ? first.leading_px : null,
