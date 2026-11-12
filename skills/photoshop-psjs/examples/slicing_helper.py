@@ -3668,8 +3668,6 @@ def cmd_validate(args):
         "snap_glyph_origin": getattr(args, "snap_glyph_origin", None),
     }
     text_opts = {k: v for k, v in text_opts.items() if v is not None}
-    profile = getattr(args, "text_profile", None) or "auto"
-    text_opts = dict(text_render.TEXT_PROFILES[profile], **text_opts)
     if getattr(args, "text_legacy_rules", False):
         text_opts = dict(text_render.LEGACY_1_3_OPTIONS, **text_opts)
     default_layout = layout_with_nodes(layout, default_nodes(layout))
@@ -3756,10 +3754,9 @@ def cmd_validate(args):
                    if n.get("kind") == "dynamic_text" and text_has_mixed_size_lines(n.get("text") or {})]
     if mixed_nodes:
         warn("note: %d dynamic_text node(s) have lines of different font sizes (%s). "
-             "Profile %s selects mixed-line drop from each layer's leadingType (leadingAbove uses k=0.86; "
-             "leadingBelow uses 0). See references/slicing.md 10.7."
-             % (len(mixed_nodes), ", ".join(mixed_nodes[:5]),
-                getattr(args, "text_profile", None) or "auto"))
+             "The extra line drop follows each layer's leadingType (leadingAbove k=0.86, leadingBelow 0). "
+             "See references/slicing.md 10.7."
+             % (len(mixed_nodes), ", ".join(mixed_nodes[:5])))
     report = {
         "artboard": art,
         "full_render": str(args.full_render),
@@ -3775,7 +3772,6 @@ def cmd_validate(args):
             "options": {k: v for k, v in dict(text_render.DEFAULT_OPTIONS, **text_opts).items() if k != "renderer"},
             "legacy_v1_text_attrs": len(legacy_v1),
             "legacy_v1_nodes": legacy_v1,
-            "profile": getattr(args, "text_profile", None) or "auto",
             "mixed_size_line_nodes": mixed_nodes,
         },
         "dynamic_text_rendered": rendered,
@@ -3828,6 +3824,20 @@ def cmd_validate(args):
     (out_dir / "validate_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 1
+
+
+TEXT_PROFILE_REMOVED = (
+    "--text-profile was removed in 1.4.2. Text rules are always chosen per layer: leadingAbove layers use "
+    "mixed_leading_k 0.86, a non-uniform layer transform turns off anti-alias gamma (references/slicing.md 10.7). "
+    "Drop the option; to override the line drop use --mixed-leading-k."
+)
+
+
+class RemovedOption(argparse.Action):
+    """Reject an option that no longer exists with a clear message instead of ignoring it."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(TEXT_PROFILE_REMOVED)
 
 
 def build_parser():
@@ -3892,13 +3902,9 @@ def build_parser():
                    help="dynamic_text preview renderer: auto (freetype, else skia), freetype, skia. "
                         "Missing packages are an error, not a fallback")
     s.add_argument("--mixed-leading-k", type=float, default=None,
-                   help="Override extra drop of a following line as a fraction of its font-size change "
-                        "(auto profile uses 0.86 only on leadingAbove layers; otherwise default 0)")
-    s.add_argument("--text-profile", choices=list(text_render.TEXT_PROFILES), default="auto",
-                   help="auto (default): per layer, leadingAbove uses mixed_leading_k 0.86 and a non-uniform "
-                        "layer transform disables anti-alias gamma (references/slicing.md 10.7). "
-                        "ps2026: force new-layer rules (k 0, gamma on). "
-                        "older-file: force k 0.86 and no anti-alias gamma on every layer")
+                   help="Override the extra drop of a following line as a fraction of its font-size change "
+                        "(by default 0.86 on leadingAbove layers, 0 otherwise; references/slicing.md 10.7)")
+    s.add_argument("--text-profile", nargs="?", action=RemovedOption, help=argparse.SUPPRESS)
     s.add_argument("--psd", default=None,
                    help="Optional PSD/PSB used only to read EngineData LeadingType when the layout omits leading_type. "
                         "Defaults to layout.source.file when that path exists")

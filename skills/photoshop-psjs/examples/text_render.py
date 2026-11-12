@@ -126,8 +126,6 @@ DEFAULT_OPTIONS = {
     # 1.4.0: 0. The 1.3.x value 0.86 was fitted on five two-line samples and did not hold on
     # 38 new two-line Photoshop samples (auto and fixed leading); see references/slicing.md 10.6.
     "mixed_leading_k": 0.0,
-    # When True (the default), each layer's leadingType and transform select k and gamma.
-    "auto_text_rules": True,
     "auto_leading_pct": 1.2,
     "snap_glyph_origin": True,
     "shadow_sigma_div": 2.0,
@@ -155,16 +153,6 @@ DEFAULT_OPTIONS = {
 # ascender ratios did not match (Exo ~1.00 vs this 0.86). See references/slicing.md 10.7.
 LEADING_ABOVE_K = 0.86
 UNIFORM_TRANSFORM_EPS = 1e-6
-
-# Text profiles (validate --text-profile). "auto" (default) picks mixed-line drop and
-# PlatformGray gamma per layer from leadingType and the layer transform (10.7).
-# "ps2026": force the 1.4.0 new-layer rules (k 0, gamma on). "older-file": force
-# k 0.86 and no anti-alias gamma on every layer.
-TEXT_PROFILES = {
-    "auto": {"auto_text_rules": True},
-    "ps2026": {"auto_text_rules": False},
-    "older-file": {"auto_text_rules": False, "mixed_leading_k": 0.86, "aa_rules": {}},
-}
 
 # The 1.3.x drawing rules, for comparison runs (validate --text-legacy-rules).
 LEGACY_1_3_OPTIONS = {
@@ -534,17 +522,14 @@ def layer_leading_type(text):
 
 
 def apply_auto_text_rules(text, options=None):
-    """Return render options, filling k and anti-alias gamma from this layer when auto_text_rules is on.
+    """Return render options with k and anti-alias gamma chosen for this layer (always on since 1.4.2).
 
     leadingAbove (from the descriptor or EngineData) uses LEADING_ABOVE_K unless the caller
     already set mixed_leading_k. A non-uniform transform drops coverage gamma unless the
-    caller already set aa_rules. Explicit --text-profile ps2026 / older-file sets
-    auto_text_rules False and skips this.
+    caller already set aa_rules. See references/slicing.md 10.7.
     """
     passed = dict(options or {})
     opts = dict(DEFAULT_OPTIONS, **passed)
-    if not opts.get("auto_text_rules"):
-        return opts
     lt = layer_leading_type(text)
     if lt:
         opts["leading_type"] = lt

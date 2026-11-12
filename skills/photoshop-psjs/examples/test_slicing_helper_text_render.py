@@ -351,7 +351,7 @@ class ValidateReport(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _validate(self, attrs, renderer="auto", profile="ps2026"):
+    def _validate(self, attrs, renderer="auto"):
         layout = {
             "schema": h.SCHEMA_LAYOUT,
             "source": {"doc_size": [200, 80], "artboard": {"name": "board", "bounds": [0, 0, 200, 80],
@@ -372,8 +372,7 @@ class ValidateReport(unittest.TestCase):
             rc = h.cmd_validate(SimpleNamespace(layout=str(lpath), slices_dir=str(self.slices), full_render=str(rpath),
                                                 out_dir=str(out), fonts_dir=str(self.fonts), group_effects=None,
                                                 reuse_tol_mae=4.0, reuse_tol_pct=1.0, text_renderer=renderer,
-                                                mixed_leading_k=None, snap_glyph_origin=None, text_legacy_rules=False,
-                                                text_profile=profile))
+                                                mixed_leading_k=None, snap_glyph_origin=None, text_legacy_rules=False))
         report = json.loads((out / "validate_report.json").read_text(encoding="utf-8"))
         return rc, report, out, err.getvalue()
 
@@ -414,10 +413,8 @@ class ValidateReport(unittest.TestCase):
         self.assertNotIn("fallback_reason", tr)
         self.assertAlmostEqual(tr["options"]["mixed_leading_k"], 0.0)
         self.assertEqual(tr["options"]["aa_rules"]["antiAliasPlatformGray"], {"gamma": 1.4})
-        self.assertEqual(tr["profile"], "ps2026")
-        _rc, report2, _o, _e = self._validate(T.text_attrs_from_descriptor(_desc(two_runs=False)), profile="older-file")
-        opts2 = report2["text_renderer"]["options"]
-        self.assertEqual((opts2["mixed_leading_k"], opts2["aa_rules"], opts2["stroke_model"]), (0.86, {}, "hires"))
+        self.assertNotIn("profile", tr)
+        self.assertNotIn("auto_text_rules", tr["options"])
         self.assertEqual(tr["legacy_v1_text_attrs"], 0)
         info = report["dynamic_text_render_info"][0]
         self.assertEqual((info["name"], info["renderer"]), ("main_text_label", "freetype"))
@@ -507,7 +504,6 @@ class Rules141(unittest.TestCase):
         base = T.text_attrs_from_descriptor(_desc())
         # default new-layer: uniform scale, no leadingType -> k 0, gamma kept
         opts = T.apply_auto_text_rules(base, {})
-        self.assertTrue(opts["auto_text_rules"])
         self.assertEqual(opts["mixed_leading_k"], 0.0)
         self.assertEqual(opts["aa_rules"]["antiAliasPlatformGray"], {"gamma": 1.4})
         above = dict(base, leading_type="leadingAbove", paragraphs=[{**base["paragraphs"][0], "leading_type": "leadingAbove"}])
@@ -521,11 +517,6 @@ class Rules141(unittest.TestCase):
         self.assertAlmostEqual(opts_o["mixed_leading_k"], 0.5)
         opts_g = T.apply_auto_text_rules(nonu, {"aa_rules": {"antiAliasPlatformGray": {"gamma": 1.4}}})
         self.assertEqual(opts_g["aa_rules"]["antiAliasPlatformGray"], {"gamma": 1.4})
-        # forced profiles skip auto
-        opts_ps = T.apply_auto_text_rules(above, dict(T.TEXT_PROFILES["ps2026"]))
-        self.assertEqual(opts_ps["mixed_leading_k"], 0.0)
-        opts_old = T.apply_auto_text_rules(base, dict(T.TEXT_PROFILES["older-file"]))
-        self.assertEqual((opts_old["mixed_leading_k"], opts_old["aa_rules"]), (0.86, {}))
 
     def test_leading_above_is_bidirectional(self):
         prev = [{"size_pt": 30.0, "auto_leading": False, "leading_pt": 33.0}]
@@ -537,12 +528,20 @@ class Rules141(unittest.TestCase):
         # leadingBelow still only adds on a size increase
         self.assertAlmostEqual(T.line_advance(prev, smaller, dict(T.DEFAULT_OPTIONS, mixed_leading_k=0.86)), 33.0)
 
-    def test_cli_default_profile_is_auto(self):
+    def test_text_profile_option_is_removed(self):
+        self.assertFalse(hasattr(T, "TEXT_PROFILES"))
+        self.assertNotIn("auto_text_rules", T.DEFAULT_OPTIONS)
         parser = h.build_parser()
-        args = parser.parse_args(["validate", "--layout", "l.json", "--slices-dir", "s",
-                                  "--full-render", "f.png", "--out-dir", "o"])
-        self.assertEqual(args.text_profile, "auto")
-        self.assertIn("auto", T.TEXT_PROFILES)
+        base = ["validate", "--layout", "l.json", "--slices-dir", "s", "--full-render", "f.png", "--out-dir", "o"]
+        args = parser.parse_args(base)
+        self.assertFalse(hasattr(args, "text_profile") and args.text_profile)
+        for extra in (["--text-profile", "older-file"], ["--text-profile", "ps2026"], ["--text-profile=auto"],
+                      ["--text-profile"]):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                parser.parse_args(base + extra)
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("--text-profile was removed in 1.4.2", err.getvalue())
 
 
 @unittest.skipIf(find_test_font() is None or T._hb is None or T._ft is None, "uharfbuzz / freetype-py or a TTF missing")
