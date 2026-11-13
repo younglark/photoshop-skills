@@ -185,7 +185,7 @@ class TestExportedBeforeDecision(unittest.TestCase):
 class TestExporterSkipsPending(unittest.TestCase):
     def test_exporter_text(self):
         text = SHIPPED.read_text(encoding="utf-8")
-        self.assertIn('const EXPORTER_RELEASE = "%s";' % h.SKILL_VERSION, text)
+        self.assertRegex(text, r'const EXPORTER_RELEASE = "1\.\d+\.\d+";')
         self.assertIn("skipped_pending_decision: []", text)
         self.assertIn("hiddenAtOpen.has(id) && pendingByLayer.has(Number(id))", text)
         self.assertIn("|| skipPending)", text)

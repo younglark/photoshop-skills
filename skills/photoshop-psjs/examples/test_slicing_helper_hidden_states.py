@@ -328,7 +328,7 @@ class TestFlattenAndExporter(unittest.TestCase):
         text = SHIPPED.read_text(encoding="utf-8")
         self.assertIn("log.layers_at_open_ms = nowMs() - tSnap;", text)
         self.assertIn("fullItem.hidden_at_render_ms = nowMs() - tSnap2;", text)
-        self.assertIn('const EXPORTER_RELEASE = "%s";' % h.SKILL_VERSION, text)
+        self.assertRegex(text, r'const EXPORTER_RELEASE = "1\.\d+\.\d+";')
 
 
 if __name__ == "__main__":

@@ -463,3 +463,11 @@ PSNR 按整张导出画布计算（括号内是合并图可见范围）。现状
 回归用合成数据（`examples/test_slicing_helper_visible_area.py`，24 条）：竖条 / 横条可见区、全部可见、低于阈值的小溢出、上层节点盖住、只有导出器蒙版记录、用户答 `unmasked`（经 / 未经 `confirm --decision`）、图层树的组蒙版（启用 / 停用 / 框外可见）、导出器文本；端到端（`flatten` → `confirm` → `build-layout` → `validate`）：没有决定的衬底仍 `ok:false` 但 `psnr_full_over_backdrop` 为 99、用户排除衬底后 `ok:true`、衬底决定未答只报 `pending_user_decision`、答 `include` 要补条目、蒙版记录与纯像素两条来源；衬底色均匀 / 不均匀 / 无未切区 / 文字区不参与；审核门闩的树检查、`flatten` / `preview` 列出、`confirm` 退出码 5 不锁定、补上决定后锁定；Windows 路径比较。
 
 在这次盲测的产物上（离线，导出器哈希按当时的作业副本）复跑：`slice_exceeds_visible_area` 报顶栏（可见框 517–536 × 211–372，右侧溢出 678 px，94% 的检查像素在可见框外且不吻合），另报两个页签各右侧 4 px（PS 整图里页签右缘是直边，导出图带圆角右缘，溢出处显示的是衬底）；`visible_layer_unassigned` 带 `reason: no_decision` 和 `suggested_decision`；`psnr_full` 8.68、`psnr_full_over_backdrop` 29.34（`backdrop.color` #5c656c，`layers` 是那个填充层，状态 `no_decision`）。在清单的图层树上跑审核门闩，正好列出那个填充层，`confirm` 会在交审前拦下。在前三轮盲测（商店、商店重跑、弹窗）的产物上复跑，`slice_exceeds_visible_area` 都没有报，那三块板没有未切区域，`backdrop.used` 为 false。导出器的蒙版裁切还没在 Photoshop 上跑过（`bounds` 含组蒙版这一点以 Photoshop 实际返回为准）；裁不到的像素由 `validate` 的像素检查兜底。
+
+### 10.20 排除衬底后官方 PSNR 失真、模型擅自改清单并重新锁定（1.4.17）
+
+起因：1.4.16 在同一块素材拼板上，用户排除整板灰色衬底后，模型用 `confirm --decision` 记下了回答并重新导出。整图渲染里衬底已隐藏，不透明区域与 Photoshop 一致（alpha 差为 0，只比有像素的地方约 99 dB），但官方 `psnr_full` 落到约 2.66 dB（MAE 约 138，差值 >16 的像素过半）。原因是参考图透明处 Photoshop 写下白色 RGB，拼图写下黑色，按未预乘 RGB 整幅去比。`psnr_full_over_backdrop` 为 `null`（`backdrop.used: false`，`reason: reference_transparent_there`），垫底帮不上忙。
+
+同一轮里模型还把第二阶段留下的修改建议（改页签归属、放宽逻辑框）自行写进清单，并用 `--relock` 重新锁定，说是为了让这轮校验通过。这些改动没有用户决定。`ok: true` 主要是这样改出来的。
+
+1.4.17 把两处都做成机械检查：`confirm` 对照上一份锁定清单，未经用户决定授权的改动报 `unapproved_manifest_change`（退出码 6，不写新锁）；参考图含透明像素时，官方 `psnr_full` 改按预乘 RGB 加 alpha。回归见 `examples/test_slicing_helper_confirm_lock.py`、`examples/test_slicing_helper_metrics.py`。导出器没有改，也尚未就这两项在 Photoshop 上重跑盲测。

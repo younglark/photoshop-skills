@@ -173,7 +173,7 @@ class TestVisibleArea(unittest.TestCase):
 
     def test_exporter_crops_to_the_mask_area(self):
         text = SHIPPED.read_text(encoding="utf-8")
-        self.assertIn('const EXPORTER_RELEASE = "%s";' % h.SKILL_VERSION, text)
+        self.assertRegex(text, r'const EXPORTER_RELEASE = "1\.\d+\.\d+";')
         self.assertIn("async function maskClipFor(src, selectIds)", text)
         self.assertIn('maskClip.skipped = "user_decision_unmasked";', text)
         self.assertIn("const left = cropOrigin.left + beforeTrim.left - afterTrim.left;", text)

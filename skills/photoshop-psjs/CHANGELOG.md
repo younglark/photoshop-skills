@@ -2,6 +2,15 @@
 
 维护者向的版本记录。现行切图规则只在 [references/slicing.md](references/slicing.md)；历史实测（原第 10 节 10.1–10.17，之后的接着编号）在 [references/slicing-history.md](references/slicing-history.md)。入口是 [SKILL.md](SKILL.md)。
 
+## 1.4.17
+
+两处交付漏洞都改成机械检查，导出器没有改：
+
+- **未经用户决定授权的清单改动不能重新锁定。** `confirm`（含 `--relock`，以及夹带其它改动的 `--decision`）对照上一份 `manifest.confirmed.json`：用户已记录决定的后果（答 `include` 后把该层加入条目，答 `exclude` / `leftover` 后拿掉该层，或只写入这次 `--decision` 的 `decision` / `decided_by` / `decided_at`）允许锁定；改 `layer_id` / 父组、`logical_bounds` / 九宫 / `kind` / 名称 / 源层、擅自增删条目等报 `unapproved_manifest_change`，退出码 6，不写新锁，列出改动的条目和字段。`--note` 或单独的 `--relock` 不授权这些改动。退出码 3（改过但没加 `--relock`）和退出码 5（可见层既无条目也无决定）保持原义。
+- **参考图透明时，官方整图分数不再被透明像素里的 RGB 拉低。** 参考图全部不透明时，`psnr_full`（= `diff_text_masked.psnr_db`）仍按 RGB 直接比，数字不变。参考图含透明像素时，官方 MAE / PSNR / 差值 >16 的比例改按预乘 RGB（`rgb * a/255`）再加 alpha 通道：两端都完全透明、只是 RGB 不同（Photoshop 写白、拼图写黑）算一致；缺了或多了可见内容，以及不透明 / 半透明上的颜色误差，仍计入。报告增加 `psnr_definition` 和仅供排查的 `psnr_full_raw_rgb`。参考图已经透明时，`psnr_full_over_backdrop` 仍可不用（`reference_transparent_there`），不必靠垫底来掩盖这个算法问题。
+
+导出器没有改（`EXPORTER_RELEASE` 仍为 1.4.16，哈希不变），作业目录不必重新复制 `export_slices.psjs`。
+
 ## 1.4.16
 
 一次素材拼板盲测暴露的问题，都落到机械检查上（`validate` 的 `issues`，`ok:false`），审核门闩也提前拦一道：

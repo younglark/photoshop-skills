@@ -18,6 +18,9 @@ Subcommands:
   infer       Optional keyword draft only (draft_manifest.json); the agent must review or replace it.
   preview     Redraw the annotated preview from a (possibly edited) manifest.
   confirm     Lock the manifest after the user confirms it (manifest.confirmed.json + .sha256).
+              Exit 5 if visible layers have no entry and no decision; exit 6 and keep the previous
+              lock if the manifest has unapproved changes (not the recorded consequence of a user
+              decision). --relock / --decision cannot sneak in those edits.
   check-lock  Exit non-zero if the manifest changed after confirmation (run before export).
   build-layout  Merge confirmed manifest + Photoshop export log + PNGs into layout JSON.
   validate    Recomposite the default state vs a full PS render; also render alternate states.
@@ -56,7 +59,7 @@ except ImportError:
     ParseLimits = None
 
 SCHEMA_MANIFEST = "psjs-slice-manifest/v2"
-SKILL_VERSION = "1.4.16"
+SKILL_VERSION = "1.4.17"
 SCHEMA_LAYOUT = "psjs-layout/v2"
 SCHEMA_MANIFEST_V1 = "psjs-slice-manifest/v1"
 SCHEMA_LAYOUT_V1 = "psjs-layout/v1"
@@ -3586,15 +3589,357 @@ MANIFEST_CHANGED_HINT = (
     "manifest.proposal.json (what, why, evidence), and stop for the user to re-confirm (then run confirm again)."
 )
 
+# 1.4.17: confirm / --relock will not write a new lock when the manifest has edits the user's recorded
+# decisions do not authorise. Exit 6 (exit 5 stays the visible-layer review gate; exit 3 stays "changed
+# and you did not pass --relock", for authorised decision-driven updates only).
+INCLUDE_DECISIONS = {"include", "included", "keep", "keep_layer", "yes", "use"}
+CONFIRM_META_KEYS = {"status", "confirmed_at", "confirmed_note"}
+DECISION_ANSWER_KEYS = {"decision", "decided_by", "decided_at"}
+UNAPPROVED_MANIFEST_CHANGE = "unapproved_manifest_change"
+UNAPPROVED_MANIFEST_EXIT = 6
+UNAPPROVED_MANIFEST_HINT = (
+    "the manifest was edited after confirmation in ways the user's recorded decisions do not authorise "
+    "(layer_id / parent / logical_bounds / nine-slice / kind / name / source-layer changes, or adding or "
+    "removing entries, that are not the recorded consequence of a user decision). The new lock was not "
+    "written. Show the listed changes to the user and record their answer with confirm --decision before "
+    "changing the confirmed manifest. A --note or --relock does not authorise the agent's own proposals."
+)
+
+
+def _json_brief(value, depth=0):
+    """JSON-serialisable short form of a manifest fragment (for issue listings)."""
+    if isinstance(value, dict):
+        if depth >= 1 and any(k in value for k in ("name", "layer_id", "select_ids", "kind", "logical_bounds", "parts")):
+            out = {k: value[k] for k in ("name", "id", "kind", "layer_id", "select_ids", "logical_bounds") if k in value}
+            out["keys"] = sorted(value)
+            return out
+        return {str(k): _json_brief(v, depth + 1) for k, v in list(value.items())[:40]}
+    if isinstance(value, list):
+        if depth >= 1 and len(value) > 8:
+            return [_json_brief(v, depth + 1) for v in value[:8]] + ["…(%d)" % len(value)]
+        return [_json_brief(v, depth + 1) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _list_item_key(item, index):
+    if isinstance(item, dict):
+        if item.get("name") not in (None, ""):
+            return "name", item["name"]
+        if item.get("id") not in (None, ""):
+            return "id", item["id"]
+    return "index", index
+
+
+def _path_join(path, key):
+    if path in (None, "", "$"):
+        return str(key)
+    if isinstance(key, str) and key.startswith("["):
+        return path + key
+    return f"{path}.{key}"
+
+
+def _path_entry_name(path, node=None):
+    if isinstance(node, dict) and node.get("name") not in (None, ""):
+        return node["name"]
+    if not path:
+        return None
+    for part in reversed(str(path).replace("]", "").split(".")):
+        if part.startswith("name="):
+            return part[5:]
+        if "[name=" in part:
+            return part.split("[name=", 1)[1]
+    return None
+
+
+def _collect_layer_ids(obj):
+    ids = []
+    if isinstance(obj, dict):
+        if obj.get("layer_id") is not None:
+            ids.append(_lid(obj["layer_id"]))
+        for x in obj.get("select_ids") or []:
+            if x is not None:
+                ids.append(_lid(x))
+        for v in obj.values():
+            ids.extend(_collect_layer_ids(v))
+    elif isinstance(obj, list):
+        for it in obj:
+            ids.extend(_collect_layer_ids(it))
+    return ids
+
+
+def _ids_from_value(val):
+    if val is None or val == "":
+        return []
+    if isinstance(val, (list, tuple)):
+        return [_lid(x) for x in val if x is not None]
+    return [_lid(val)]
+
+
+def recorded_user_layer_sets(decisions, decision_log):
+    """Layer ids a recorded user answer allows adding (include / export-as-state) or removing (exclude / leftover)."""
+    add, remove = set(), set()
+    for d in decisions or []:
+        if not isinstance(d, dict) or decision_answer_state(d, decision_log) is not None:
+            continue
+        typ, val = d.get("type"), _norm_decision(d.get("decision"))
+        ids = {_lid(x) for x in (d.get("layer_ids") or []) if x is not None}
+        if typ in EXCLUDE_DECISION_TYPES:
+            if val in EXCLUDE_DECISIONS:
+                remove |= ids
+            elif val in INCLUDE_DECISIONS:
+                add |= ids
+        elif typ == "hidden_layer_state":
+            if val in EXCLUDE_DECISIONS:
+                remove |= ids
+            elif val in STATE_EXPORT_DECISIONS:
+                add |= ids
+    return add, remove
+
+
+def _structural_diff(before, after, path="$"):
+    """List of {op, path, field, name, before, after} between two JSON-like values."""
+    changes = []
+
+    def rec(a, b, here):
+        if a is b:
+            return
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and a == b:
+            return
+        if type(a) is not type(b) and not (isinstance(a, (int, float)) and isinstance(b, (int, float))):
+            changes.append({"op": "change", "path": here, "field": here.rsplit(".", 1)[-1],
+                            "name": _path_entry_name(here, b if isinstance(b, dict) else a),
+                            "before": _json_brief(a), "after": _json_brief(b)})
+            return
+        if isinstance(a, dict) and isinstance(b, dict):
+            keys = sorted(set(a) | set(b), key=str)
+            for k in keys:
+                child = _path_join(here, k)
+                if k not in a:
+                    changes.append({"op": "add", "path": child, "field": k,
+                                    "name": _path_entry_name(child, b[k] if isinstance(b[k], dict) else None),
+                                    "before": None, "after": _json_brief(b[k])})
+                elif k not in b:
+                    changes.append({"op": "remove", "path": child, "field": k,
+                                    "name": _path_entry_name(child, a[k] if isinstance(a[k], dict) else None),
+                                    "before": _json_brief(a[k]), "after": None})
+                else:
+                    rec(a[k], b[k], child)
+            return
+        if isinstance(a, list) and isinstance(b, list):
+            primitives = all(not isinstance(x, (dict, list)) for x in list(a) + list(b))
+            if primitives:
+                if a != b:
+                    field = here.rsplit(".", 1)[-1] if "." in here else here
+                    changes.append({"op": "change", "path": here, "field": field,
+                                    "name": _path_entry_name(here),
+                                    "before": _json_brief(a), "after": _json_brief(b)})
+                return
+
+            def ident(item, i):
+                return _list_item_key(item, i)
+
+            used = set()
+            b_used = set()
+            a_by = {}
+            for i, it in enumerate(a):
+                a_by.setdefault(ident(it, i), []).append((i, it))
+            for j, it in enumerate(b):
+                key = ident(it, j)
+                slot = next((pair for pair in a_by.get(key, []) if pair[0] not in used), None)
+                if slot is None and key[0] != "index":
+                    changes.append({"op": "add", "path": f"{here}[{key[0]}={key[1]}]", "field": None,
+                                    "name": it.get("name") if isinstance(it, dict) else None,
+                                    "before": None, "after": _json_brief(it)})
+                    b_used.add(j)
+                    continue
+                if slot is None:
+                    continue
+                i, prev = slot
+                used.add(i)
+                b_used.add(j)
+                rec(prev, it, f"{here}[{key[0]}={key[1]}]" if key[0] != "index" else f"{here}[{i}]")
+            for i, it in enumerate(a):
+                if i in used:
+                    continue
+                key = ident(it, i)
+                label = f"{key[0]}={key[1]}" if key[0] != "index" else str(i)
+                changes.append({"op": "remove", "path": f"{here}[{label}]", "field": None,
+                                "name": it.get("name") if isinstance(it, dict) else None,
+                                "before": _json_brief(it), "after": None})
+            for j, it in enumerate(b):
+                if j in b_used:
+                    continue
+                key = ident(it, j)
+                if key[0] != "index":
+                    continue
+                changes.append({"op": "add", "path": f"{here}[{j}]", "field": None,
+                                "name": it.get("name") if isinstance(it, dict) else None,
+                                "before": None, "after": _json_brief(it)})
+            return
+        if a != b:
+            changes.append({"op": "change", "path": here, "field": here.rsplit(".", 1)[-1],
+                            "name": _path_entry_name(here),
+                            "before": _json_brief(a), "after": _json_brief(b)})
+
+    rec(before, after, path)
+    return changes
+
+
+def _names_in(obj):
+    names = {}
+    if isinstance(obj, dict):
+        if obj.get("name") not in (None, ""):
+            names.setdefault(obj["name"], 0)
+            names[obj["name"]] += 1
+        for v in obj.values():
+            for k, n in _names_in(v).items():
+                names[k] = names.get(k, 0) + n
+    elif isinstance(obj, list):
+        for it in obj:
+            for k, n in _names_in(it).items():
+                names[k] = names.get(k, 0) + n
+    return names
+
+
+def _ids_change_allowed(before, after, add_ids, remove_ids):
+    gained = set(_ids_from_value(after)) - set(_ids_from_value(before))
+    lost = set(_ids_from_value(before)) - set(_ids_from_value(after))
+    return bool(gained or lost) and gained <= add_ids and lost <= remove_ids
+
+
+def _change_authorised(ch, add_ids, remove_ids, confirmed_names, current_names):
+    """True when this structural change is the recorded consequence of a user decision."""
+    path = ch.get("path") or ""
+    field = ch.get("field")
+    name = ch.get("name")
+    if path == "reuse_decisions" or path.startswith("reuse_decisions.") or path.startswith("reuse_decisions["):
+        return False  # reuse_decisions are classified separately
+    if ch["op"] in ("add", "remove"):
+        payload = ch.get("after") if ch["op"] == "add" else ch.get("before")
+        ids = set(_collect_layer_ids(payload))
+        if not ids:
+            return False
+        if ch["op"] == "add":
+            if name and confirmed_names.get(name) and current_names.get(name, 0) <= confirmed_names.get(name, 0):
+                # appeared under a new path while the same name still exists (or existed) — a move / reparent
+                pass
+            if name and name in confirmed_names:
+                return False  # existing entry moved or duplicated
+            return ids <= add_ids
+        return ids <= remove_ids
+    # field change on an existing node
+    if field in ("layer_id", "select_ids"):
+        return _ids_change_allowed(ch.get("before"), ch.get("after"), add_ids, remove_ids)
+    if field == "hidden":
+        ids = set()
+        # hidden flag on an entry whose layers the user excluded / re-included
+        # (layer ids are not on the field itself; caller may pass them via name lookup — skip if unknown)
+        return False
+    return False
+
+
+def _decision_id_from_path(path):
+    if "reuse_decisions[id=" in (path or ""):
+        return path.split("reuse_decisions[id=", 1)[1].split("]", 1)[0]
+    if "reuse_decisions[name=" in (path or ""):
+        return path.split("reuse_decisions[name=", 1)[1].split("]", 1)[0]
+    return None
+
+
+def _decision_change_authorised(ch, confirmed_decs, current_decs, decision_log, recorded_ids):
+    """reuse_decisions edits: new questions, and answer fields that match a recorded user answer, are allowed."""
+    confirmed_by = {str(d.get("id")): d for d in (confirmed_decs or []) if isinstance(d, dict) and d.get("id") is not None}
+    current_by = {str(d.get("id")): d for d in (current_decs or []) if isinstance(d, dict) and d.get("id") is not None}
+    path = ch.get("path") or ""
+    field = ch.get("field")
+    payload = ch.get("after") if ch.get("op") == "add" else ch.get("before") if ch.get("op") == "remove" else None
+    did = _decision_id_from_path(path)
+    if did is None and isinstance(payload, dict) and payload.get("id") is not None:
+        did = str(payload["id"])
+    if did is None and ch.get("name") not in (None, ""):
+        key = str(ch["name"])
+        if key in current_by or key in confirmed_by:
+            did = key
+    new = current_by.get(did) if did is not None else None
+    old = confirmed_by.get(did) if did is not None else None
+    suffix = path.split("]", 1)[-1] if "]" in path else ""
+    whole_entry = path.startswith("reuse_decisions[") and suffix in ("",)
+
+    if field in DECISION_ANSWER_KEYS:
+        if new is None:
+            return False
+        return decision_recorded(new, decision_log) or str(did) in recorded_ids
+    if ch["op"] == "add" and (path == "reuse_decisions" or whole_entry):
+        return did not in confirmed_by if did is not None else True
+    if ch["op"] == "remove" and (path == "reuse_decisions" or whole_entry or (path.startswith("reuse_decisions") and isinstance(payload, dict))):
+        if old is None:
+            return True
+        return not decision_recorded(old, decision_log) and str(did) not in recorded_ids
+    if did is None:
+        return False
+    if new is None:
+        return False
+    if old is None:
+        return True  # fields of a newly added decision
+    # freeze question / layer_ids / options / type once an answer is in the previous log
+    if decision_recorded(old, decision_log):
+        return False
+    return True  # typo fixes on a still-open question
+
+
+def unapproved_manifest_changes(confirmed, current, decision_log, recorded_ids=None):
+    """Changes in current vs the last locked manifest that a recorded user decision does not authorise.
+
+    Returns a list of {op, path, field, name, before, after} (empty when the new lock would be allowed).
+    Confirm metadata (status / confirmed_at / confirmed_note) is ignored. reuse_decisions answer fields
+    that match the decision_log (or this confirm's --decision ids) are allowed, as are adding an entry
+    for a layer the user said to include / export as a state, and removing an entry for a layer they
+    said to exclude / leave as leftover. Everything else (bounds, kind, name, parent, source layer,
+    unauthorised add/remove, and so on) is unapproved.
+    """
+    recorded_ids = {str(x) for x in (recorded_ids or [])}
+    if not isinstance(confirmed, dict) or not isinstance(current, dict):
+        return [{"op": "change", "path": "$", "field": None, "name": None,
+                 "before": _json_brief(confirmed), "after": _json_brief(current)}]
+    left = {k: v for k, v in confirmed.items() if k not in CONFIRM_META_KEYS}
+    right = {k: v for k, v in current.items() if k not in CONFIRM_META_KEYS}
+    left_decs, right_decs = left.get("reuse_decisions") or [], right.get("reuse_decisions") or []
+    struct_l = {k: v for k, v in left.items() if k != "reuse_decisions"}
+    struct_r = {k: v for k, v in right.items() if k != "reuse_decisions"}
+    add_ids, remove_ids = recorded_user_layer_sets(current.get("reuse_decisions") or [], decision_log)
+    confirmed_names, current_names = _names_in(struct_l), _names_in(struct_r)
+    unapproved = []
+    for ch in _structural_diff(left_decs, right_decs, "reuse_decisions"):
+        if not _decision_change_authorised(ch, left_decs, right_decs, decision_log, recorded_ids):
+            unapproved.append(ch)
+    for ch in _structural_diff(struct_l, struct_r, "$"):
+        # drop the leading "$."
+        if ch.get("path", "").startswith("$."):
+            ch = dict(ch, path=ch["path"][2:])
+        elif ch.get("path") == "$":
+            ch = dict(ch, path="")
+        if not _change_authorised(ch, add_ids, remove_ids, confirmed_names, current_names):
+            unapproved.append(ch)
+    return unapproved
+
+
+def confirmed_manifest_dict(path):
+    """Last locked manifest (manifest.confirmed.json), or None if there is no copy yet."""
+    copy, _sha = manifest_lock_paths(Path(path))
+    if not copy.is_file():
+        return None
+    try:
+        return json.loads(copy.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
 
 def cmd_confirm(args):
     path = Path(args.manifest)
     manifest = json.loads(path.read_text(encoding="utf-8"))
     st = manifest_lock_state(path)
-    if st["locked"] and st["changed"] and not getattr(args, "relock", False):
-        print(json.dumps(dict(st, error="manifest_changed_after_confirm", hint=MANIFEST_CHANGED_HINT),
-                         ensure_ascii=False, indent=2))
-        return 3
     status = manifest.get("status")
     if status not in (None, "pending_review", "confirmed"):
         raise SystemExit(f"manifest.status is {status!r}; only pending_review / confirmed can be confirmed")
@@ -3623,6 +3968,25 @@ def cmd_confirm(args):
     decision_log = list(st.get("decision_log") or [])
     for r in recorded:
         decision_log.append({"id": r["id"], "decision": r["decision"], "decided_at": stamp})
+    confirmed = confirmed_manifest_dict(path)
+    if confirmed is not None:
+        unapproved = unapproved_manifest_changes(confirmed, manifest, decision_log,
+                                                 recorded_ids=[r["id"] for r in recorded])
+        if unapproved:
+            print(json.dumps({"ok": False, "error": UNAPPROVED_MANIFEST_CHANGE,
+                              "type": UNAPPROVED_MANIFEST_CHANGE,
+                              "count": len(unapproved),
+                              "changes": unapproved[:50],
+                              "hint": UNAPPROVED_MANIFEST_HINT,
+                              "sha256": st.get("sha256"),
+                              "confirmed_sha256": st.get("confirmed_sha256")},
+                             ensure_ascii=False, indent=2))
+            print("error: unapproved_manifest_change; manifest not re-locked", file=sys.stderr, flush=True)
+            return UNAPPROVED_MANIFEST_EXIT
+    if st["locked"] and st["changed"] and not getattr(args, "relock", False):
+        print(json.dumps(dict(st, error="manifest_changed_after_confirm", hint=MANIFEST_CHANGED_HINT),
+                         ensure_ascii=False, indent=2))
+        return 3
     pending = pending_user_decisions(decs, decision_log)
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     copy, sha = manifest_lock_paths(path)
@@ -6427,23 +6791,24 @@ def text_region_mask(layout, cw, ch):
     return mask
 
 
-def metrics(a, b, mask=None):
-    rgb_a, rgb_b = a[..., :3], b[..., :3]
-    if mask is not None:
-        keep = ~mask
-        if not keep.any():
-            return {}
-        rgb_a, rgb_b = rgb_a[keep], rgb_b[keep]
-        alpha_diff = np.abs(a[..., 3].astype(np.int16) - b[..., 3].astype(np.int16))[keep]
-    else:
-        alpha_diff = np.abs(a[..., 3].astype(np.int16) - b[..., 3].astype(np.int16))
-    diff = np.abs(rgb_a.astype(np.int16) - rgb_b.astype(np.int16))
+PSNR_DEFINITION_OPAQUE = "raw_rgb_opaque_reference"
+PSNR_DEFINITION_PREMULTIPLIED = "premultiplied_rgb_plus_alpha"
+
+
+def _premultiplied_rgba_channels(img):
+    """Premultiplied RGB (rgb * a/255) plus the alpha channel, float64, shape (..., 4)."""
+    img = np.asarray(img, dtype=np.float64)
+    return np.concatenate([img[..., :3] * (img[..., 3:4] / 255.0), img[..., 3:4]], axis=-1)
+
+
+def _channel_pair_stats(a, b, alpha_diff, rgb_for_lab, definition, raw_psnr):
+    diff = np.abs(a - b)
     chan_max = diff.max(axis=-1)
     mae = float(diff.mean())
-    mse = float((diff.astype(np.float64) ** 2).mean())
+    mse = float((diff.astype(np.float64) ** 2).mean()) if diff.size else 0.0
     psnr = 10 * np.log10(255 ** 2 / mse) if mse else 99.0
-    lab_a = rgb_to_lab(rgb_a.reshape(-1, 3) if mask is not None else rgb_a)
-    lab_b = rgb_to_lab(rgb_b.reshape(-1, 3) if mask is not None else rgb_b)
+    lab_a = rgb_to_lab(np.clip(rgb_for_lab[0], 0, 255).reshape(-1, 3))
+    lab_b = rgb_to_lab(np.clip(rgb_for_lab[1], 0, 255).reshape(-1, 3))
     dE = ciede2000(lab_a, lab_b)
     return {
         "mae": round(mae, 3),
@@ -6455,7 +6820,39 @@ def metrics(a, b, mask=None):
         "pct_delta_e_gt2": round(float((dE > 2).mean() * 100), 3),
         "pct_delta_e_gt5": round(float((dE > 5).mean() * 100), 3),
         "mean_alpha_diff": round(float(alpha_diff.mean()), 3),
+        "psnr_db_raw_rgb": round(float(raw_psnr), 2),
+        "psnr_definition": definition,
     }
+
+
+def metrics(a, b, mask=None):
+    """Pixel metrics used by validate (official psnr_full = diff_text_masked.psnr_db).
+
+    When every compared reference pixel is fully opaque, stats stay on raw RGB (same numbers as
+    before 1.4.17). When the reference has any transparent or semi-transparent pixel, official
+    mae / psnr_db / pct_px_diff_gt16 (and the ΔE companions) compare premultiplied RGB
+    (rgb * a/255) plus the alpha channel: (255,255,255,0) and (0,0,0,0) are identical, but
+    missing or extra visible pixels and colour errors on opaque or partial-alpha pixels still
+    count. psnr_db_raw_rgb is the old un-premultiplied RGB figure, for debugging only.
+    """
+    if mask is not None:
+        keep = ~mask
+        if not keep.any():
+            return {}
+        aa, bb = a[keep], b[keep]
+    else:
+        aa, bb = a, b
+    alpha_diff = np.abs(aa[..., 3].astype(np.int16) - bb[..., 3].astype(np.int16))
+    raw_a, raw_b = aa[..., :3].astype(np.int16), bb[..., :3].astype(np.int16)
+    raw_diff = np.abs(raw_a - raw_b)
+    raw_mse = float((raw_diff.astype(np.float64) ** 2).mean()) if raw_diff.size else 0.0
+    raw_psnr = 10 * np.log10(255 ** 2 / raw_mse) if raw_mse else 99.0
+    if not np.any(aa[..., 3] < 255):
+        return _channel_pair_stats(raw_a, raw_b, alpha_diff, (aa[..., :3], bb[..., :3]),
+                                   PSNR_DEFINITION_OPAQUE, raw_psnr)
+    pa, pb = _premultiplied_rgba_channels(aa), _premultiplied_rgba_channels(bb)
+    return _channel_pair_stats(pa, pb, alpha_diff, (pa[..., :3], pb[..., :3]),
+                               PSNR_DEFINITION_PREMULTIPLIED, raw_psnr)
 
 
 def per_element_diffs(layout, ref, rec, cw, ch):
@@ -6469,26 +6866,20 @@ def per_element_diffs(layout, ref, rec, cw, ch):
         r, bt = min(cw, r), min(ch, bt)
         if r <= l or bt <= top:
             continue
-        aa = ref[top:bt, l:r]
-        bb = rec[top:bt, l:r]
-        diff = np.abs(aa[..., :3].astype(np.int16) - bb[..., :3].astype(np.int16))
-        chan_max = diff.max(axis=-1)
-        mae = float(diff.mean())
-        mse = float((diff.astype(np.float64) ** 2).mean())
-        psnr = 10 * np.log10(255 ** 2 / mse) if mse else 99.0
-        lab_a = rgb_to_lab(aa[..., :3].reshape(-1, 3))
-        lab_b = rgb_to_lab(bb[..., :3].reshape(-1, 3))
-        dE = ciede2000(lab_a, lab_b)
+        m = metrics(ref[top:bt, l:r], rec[top:bt, l:r])
+        if not m:
+            continue
         rows.append({
             "name": node["name"],
             "kind": node["kind"],
             "bounds": [l, top, r, bt],
-            "mae": round(mae, 3),
-            "psnr_db": round(float(psnr), 2),
-            "mean_delta_e": round(float(dE.mean()), 3),
-            "p95_delta_e": round(float(np.percentile(dE, 95)), 3),
-            "pct_delta_e_gt5": round(float((dE > 5).mean() * 100), 3),
-            "pct_px_diff_gt16": round(float((chan_max > 16).mean() * 100), 3),
+            "mae": m["mae"],
+            "psnr_db": m["psnr_db"],
+            "mean_delta_e": m["mean_delta_e"],
+            "p95_delta_e": m["p95_delta_e"],
+            "pct_delta_e_gt5": m["pct_delta_e_gt5"],
+            "pct_px_diff_gt16": m["pct_px_diff_gt16"],
+            "psnr_definition": m.get("psnr_definition"),
         })
     rows.sort(key=lambda row: (-row["mean_delta_e"], -row["mae"]))
     return rows[:10], rows
@@ -7687,6 +8078,8 @@ def cmd_validate(args):
         "diff_text_masked": m_masked,
         "diff_no_text_unmasked": m_no_text_all,
         "psnr_full": (m_masked or {}).get("psnr_db"),
+        "psnr_full_raw_rgb": (m_masked or {}).get("psnr_db_raw_rgb"),
+        "psnr_definition": (m_masked or {}).get("psnr_definition"),
         "psnr_full_over_backdrop": (m_masked_bd or {}).get("psnr_db") if m_masked_bd else None,
         "diff_text_masked_over_backdrop": m_masked_bd,
         "diff_text_rendered_over_backdrop": m_text_bd,
@@ -7755,9 +8148,15 @@ def cmd_validate(args):
             "while a lower one stays off. Cumulative groups are previewed as whole levels (level_N).",
             "label_font: font used for annotation labels; a warning means CJK labels may show as boxes (annotation "
             "only, not a validation result).",
-            "psnr_full = diff_text_masked.psnr_db (official, recomposite over transparency). psnr_full_over_backdrop: "
-            "the same with the recomposite laid over backdrop.color, the one colour the PS render shows where no "
-            "slice draws (backdrop.used only when that region is uniform). backdrop.layers lists the large unsliced "
+            "psnr_full = diff_text_masked.psnr_db (official). When the (masked) PS reference is fully opaque, this "
+            "is raw RGB, same as before. When it has transparent pixels, official mae / psnr_db / pct_px_diff_gt16 "
+            "compare premultiplied RGB (rgb * a/255) plus the alpha channel, so fully transparent pixels that differ "
+            "only in RGB (Photoshop white vs a black recomposite) are not a mismatch; missing or extra visible "
+            "pixels and colour errors on opaque or semi-transparent pixels still are. psnr_definition records which "
+            "rule was used; psnr_full_raw_rgb is the old un-premultiplied RGB figure, for debugging only. "
+            "psnr_full_over_backdrop: the same official rule with the recomposite laid over backdrop.color, the one "
+            "colour the PS render shows where no slice draws (backdrop.used only when that region is uniform; left "
+            "unused when the reference is already transparent there). backdrop.layers lists the large unsliced "
             "layers and whether the user excluded them; an unsliced layer without a decision still fails "
             "(visible_layer_unassigned). preview_exported_* are drawn over the backdrop when it is used.",
             "slice_exceeds_visible_area: a slice draws opaque pixels outside the area where it matches the PS render "
@@ -7859,13 +8258,18 @@ def build_parser():
     s.set_defaults(func=cmd_preview)
 
     s = sub.add_parser("confirm", help="After the user confirms: set status confirmed and lock the manifest "
-                                       "(exit 5 without locking while visible layers have no entry and no decision)")
+                                       "(exit 5 without locking while visible layers have no entry and no decision; "
+                                       "exit 6 and keep the previous lock on unapproved_manifest_change)")
     s.add_argument("--manifest", required=True)
     s.add_argument("--note", default=None, help="Who confirmed / what (kept in the lock file)")
-    s.add_argument("--relock", action="store_true", help="Re-lock after the user re-confirmed a changed manifest")
+    s.add_argument("--relock", action="store_true",
+                   help="Re-lock after a changed manifest whose edits are the recorded consequence of a user "
+                        "decision (or metadata only). Unapproved edits fail with unapproved_manifest_change (exit 6); "
+                        "a --note does not authorise them")
     s.add_argument("--decision", action="append", default=[], metavar="ID=VALUE",
                    help="Record the user's own answer to a reuse_decisions entry (decided_by=user, appended to the "
-                        "lock's decision_log); repeatable. A --note answers no decision")
+                        "lock's decision_log); repeatable. A --note answers no decision. Combined with unrelated "
+                        "manifest edits this also fails with unapproved_manifest_change (exit 6)")
     s.set_defaults(func=cmd_confirm)
 
     s = sub.add_parser("check-lock", help="Exit 3 if the manifest changed after confirm, 4 if not locked")

@@ -55,10 +55,10 @@ class TestManifestLock(unittest.TestCase):
         st = h.manifest_lock_state(self.m)
         self.assertTrue(st["locked"] and st["changed"])
         self.assertEqual(h.cmd_check_lock(SimpleNamespace(manifest=str(self.m))), 3)
-        # confirm refuses to silently re-lock a changed manifest
-        self.assertEqual(h.cmd_confirm(SimpleNamespace(manifest=str(self.m), note=None, relock=False)), 3)
-        self.assertEqual(h.cmd_confirm(SimpleNamespace(manifest=str(self.m), note="user re-confirmed", relock=True)), 0)
-        self.assertFalse(h.manifest_lock_state(self.m)["changed"])
+        # confirm refuses to lock unapproved edits, with or without --relock (exit 6; lock unchanged)
+        self.assertEqual(h.cmd_confirm(SimpleNamespace(manifest=str(self.m), note=None, relock=False)), 6)
+        self.assertEqual(h.cmd_confirm(SimpleNamespace(manifest=str(self.m), note="user re-confirmed", relock=True)), 6)
+        self.assertTrue(h.manifest_lock_state(self.m)["changed"])
 
     def test_build_layout_refuses_changed_manifest(self):
         h.flatten_components(json.loads(self.m.read_text(encoding="utf-8")))
